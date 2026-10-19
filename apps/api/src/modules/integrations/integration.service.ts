@@ -16,6 +16,7 @@ import { Queue } from 'bull';
 import { ClsService } from 'nestjs-cls';
 import {
   IntegrationStatus,
+  PosProductCogs,
   Prisma,
   WmsProductProfileStatus,
 } from '@prisma/client';
@@ -65,9 +66,22 @@ import {
   resolveAutomaticPancakeReconcileMode,
 } from './pancake-webhook-reconcile.util';
 import { PosShopOwnershipService } from './services/pos-shop-ownership.service';
+import { assertValidProductCogs } from './product-cogs-validation';
+import { ProductCogsRefreshPublisherService } from './services/product-cogs-refresh-publisher.service';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
+
+// Deployment checks pin this writer policy together with the built source hash.
+export const PRODUCT_COGS_WRITER_POLICY = 'ERP_COGS_DATED_PARENT_LOCK_V2';
+
+type LockedCogsProduct = {
+  id: string;
+  name: string;
+  productId: string;
+  customId: string | null;
+  teamId: string | null;
+};
 
 type PancakeWebhookSettings = {
   enabled?: boolean;
@@ -218,6 +232,7 @@ export class IntegrationService {
     private readonly pancakeWebhookReconcileQueue: Queue<PancakeWebhookReconcileJobData>,
     @Inject(CACHE_MANAGER)
     private readonly cacheManager: Cache,
+    private readonly productCogsRefresh: ProductCogsRefreshPublisherService,
   ) {}
 
   private getPosGeoCacheTtlMs(): number {
@@ -1333,10 +1348,15 @@ export class IntegrationService {
 
     return (
       code === 'P2034' ||
+      code === 'P2028' ||
       code === '40001' ||
       code === '40P01' ||
+      code === '55P03' ||
+      code === '57014' ||
       metaCode === '40P01' ||
       metaCode === '40001' ||
+      metaCode === '55P03' ||
+      metaCode === '57014' ||
       message.includes('deadlock detected') ||
       message.includes('40p01') ||
       message.includes('could not serialize access due to') ||
@@ -3727,120 +3747,46 @@ export class IntegrationService {
       throw new BadRequestException('productIds must contain at least one product');
     }
 
-    if (!Number.isFinite(cogs) || cogs <= 0) {
-      throw new BadRequestException('cogs must be greater than 0');
-    }
+    assertValidProductCogs(cogs);
 
     const store = await this.getPosStore(storeId); // validates access including shared integrations
-    const effectiveTeamId = await this.teamContext.validateAndGetTeamId(store.teamId);
     const uniqueProductIds = Array.from(
-      new Set(productIds.filter((value) => typeof value === 'string' && value.trim().length > 0)),
+      new Set(productIds.filter((value) => typeof value === 'string' && value.trim().length > 0).map((value) => value.trim())),
     );
 
     if (uniqueProductIds.length === 0) {
       throw new BadRequestException('productIds must contain valid product IDs');
     }
 
-    const products = await this.prisma.posProduct.findMany({
-      where: {
-        id: { in: uniqueProductIds },
-        storeId: store.id,
-      },
-      select: {
-        id: true,
-        name: true,
-        productId: true,
-        customId: true,
-      },
-    });
-
-    if (products.length === 0) {
-      throw new NotFoundException('No matching products found in this store');
-    }
-
-    const matchedProductIds = products.map((product) => product.id);
-    const matchedProductIdSet = new Set(matchedProductIds);
-    const existingEntries = await this.prisma.posProductCogs.findMany({
-      where: {
-        tenantId: store.tenantId,
-        storeId: store.id,
-        productId: { in: matchedProductIds },
-      },
-      orderBy: [{ updatedAt: 'desc' }, { createdAt: 'desc' }],
-    });
-
-    const latestEntryIdsByProductId = new Map<string, string>();
-    for (const entry of existingEntries) {
-      if (!latestEntryIdsByProductId.has(entry.productId)) {
-        latestEntryIdsByProductId.set(entry.productId, entry.id);
+    return this.prisma.$transaction(async (tx) => {
+      const products: LockedCogsProduct[] = [];
+      const failedProducts: Array<{ id: string; name: null; productId: null; customId: null; reason: string }> = [];
+      // Every writer locks parents before reading history. A stable order also
+      // prevents two overlapping bulk edits from taking opposite parent locks.
+      for (const productId of [...uniqueProductIds].sort()) {
+        const product = await this.lockCogsProduct(tx, productId, store);
+        if (product) products.push(product);
+        else failedProducts.push({ id: productId, name: null, productId: null, customId: null, reason: 'Product not found in this store' });
       }
-    }
-
-    const existingEntryIds = Array.from(latestEntryIdsByProductId.values());
-    const missingProductIds = matchedProductIds.filter(
-      (productId) => !latestEntryIdsByProductId.has(productId),
-    );
-    const updatedProducts = products.filter((product) => latestEntryIdsByProductId.has(product.id));
-    const newProducts = products.filter((product) => !latestEntryIdsByProductId.has(product.id));
-    const failedProducts = uniqueProductIds
-      .filter((productId) => !matchedProductIdSet.has(productId))
-      .map((productId) => ({
-        id: productId,
-        name: null,
-        productId: null,
-        customId: null,
-        reason: 'Product not found in this store',
-      }));
-
-    const result = await this.prisma.$transaction(async (tx) => {
-      let updated = 0;
-      let created = 0;
-
-      if (existingEntryIds.length > 0) {
-        const updateResult = await tx.posProductCogs.updateMany({
-          where: {
-            id: { in: existingEntryIds },
-          },
-          data: {
-            cogs,
-            endDate: null,
-          },
-        });
-        updated = updateResult.count;
+      if (products.length === 0) throw new NotFoundException('No matching products found in this store');
+      const today = await this.productCogsToday(tx);
+      const newProducts: Array<{ id: string; name: string; productId: string; customId: string | null }> = [];
+      const updatedProducts: typeof newProducts = [];
+      for (const product of products) {
+        const result = await this.writeCurrentProductCogs(tx, product, store, cogs, today);
+        const summary = { id: product.id, name: product.name, productId: product.productId, customId: product.customId };
+        (result.hadHistory ? updatedProducts : newProducts).push(summary);
       }
-
-      if (missingProductIds.length > 0) {
-        const createResult = await tx.posProductCogs.createMany({
-          data: missingProductIds.map((productId) => ({
-            tenantId: store.tenantId,
-            teamId: effectiveTeamId,
-            productId,
-            storeId: store.id,
-            cogs,
-            startDate: null,
-            endDate: null,
-          })),
-        });
-        created = createResult.count;
-      }
-
-      return { updated, created };
-    });
-
-    return {
-      success: true,
-      updated: result.updated,
-      created: result.created,
-      processed: result.updated + result.created,
-      requested: uniqueProductIds.length,
-      matched: matchedProductIds.length,
-      summary: {
-        new: newProducts,
-        updated: updatedProducts,
-        failed: failedProducts,
-      },
-      message: `Processed ${result.updated + result.created} product(s)`,
-    };
+      await this.productCogsRefresh.enqueue({ tenantId: store.tenantId, storeId: store.id,
+        changes: products.map(product => ({ productId: product.id, fromDate: today.toISOString().slice(0, 10), toDate: null })) });
+      // A history conflict throws and rolls back the whole bulk operation.
+      return {
+        success: true, updated: updatedProducts.length, created: newProducts.length,
+        processed: products.length, requested: uniqueProductIds.length, matched: products.length,
+        summary: { new: newProducts, updated: updatedProducts, failed: failedProducts },
+        message: `Processed ${products.length} product(s)`,
+      };
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10000, timeout: 30000 });
   }
 
   async checkPosDuplicate(apiKey?: string, shopId?: string) {
@@ -5671,17 +5617,114 @@ export class IntegrationService {
   // COGS (Cost of Goods Sold) Management
   // ============================================================================
 
-  private async getLatestProductCogsEntry(productId: string, storeId: string) {
-    const { tenantId } = await this.teamContext.getContext();
+  private async lockCogsProduct(
+    tx: Prisma.TransactionClient,
+    productId: string,
+    store: { id: string; tenantId: string },
+  ): Promise<LockedCogsProduct | null> {
+    // Acquire the normal COGS write table lock before the parent row. The reviewed
+    // repair utility takes a SHARE table lock in the same order to exclude phantoms.
+    await tx.$executeRawUnsafe('LOCK TABLE pos_product_cogs IN ROW EXCLUSIVE MODE');
+    const rows = await tx.$queryRawUnsafe<LockedCogsProduct[]>(`
+      SELECT p.id,p.name,p."productId",p."customId",s."teamId"
+      FROM pos_products p JOIN pos_stores s ON s.id=p."storeId"
+      WHERE p.id=$1::uuid AND p."storeId"=$2::uuid AND s."tenantId"=$3::uuid
+      FOR UPDATE OF p FOR SHARE OF s`, productId, store.id, store.tenantId);
+    return rows[0] ?? null;
+  }
 
-    return this.prisma.posProductCogs.findFirst({
-      where: {
-        tenantId,
-        productId,
-        storeId,
-      },
-      orderBy: [{ updatedAt: 'desc' }, { createdAt: 'desc' }],
+  private async productCogsToday(client: Pick<Prisma.TransactionClient, '$queryRawUnsafe'>): Promise<Date> {
+    const [clock] = await client.$queryRawUnsafe<Array<{ businessDate: string }>>(`
+      SELECT to_char((statement_timestamp() AT TIME ZONE 'Asia/Manila')::date,'YYYY-MM-DD') AS "businessDate"`);
+    return new Date(`${clock.businessDate}T00:00:00.000Z`);
+  }
+
+  private async findApplicableProductCogs(
+    client: Pick<Prisma.TransactionClient, 'posProductCogs'>,
+    productId: string,
+    store: { id: string; tenantId: string },
+    date: Date,
+  ) {
+    const scope = { tenantId: store.tenantId, storeId: store.id, productId };
+    const dated = await client.posProductCogs.findFirst({
+      where: { ...scope, AND: [{ startDate: { not: null } }, { startDate: { lte: date } }],
+        OR: [{ endDate: { gte: date } }, { endDate: null }] },
+      orderBy: [{ startDate: 'desc' }, { updatedAt: 'desc' }, { id: 'asc' }],
     });
+    if (dated) return dated;
+    return client.posProductCogs.findFirst({
+      where: { ...scope, startDate: null, OR: [{ endDate: { gte: date } }, { endDate: null }] },
+      orderBy: [{ updatedAt: 'desc' }, { createdAt: 'desc' }, { id: 'asc' }],
+    });
+  }
+
+  private validateCurrentCogsHistory(
+    history: PosProductCogs[], productId: string, store: { id: string; tenantId: string }, today: Date,
+  ) {
+    const review = (reason: string): never => {
+      throw new ConflictException(`COGS history requires review (${reason}); no changes applied`);
+    };
+    const todayTime = today.getTime();
+    for (const entry of history) {
+      if (entry.productId !== productId || entry.storeId !== store.id || entry.tenantId !== store.tenantId) review('scope mismatch');
+      try { assertValidProductCogs(Number(entry.cogs.toString())); } catch { review('invalid recorded cost'); }
+      const start = entry.startDate?.getTime();
+      const end = entry.endDate?.getTime();
+      if ((start !== undefined && !Number.isFinite(start)) || (end !== undefined && !Number.isFinite(end))) review('invalid date');
+      if (start !== undefined && end !== undefined && end < start) review('invalid date range');
+      if (start !== undefined && start > todayTime) review('future schedule');
+      if (end !== undefined && end >= todayTime) review('finite current or future expiry');
+    }
+    if (history.filter((entry) => entry.startDate === null).length > 1) review('multiple undated defaults');
+    const dated = history.filter((entry) => entry.startDate !== null)
+      .sort((left, right) => left.startDate!.getTime() - right.startDate!.getTime());
+    let previousEnd = -Infinity;
+    for (const entry of dated) {
+      if (entry.startDate!.getTime() <= previousEnd) review('overlapping dated intervals');
+      previousEnd = entry.endDate?.getTime() ?? Infinity;
+    }
+  }
+
+  private async writeCurrentProductCogs(
+    tx: Prisma.TransactionClient, product: LockedCogsProduct,
+    store: { id: string; tenantId: string }, cogs: number, today: Date,
+  ) {
+    // Deliberately include all rows for this parent, so wrong-scope history is
+    // rejected rather than hidden by a tenant filter and silently duplicated.
+    const history = await tx.posProductCogs.findMany({ where: { productId: product.id } });
+    this.validateCurrentCogsHistory(history, product.id, store, today);
+    const todayEntry = history.find((entry) => entry.startDate?.getTime() === today.getTime());
+    const olderOpen = history.find((entry) => entry.startDate !== null
+      && entry.startDate.getTime() < today.getTime() && entry.endDate === null);
+    const legacy = history.find((entry) => entry.startDate === null && entry.endDate === null);
+    const current = todayEntry ?? olderOpen ?? legacy;
+    if (current && current.cogs.equals(cogs)) return { entry: current, hadHistory: true };
+    if (todayEntry) {
+      const entry = await tx.posProductCogs.update({
+        where: { id: todayEntry.id, tenantId: store.tenantId, storeId: store.id,
+          productId: product.id, updatedAt: todayEntry.updatedAt },
+        data: { cogs },
+      });
+      return { entry, hadHistory: true };
+    }
+    if (olderOpen) {
+      const closed = await tx.posProductCogs.updateMany({
+        where: { id: olderOpen.id, tenantId: store.tenantId, storeId: store.id,
+          productId: product.id, updatedAt: olderOpen.updatedAt, endDate: null },
+        data: { endDate: new Date(today.getTime() - 86400000) },
+      });
+      if (closed.count !== 1) throw new ConflictException('COGS history changed; refresh before retrying');
+    }
+    const entry = await tx.posProductCogs.create({ data: {
+      tenantId: store.tenantId, teamId: product.teamId, productId: product.id,
+      storeId: store.id, cogs, startDate: today, endDate: null,
+    } });
+    return { entry, hadHistory: history.length > 0 };
+  }
+
+  private productCogsRefreshRange(entry: Pick<PosProductCogs, 'productId' | 'startDate' | 'endDate'>) {
+    return { productId: entry.productId, fromDate: entry.startDate?.toISOString().slice(0, 10) ?? null,
+      toDate: entry.endDate?.toISOString().slice(0, 10) ?? null };
   }
 
   /**
@@ -5724,86 +5767,43 @@ export class IntegrationService {
       throw new NotFoundException(`Product with ID ${productId} not found in this store`);
     }
 
-    return this.prisma.posProductCogs.findFirst({
-      where: {
-        tenantId: store.tenantId,
-        storeId: store.id,
-        productId,
-      },
-      orderBy: [{ updatedAt: 'desc' }, { createdAt: 'desc' }],
-    });
+    return this.findApplicableProductCogs(this.prisma, productId, store, await this.productCogsToday(this.prisma));
   }
 
   /**
    * Get COGS for a product on a specific date (used in Meta attribution)
    */
   async getCogsForDate(productId: string, storeId: string, date: Date) {
-    const legacyWhere = await this.teamContext.buildTeamWhereClause({
-      productId,
-      storeId,
-      AND: [{ startDate: { not: null } }, { startDate: { lte: date } }],
-      OR: [{ endDate: { gte: date } }, { endDate: null }],
-    });
-
-    const datedEntry = await this.prisma.posProductCogs.findFirst({
-      where: legacyWhere,
-      orderBy: [{ startDate: 'desc' }, { updatedAt: 'desc' }],
-    });
-
-    if (datedEntry) {
-      return datedEntry.cogs;
-    }
-
-    const latestEntry = await this.getLatestProductCogsEntry(productId, storeId);
-    return latestEntry?.cogs || null;
+    if (!(date instanceof Date) || !Number.isFinite(date.getTime())) throw new BadRequestException('Invalid COGS date');
+    const store = await this.getPosStore(storeId);
+    const product = await this.prisma.posProduct.findFirst({ where: { id: productId, storeId: store.id }, select: { id: true } });
+    if (!product) throw new NotFoundException(`Product with ID ${productId} not found in this store`);
+    const calendarDate = new Date(`${date.toISOString().slice(0, 10)}T00:00:00.000Z`);
+    const entry = await this.findApplicableProductCogs(this.prisma, productId, store, calendarDate);
+    return entry?.cogs ?? null;
   }
 
   /**
-   * Add new COGS entry for a product
-   * Automatically closes previous active entry
+   * Set today's current COGS while preserving earlier dated and legacy costs.
    */
   async addCogsEntry(
     productId: string,
     storeId: string,
     cogs: number,
   ) {
-    const { tenantId } = await this.teamContext.getContext();
+    assertValidProductCogs(cogs);
     const store = await this.getPosStore(storeId); // validates access including shared integrations
-
-    // Verify product belongs to this store
-    const product = await this.prisma.posProduct.findFirst({
-      where: { id: productId, storeId: store.id },
-    });
-
-    if (!product) {
-      throw new NotFoundException(`Product with ID ${productId} not found in this store`);
-    }
-
-    // Validate and get effective team ID
-    const effectiveTeamId = await this.teamContext.validateAndGetTeamId(store.teamId);
-    const existingEntry = await this.getLatestProductCogsEntry(productId, storeId);
-
-    if (existingEntry) {
-      return this.prisma.posProductCogs.update({
-        where: { id: existingEntry.id },
-        data: {
-          cogs,
-          endDate: null,
-        },
-      });
-    }
-
-    return this.prisma.posProductCogs.create({
-      data: {
-        tenantId,
-        teamId: effectiveTeamId,
-        productId,
-        storeId: store.id,
-        cogs,
-        startDate: null,
-        endDate: null,
-      },
-    });
+    return this.prisma.$transaction(async (tx) => {
+      const product = await this.lockCogsProduct(tx, productId, store);
+      if (!product) throw new NotFoundException(`Product with ID ${productId} not found in this store`);
+      const today = await this.productCogsToday(tx);
+      const result = await this.writeCurrentProductCogs(tx, product, store, cogs, today);
+      // Publish while the parent lock is held; the worker barrier waits for
+      // commit. A queue failure rolls back the cost edit instead of losing it.
+      await this.productCogsRefresh.enqueue({ tenantId: store.tenantId, storeId: store.id,
+        changes: [{ productId, fromDate: today.toISOString().slice(0, 10), toDate: null }] });
+      return result.entry;
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10000, timeout: 30000 });
   }
 
   /**
@@ -5815,68 +5815,40 @@ export class IntegrationService {
     cogsId: string,
     cogs: number,
   ) {
+    assertValidProductCogs(cogs);
     const store = await this.getPosStore(storeId); // validates access including shared integrations
-
-    const product = await this.prisma.posProduct.findFirst({
-      where: { id: productId, storeId: store.id },
-      select: { id: true },
-    });
-
-    if (!product) {
-      throw new NotFoundException(`Product with ID ${productId} not found in this store`);
-    }
-
-    const existingEntry = await this.prisma.posProductCogs.findFirst({
-      where: {
-        id: cogsId,
-        tenantId: store.tenantId,
-        storeId: store.id,
-        productId,
-      },
-    });
-
-    if (!existingEntry) {
-      throw new NotFoundException('COGS entry not found');
-    }
-
-    return this.prisma.posProductCogs.update({
-      where: { id: cogsId },
-      data: { cogs },
-    });
+    return this.prisma.$transaction(async (tx) => {
+      if (!await this.lockCogsProduct(tx, productId, store)) throw new NotFoundException(`Product with ID ${productId} not found in this store`);
+      const entry = await tx.posProductCogs.findFirst({ where: { id: cogsId, tenantId: store.tenantId, storeId: store.id, productId } });
+      if (!entry) throw new NotFoundException('COGS entry not found');
+      // Explicit entry editing retains its intentional historical-edit contract.
+      const updated = await tx.posProductCogs.update({
+        where: { id: cogsId, tenantId: store.tenantId, storeId: store.id, productId, updatedAt: entry.updatedAt }, data: { cogs },
+      });
+      // Preserve both effective ranges if this entry editor later gains date editing.
+      const changes = [...new Map([entry, updated].map(row => {
+        const range = this.productCogsRefreshRange(row);
+        return [JSON.stringify(range), range] as const;
+      })).values()];
+      await this.productCogsRefresh.enqueue({ tenantId: store.tenantId, storeId: store.id, changes });
+      return updated;
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10000, timeout: 30000 });
   }
 
   /**
    * Delete COGS entry
-   * If deleting current active entry, makes previous entry active again
+   * Explicit deletion does not reopen or rewrite another historical interval.
    */
   async deleteCogsEntry(storeId: string, productId: string, cogsId: string): Promise<void> {
     const store = await this.getPosStore(storeId); // validates access including shared integrations
-
-    const product = await this.prisma.posProduct.findFirst({
-      where: { id: productId, storeId: store.id },
-      select: { id: true },
-    });
-
-    if (!product) {
-      throw new NotFoundException(`Product with ID ${productId} not found in this store`);
-    }
-
-    const entry = await this.prisma.posProductCogs.findFirst({
-      where: {
-        id: cogsId,
-        tenantId: store.tenantId,
-        storeId: store.id,
-        productId,
-      },
-    });
-
-    if (!entry) {
-      throw new NotFoundException('COGS entry not found');
-    }
-
-    await this.prisma.posProductCogs.delete({
-      where: { id: cogsId },
-    });
+    await this.prisma.$transaction(async (tx) => {
+      if (!await this.lockCogsProduct(tx, productId, store)) throw new NotFoundException(`Product with ID ${productId} not found in this store`);
+      const entry = await tx.posProductCogs.findFirst({ where: { id: cogsId, tenantId: store.tenantId, storeId: store.id, productId } });
+      if (!entry) throw new NotFoundException('COGS entry not found');
+      await tx.posProductCogs.delete({ where: { id: cogsId, tenantId: store.tenantId, storeId: store.id, productId, updatedAt: entry.updatedAt } });
+      await this.productCogsRefresh.enqueue({ tenantId: store.tenantId, storeId: store.id,
+        changes: [this.productCogsRefreshRange(entry)] });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10000, timeout: 30000 });
   }
 
   async getMetaInsightsByIntegration(
