@@ -20,12 +20,18 @@ export class TenantGuard implements CanActivate {
 
     // Skip tenant validation for SUPER_ADMIN (platform administrators)
     if (user.role === 'SUPER_ADMIN') {
+      if (user.tenantId !== null && user.tenantId !== undefined && !uuidValidate(user.tenantId)) {
+        throw new ForbiddenException('Tenant context is required');
+      }
+      // Keep tenant-scoped services in the administrator's stored workspace.
+      // Global administrators remain unscoped; request headers cannot select it.
+      this.cls.set('tenantId', user.tenantId ?? null);
       this.cls.set('userId', user.userId);
       this.cls.set('userRole', user.role);
       this.cls.set('userPermissions', user.permissions || []);
       this.cls.set('sessionId', user.sessionId || null);
-    // Carried so audit rows can name the admin behind an impersonated write.
-    this.cls.set('impersonatedBy', user.impersonatedBy || null);
+      // Carried so audit rows can name the admin behind an impersonated write.
+      this.cls.set('impersonatedBy', user.impersonatedBy || null);
       return true;
     }
 
