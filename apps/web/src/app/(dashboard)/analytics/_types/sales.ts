@@ -1,4 +1,18 @@
 export type SalesOverviewResponse = {
+  coverage?: {
+    basis: string;
+    feeBasis: string;
+    ambiguousShopCount: number;
+    ambiguousOrderCount: number;
+    zeroCogsOrderCount: number;
+    unattributedAdRows: number;
+    unattributedAdSpend: number;
+    previousUnattributedAdRows: number;
+    previousUnattributedAdSpend: number;
+    unknownSelectedStoreCount: number;
+    hasCanonicalDifferences: boolean;
+    canonicalMinusSource: { current: Record<string, number>; previous: Record<string, number> };
+  };
   kpis: {
     revenue: number;
     delivered: number;
