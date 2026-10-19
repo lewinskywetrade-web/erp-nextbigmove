@@ -18,6 +18,7 @@ import { ReconcileMarketingService } from './services/reconcile-marketing.servic
 import { ReconcileSalesService } from './services/reconcile-sales.service';
 import { ReconcileSalesAttributionService } from './services/reconcile-sales-attribution.service';
 import { PancakeWebhookReconcileProcessor } from './processors/pancake-webhook-reconcile.processor';
+import { ProductCogsRefreshProcessor } from './processors/product-cogs-refresh.processor';
 import { PANCAKE_WEBHOOK_RECONCILE_QUEUE } from '../integrations/pancake-webhook.constants';
 import { ManualMetaUploadProcessor } from './processors/manual-meta-upload.processor';
 import {
@@ -59,7 +60,7 @@ import {
           ManualMetaUploadProcessor,
         ]
       : []),
-    ...(shouldRunPancakeWorkers() ? [PancakeWebhookReconcileProcessor] : []),
+    ...(shouldRunPancakeWorkers() ? [PancakeWebhookReconcileProcessor, ProductCogsRefreshProcessor] : []),
   ],
   exports: [WorkflowService, WorkflowExecutionGateway],
 })

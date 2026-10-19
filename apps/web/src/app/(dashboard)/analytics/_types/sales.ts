@@ -140,6 +140,8 @@ export type SalesOverviewResponse = {
     ff_raw?: number;
     if_raw?: number;
     cod_fee_delivered_raw?: number;
+    cogs_raw?: number;
+    cogs_canceled?: number;
     cogs_ec?: number;
     cogs_restocking?: number;
     canceled_cod?: number;

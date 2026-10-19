@@ -8,6 +8,8 @@ import { IntegrationService } from './integration.service';
 import { EncryptionService } from './services/encryption.service';
 import { MetaInsightService } from './services/meta-insight.service';
 import { PosOrderService } from './services/pos-order.service';
+import { ProductCogsRecalculationService } from './services/product-cogs-recalculation.service';
+import { ProductCogsRefreshPublisherService } from './services/product-cogs-refresh-publisher.service';
 import { PosShopOwnershipService } from './services/pos-shop-ownership.service';
 import { PrismaModule } from '../../common/prisma/prisma.module';
 import { ProviderFactory } from './providers/provider.factory';
@@ -42,6 +44,8 @@ import { CreativeAgentModule } from '../creative-agent/creative-agent.module';
     EncryptionService,
     MetaInsightService,
     PosOrderService,
+    ProductCogsRecalculationService,
+    ProductCogsRefreshPublisherService,
     PosShopOwnershipService,
     ...(shouldRunPancakeWorkers() ? [PancakeWebhookQueueProcessor] : []),
     ProviderRegistry,
@@ -53,6 +57,7 @@ import { CreativeAgentModule } from '../creative-agent/creative-agent.module';
     ProviderFactory,
     MetaInsightService,
     PosOrderService,
+    ProductCogsRecalculationService,
     PosShopOwnershipService,
   ],
 })

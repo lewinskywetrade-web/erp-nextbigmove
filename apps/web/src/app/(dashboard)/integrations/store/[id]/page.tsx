@@ -171,6 +171,7 @@ export default function StoreDetailPage() {
   const { table } = useDataTable({
     data: filteredProducts,
     columns,
+    getRowId: (product) => product.id,
     pageCount: Math.ceil(filteredProducts.length / 10),
     initialState: {
       pagination: {
@@ -190,6 +191,7 @@ export default function StoreDetailPage() {
 
   useEffect(() => {
     table.setPageIndex(0);
+    table.resetRowSelection();
   }, [productSearchTerm, table]);
 
   const { table: orderTable } = useDataTable({

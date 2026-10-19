@@ -11,6 +11,7 @@ dayjs.extend(utc);
 dayjs.extend(timezone);
 
 const TIMEZONE = process.env.NEXT_PUBLIC_TIMEZONE || 'Asia/Manila';
+const POS_ORDER_POPULATION = 'non-void-v1';
 const RISK_CONFIRMATION_GROUPS = [
   'HIGH RTS RATE',
   'ABANDONED',
@@ -318,6 +319,7 @@ export class SalesPerformanceService {
     const cacheVersion = await this.analyticsCache.getVersion(tenantId);
     const cacheKeyPayload = {
       tenantId,
+      orderPopulation: POS_ORDER_POPULATION,
       teamIds: effectiveTeamIds || [],
       start: startStr,
       end: endStr,
@@ -334,6 +336,7 @@ export class SalesPerformanceService {
         Prisma.sql`"dateLocal" >= ${start}`,
         Prisma.sql`"dateLocal" <= ${end}`,
         Prisma.sql`"status" IS DISTINCT FROM 7`,
+        Prisma.sql`"isVoid" IS DISTINCT FROM true`,
         Prisma.sql`(COALESCE("wasAbandonedCart", false) = true OR COALESCE("isRepurchase", false) = true)`,
       ];
       if (Array.isArray(effectiveTeamIds) && effectiveTeamIds.length > 0) {
@@ -548,6 +551,7 @@ export class SalesPerformanceService {
     const cacheVersion = await this.analyticsCache.getVersion(tenantId);
     const cacheKeyPayload = {
       tenantId,
+      orderPopulation: POS_ORDER_POPULATION,
       teamIds: effectiveTeamIds || [],
       start: startStr,
       end: endStr,
@@ -565,6 +569,7 @@ export class SalesPerformanceService {
         Prisma.sql`"dateLocal" >= ${start}`,
         Prisma.sql`"dateLocal" <= ${end}`,
         Prisma.sql`"status" IS DISTINCT FROM 7`,
+        Prisma.sql`"isVoid" IS DISTINCT FROM true`,
       ];
       if (Array.isArray(effectiveTeamIds) && effectiveTeamIds.length > 0) {
         const teamIdParams = effectiveTeamIds.map((id) => Prisma.sql`${id}::uuid`);
@@ -1168,6 +1173,7 @@ export class SalesPerformanceService {
     const cacheVersion = await this.analyticsCache.getVersion(tenantId);
     const cacheKeyPayload = {
       tenantId,
+      orderPopulation: POS_ORDER_POPULATION,
       teamIds: effectiveTeamIds || [],
       start: startStr,
       end: endStr,
@@ -1185,6 +1191,7 @@ export class SalesPerformanceService {
         Prisma.sql`"dateLocal" >= ${start}`,
         Prisma.sql`"dateLocal" <= ${end}`,
         Prisma.sql`"status" IS DISTINCT FROM 7`,
+        Prisma.sql`"isVoid" IS DISTINCT FROM true`,
       ];
       if (Array.isArray(effectiveTeamIds) && effectiveTeamIds.length > 0) {
         const teamIdParams = effectiveTeamIds.map((id) => Prisma.sql`${id}::uuid`);
@@ -1224,6 +1231,7 @@ export class SalesPerformanceService {
     const deliveredRangeBaseWhere = [
       Prisma.sql`"tenantId" = ${tenantId}::uuid`,
       Prisma.sql`"status" IS DISTINCT FROM 7`,
+      Prisma.sql`"isVoid" IS DISTINCT FROM true`,
       ...(Array.isArray(effectiveTeamIds) && effectiveTeamIds.length > 0
         ? [Prisma.sql`"teamId" IN (${Prisma.join(effectiveTeamIds.map((id) => Prisma.sql`${id}::uuid`))})`]
         : []),
@@ -1245,6 +1253,7 @@ export class SalesPerformanceService {
     const allTimeBaseWhere = [
       Prisma.sql`"tenantId" = ${tenantId}::uuid`,
       Prisma.sql`"status" IS DISTINCT FROM 7`,
+      Prisma.sql`"isVoid" IS DISTINCT FROM true`,
       ...(Array.isArray(effectiveTeamIds) && effectiveTeamIds.length > 0
         ? [Prisma.sql`"teamId" IN (${Prisma.join(effectiveTeamIds.map((id) => Prisma.sql`${id}::uuid`))})`]
         : []),
@@ -1603,6 +1612,7 @@ export class SalesPerformanceService {
     const shopScopeWhere = applySalesAssigneeFilters([
       Prisma.sql`"tenantId" = ${tenantId}::uuid`,
       Prisma.sql`"status" IS DISTINCT FROM 7`,
+      Prisma.sql`"isVoid" IS DISTINCT FROM true`,
       ...(Array.isArray(effectiveTeamIds) && effectiveTeamIds.length > 0
         ? [Prisma.sql`"teamId" IN (${Prisma.join(effectiveTeamIds.map((id) => Prisma.sql`${id}::uuid`))})`]
         : []),

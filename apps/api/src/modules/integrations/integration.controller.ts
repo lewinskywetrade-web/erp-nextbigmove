@@ -25,6 +25,7 @@ import {
   UpdatePancakeWebhookRelayDto,
   ClaimPosShopOwnershipDto,
   TransferOpenPosOrdersDto,
+  ProductCogsDto,
 } from './dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { TenantGuard } from '../../common/guards/tenant.guard';
@@ -534,7 +535,7 @@ export class IntegrationController {
   async addCogsEntry(
     @Param('storeId') storeId: string,
     @Param('productId') productId: string,
-    @Body() body: { cogs: number },
+    @Body() body: ProductCogsDto,
   ) {
     return this.integrationService.addCogsEntry(
       productId,
@@ -552,7 +553,7 @@ export class IntegrationController {
     @Param('storeId') storeId: string,
     @Param('productId') productId: string,
     @Param('cogsId') cogsId: string,
-    @Body() body: { cogs: number },
+    @Body() body: ProductCogsDto,
   ) {
     return this.integrationService.updateCogsEntry(
       storeId,
