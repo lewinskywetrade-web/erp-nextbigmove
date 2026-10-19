@@ -178,7 +178,7 @@ function responseFixture() {
   const storeId = 'store-a';
   const posRows: any[] = [];
   const add = (dateLocal: string, status: number | null, cod: number, extra: Record<string, any> = {}) =>
-    posRows.push({ tenantId, shopId, mapping: 'product-a', dateLocal, status, cod, isVoid: false, isRepurchase: false, ...extra });
+    posRows.push({ id: String(posRows.length).padStart(5, '0'), posOrderId: String(posRows.length), cogs: 0, tenantId, shopId, mapping: 'product-a', dateLocal, status, cod, isVoid: false, isRepurchase: false, ...extra });
   for (const status of [1, 2, 3, 9, 12, 13]) add('2026-10-10', status, status * 10);
   for (const [status, cod] of [[6, 60], [4, 40], [5, 50], [11, 110], [0, 5], [null, 5], [7, 70]] as const)
     add('2026-10-10', status, cod);
@@ -214,7 +214,10 @@ function responseFixture() {
   const prisma = {
     posStore: { findMany: async () => [{ id: storeId, shopId, name: 'Fixture Store' }] },
     posProduct: { findMany: async () => [] },
+    creativeMetaAdLink: { findMany: async () => [] }, creative: { findMany: async () => [] },
+    creativeStoreConfig: { findMany: async () => [] },
     posOrder: {
+      findMany: async ({ where }: any) => posRows.filter(row => matches(row, where)),
       aggregate: async ({ where }: any) => {
         projections.push({ kind: 'sum', where });
         return { _sum: { cod: posRows.filter(row => matches(row, where)).reduce((sum, row) => sum + row.cod, 0) } };
@@ -226,11 +229,16 @@ function responseFixture() {
       findMany: async () => [], count: async () => 0,
       groupBy: async () => [{ mapping: 'product-a', _sum: sums }],
     },
-    reconcileMarketing: { findMany: async () => {
+    reconcileMarketing: {
+      aggregate: async (args: any) => { aggregateQueries++; return args._max ? { _max: { updatedAt: null } } : { _sum: sums }; },
+      count: async () => 0, groupBy: async () => [{ mapping: 'product-a', _sum: sums }],
+      findMany: async () => {
       aggregateQueries++;
       return ['2026-10-09', '2026-10-10'].map(date => ({ ...sums, adId: 'ad-a', shops: [shopId], date: new Date(`${date}T00:00:00Z`), mapping: 'product-a' }));
     } },
     $queryRaw: async () => [],
+    $executeRaw: async () => 0,
+    $transaction: async (operation: any) => operation(prisma),
   };
   const hash = (value: any) => createHash('md5').update(JSON.stringify(value)).digest('hex').slice(0, 12);
   const entries = new Map<string, any>();
@@ -276,7 +284,7 @@ describe('Sales analytics response source scopes and calculation cache revision'
       expect(response.counts.returned).toBe(1);
       expect(response.prevCounts.undelivered).toBe(0);
       expect(response.prevCounts.returned).toBe(1);
-      expect(fixture.projections).toHaveLength(10);
+      expect(fixture.projections).toHaveLength(dimension === 'store' ? 0 : 10);
       for (const { kind, where } of fixture.projections) {
         expect(where.isVoid).toBe(false);
         expect(where.tenantId).toBe('tenant-a');
@@ -294,11 +302,17 @@ describe('Sales analytics response source scopes and calculation cache revision'
     const response = await read();
     expect(fixture.legacyKeys.size).toBe(1);
     expect(fixture.requestedCacheKeys.every(key => !fixture.legacyKeys.has(key))).toBe(true);
+    if (dimension === 'product') {
     expect(response.products[0].net_margin).toBeCloseTo(207.6, 8);
     expect(response.products[0].cogs_raw).toBe(1095);
     expect(response.products[0].cogs_canceled).toBe(120);
     expect(response.products[0].abandoned_cod).toBe(250);
     expect(response.products[0].cm_rts_forecast).toBeCloseTo(712.6, 8);
+    } else {
+      expect(response.products[0].cogs_raw).toBe(0);
+      expect(response.coverage.basis).toBe('SAVED_ERP_POS_ORDER_COMPONENTS');
+      expect(response.coverage.hasCanonicalDifferences).toBe(true);
+    }
     const queries = fixture.aggregateQueries();
     const projections = fixture.projections.length;
     expect(await read()).toBe(response);

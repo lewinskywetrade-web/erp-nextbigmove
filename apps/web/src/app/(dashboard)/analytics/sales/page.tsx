@@ -1377,6 +1377,28 @@ export default function SalesAnalyticsPage() {
         {error && (
           <AlertBanner tone="error" message={error} className="mt-4" />
         )}
+        {dimension === 'store' && data?.coverage && (
+          data.coverage.ambiguousShopCount > 0 || data.coverage.unattributedAdRows > 0 || data.coverage.previousUnattributedAdRows > 0 ||
+          data.coverage.unknownSelectedStoreCount > 0 || data.coverage.zeroCogsOrderCount > 0 || data.coverage.hasCanonicalDifferences
+        ) && (
+          <AlertBanner
+            tone="warning"
+            message={[
+              'Store revenue and COGS use saved POS orders for each shop.',
+              data.coverage.zeroCogsOrderCount > 0
+                ? `${data.coverage.zeroCogsOrderCount} nonvoid, nondeleted orders have saved COGS of zero across all active tenant shops in the current and previous periods, including orders excluded by the current filters. A saved zero alone does not prove a missing catalog cost.` : '',
+              data.coverage.ambiguousShopCount > 0
+                ? `Across the current and previous periods, ${data.coverage.ambiguousOrderCount} orders have conflicting store ownership and remain under Unattributed.` : '',
+              data.coverage.unattributedAdRows > 0 || data.coverage.previousUnattributedAdRows > 0
+                ? 'Some ad spend in the current or previous period has no unique store owner and remains under Unattributed; individual store margins may therefore exclude that spend.' : '',
+              data.coverage.unknownSelectedStoreCount > 0
+                ? 'A selected store is outside the active reporting population.' : '',
+              data.coverage.hasCanonicalDifferences
+                ? 'Saved-order components differ from reconciled totals, which can include report lag and fee rounding. This view uses the saved orders and fee formulas per shop and day.' : '',
+            ].filter(Boolean).join(' ')}
+            className="mt-4"
+          />
+        )}
 
         <div className="flex flex-col gap-3 xl:flex-row">
           {(

@@ -11,6 +11,9 @@ import { ReconcileMarketingService } from '../workflows/services/reconcile-marke
 import {
   resolveMappingDisplayNames,
 } from '../workflows/utils/product-mapping-key';
+import {
+  createEmptyPosAggregateBucket, accumulatePosOrder, calculatePosFees,
+} from '../workflows/utils/pos-reporting-components';
 import { ReconcileSalesService } from '../workflows/services/reconcile-sales.service';
 import { ReconcileSalesAttributionService } from '../workflows/services/reconcile-sales-attribution.service';
 import { AnalyticsRequestCoordinatorService } from './analytics-request-coordinator.service';
@@ -722,6 +725,8 @@ export class SalesAnalyticsService {
     const tenantId = this.teamContext.getTenantId();
     const requestKey = `sales-overview:${tenantId}:${this.analyticsCache.hashObject({
       ...params,
+      sourceRevision: 'PER_AD_MAPPING_V1',
+      readConsistency: 'READ_ONLY_REPEATABLE_READ',
       mappings: [...(params.mappings || [])].map((value) => this.normalize(value)).sort(),
     })}`;
 
@@ -733,6 +738,13 @@ export class SalesAnalyticsService {
   }
 
   private async calculateOverview(params: SalesOverviewParams) {
+    return this.prisma.$transaction(async (db) => {
+      await db.$executeRaw`SET TRANSACTION READ ONLY`;
+      return this.calculateOverviewSnapshot(params, db);
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead, maxWait: 5000, timeout: 60000 });
+  }
+
+  private async calculateOverviewSnapshot(params: SalesOverviewParams, db: Prisma.TransactionClient) {
     const { startDate, endDate, mappings = [], excludeCancel = true, excludeRestocking = true, excludeAbandoned = true, excludeRts = true, excludeRepurchase = true, includeTax12 = false, includeTax1 = false } = params;
 
     const startStr = (startDate && startDate.trim()) || dayjs().tz(TIMEZONE).format('YYYY-MM-DD');
@@ -762,7 +774,7 @@ export class SalesAnalyticsService {
     const includeNull = normalizedMappings.includes(this.normalize('__null__'));
 
     const tenantId = this.teamContext.getTenantId();
-    const activeStores = await this.prisma.posStore.findMany({
+    const activeStores = await db.posStore.findMany({
       where: {
         tenantId,
         status: 'ACTIVE',
@@ -827,7 +839,9 @@ export class SalesAnalyticsService {
 
     const cacheVersion = await this.analyticsCache.getVersion(tenantId);
     const cacheKeyPayload = {
-      responseShapeVersion: 7,
+      responseShapeVersion: 8,
+      sourceRevision: 'PER_AD_MAPPING_V1',
+      readConsistency: 'READ_ONLY_REPEATABLE_READ',
       calculationVersion: SALES_CALCULATION_VERSION,
       tenantId,
       analyticsScope: 'tenant',
@@ -888,7 +902,7 @@ export class SalesAnalyticsService {
       productGroups,
       lastUpdatedAgg,
     ] = await Promise.all([
-      this.prisma.reconcileSales.aggregate({
+      db.reconcileMarketing.aggregate({
         where,
         _sum: {
           spend: true,
@@ -967,7 +981,7 @@ export class SalesAnalyticsService {
           repurchaseIfSdrPos: true,
         },
       }),
-      this.prisma.reconcileSales.aggregate({
+      db.reconcileMarketing.aggregate({
         where: {
           ...baseWhere,
           ...mappingFilter,
@@ -1050,67 +1064,67 @@ export class SalesAnalyticsService {
           repurchaseIfSdrPos: true,
         },
       }),
-      this.prisma.posOrder.aggregate({
+      db.posOrder.aggregate({
         where: processedSalesWhere,
         _sum: {
           cod: true,
         },
       }),
-      this.prisma.posOrder.aggregate({
+      db.posOrder.aggregate({
         where: prevProcessedSalesWhere,
         _sum: {
           cod: true,
         },
       }),
-      this.prisma.posOrder.count({
+      db.posOrder.count({
         where: {
           ...cancellationRateWhere,
           OR: [{ status: { not: 7 } }, { status: null }],
         },
       }),
-      this.prisma.posOrder.count({
+      db.posOrder.count({
         where: {
           ...cancellationRateWhere,
           status: 6,
         },
       }),
-      this.prisma.posOrder.count({
+      db.posOrder.count({
         where: {
           ...prevCancellationRateWhere,
           OR: [{ status: { not: 7 } }, { status: null }],
         },
       }),
-      this.prisma.posOrder.count({
+      db.posOrder.count({
         where: {
           ...prevCancellationRateWhere,
           status: 6,
         },
       }),
-      this.prisma.posOrder.count({
+      db.posOrder.count({
         where: {
           ...cancellationRateWhere,
           status: 4,
         },
       }),
-      this.prisma.posOrder.count({
+      db.posOrder.count({
         where: {
           ...cancellationRateWhere,
           status: 5,
         },
       }),
-      this.prisma.posOrder.count({
+      db.posOrder.count({
         where: {
           ...prevCancellationRateWhere,
           status: 4,
         },
       }),
-      this.prisma.posOrder.count({
+      db.posOrder.count({
         where: {
           ...prevCancellationRateWhere,
           status: 5,
         },
       }),
-      this.prisma.$queryRaw<Array<{ date: string; shipped: number; delivered: number; rts: number }>>(Prisma.sql`
+      db.$queryRaw<Array<{ date: string; shipped: number; delivered: number; rts: number }>>(Prisma.sql`
         WITH dates AS (
           SELECT generate_series(${startStr}::date, ${endStr}::date, interval '1 day')::date AS d
         ),
@@ -1175,7 +1189,7 @@ export class SalesAnalyticsService {
         LEFT JOIN counts ON counts.d = dates.d
         ORDER BY dates.d
       `),
-      this.prisma.reconcileSales.findMany({
+      db.reconcileMarketing.findMany({
         where: {
           ...baseWhere,
           mapping: { not: null },
@@ -1183,13 +1197,13 @@ export class SalesAnalyticsService {
         distinct: ['mapping'],
         select: { mapping: true },
       }),
-      this.prisma.reconcileSales.count({
+      db.reconcileMarketing.count({
         where: {
           ...baseWhere,
           mapping: null,
         },
       }),
-      this.prisma.reconcileSales.groupBy({
+      db.reconcileMarketing.groupBy({
         by: ['mapping'],
         where,
         _sum: {
@@ -1269,7 +1283,7 @@ export class SalesAnalyticsService {
           repurchaseIfSdrPos: true,
         },
       }),
-      this.prisma.reconcileSales.aggregate({
+      db.reconcileMarketing.aggregate({
         where,
         _max: { updatedAt: true },
       }),
@@ -1288,7 +1302,7 @@ export class SalesAnalyticsService {
 
     // pv:: keys -> product names, ua:: keys -> "Unassigned — {store}"; coarse
     // labels pass through untouched.
-    await resolveMappingDisplayNames(this.prisma, mappingDisplayMap);
+    await resolveMappingDisplayNames(db, mappingDisplayMap);
 
     if (nullCount > 0) {
       const key = this.normalize('__null__');
@@ -1415,20 +1429,20 @@ export class SalesAnalyticsService {
     return response;
   }
 
-  /**
-   * Full overview for the sales page's STORE tab: identical response shape to
-   * calculateOverview (kpis, counts, prev-period deltas, breakdown rows,
-   * delivery statuses), computed with the same math — only the dimension
-   * changes. Sourced from reconcile_marketing, the one reconcile table that
-   * still knows which store a row touched; its totals are identical to
-   * reconcile_sales, so the two tabs tie out by construction.
-   *
-   * `mappings` carries selected STORE ids here (with '__unattributed__' as the
-   * sentinel bucket). Every row is assigned to EXACTLY ONE store via
-   *   shops[0] -> creative link -> mapping-embedded store -> Unattributed
-   * so buckets partition the data: nothing is dropped or counted twice.
+  /** Store POS components belong to their real shop, independently of the
+   * owner of the ad that produced the visit. No row or cost is split by a ratio.
    */
   async getStoreOverview(params: SalesOverviewParams) {
+    const tenantId = this.teamContext.getTenantId();
+    const requestKey = `sales-store-overview:${tenantId}:${this.analyticsCache.hashObject({
+      ...params,
+      sourceRevision: 'EXACT_SHOP_POS_COMPONENTS_V1',
+      mappings: [...(params.mappings || [])].map(value => this.normalize(value)).sort(),
+    })}`;
+    return this.analyticsRequestCoordinator.run(tenantId, requestKey, () => this.calculateStoreOverview(params));
+  }
+
+  private async calculateStoreOverview(params: SalesOverviewParams) {
     const { startDate, endDate, mappings = [], excludeCancel = true, excludeRestocking = true, excludeAbandoned = true, excludeRts = true, excludeRepurchase = true, includeTax12 = false, includeTax1 = false } = params;
 
     const startStr = (startDate && startDate.trim()) || dayjs().tz(TIMEZONE).format('YYYY-MM-DD');
@@ -1450,9 +1464,14 @@ export class SalesAnalyticsService {
     const selectedStoreIds = mappings.map((m) => this.normalize(m)).filter((v) => v.length > 0);
     const tenantId = this.teamContext.getTenantId();
 
+    const activeStoreWhere = { tenantId, status: 'ACTIVE' as const, OR: [{ enabled: true }, { enabled: null }] };
+    const scopeStores = await this.prisma.posStore.findMany({ where: activeStoreWhere, select: { id: true, shopId: true, name: true } });
+    const scopeKey = (stores: typeof scopeStores) => stores.map(store => `${store.id}:${store.shopId}:${store.name}`).sort();
     const cacheVersion = await this.analyticsCache.getVersion(tenantId);
     const cacheKeyPayload = {
-      responseShapeVersion: 1,
+      responseShapeVersion: 2,
+      sourceRevision: 'EXACT_SHOP_POS_COMPONENTS_V1',
+      activeStores: scopeKey(scopeStores),
       calculationVersion: SALES_CALCULATION_VERSION,
       start: startStr,
       end: endStr,
@@ -1464,8 +1483,6 @@ export class SalesAnalyticsService {
     const cached = await this.analyticsCache.get<any>(cacheKey);
     if (cached) return cached;
 
-    // The exact field set the product overview aggregates — same inputs, same
-    // computeKpis/computeCounts/computeProductRow math.
     const metricFields = [
       'spend', 'codPos', 'purchasesPos', 'processedPurchasesPos', 'repurchaseCount', 'repurchaseProcessedPurchasesPos',
       'leads', 'deliveredCodPos', 'shippedCodPos', 'waitingPickupCodPos', 'rtsCodPos', 'canceledCodPos',
@@ -1485,209 +1502,205 @@ export class SalesAnalyticsService {
       'repurchaseSfSdrPos', 'repurchaseFfSdrPos', 'repurchaseIfSdrPos',
     ] as const;
 
-    const select: Record<string, boolean> = {
-      adId: true,
-      adName: true,
-      mapping: true,
-      shops: true,
-      date: true,
-      updatedAt: true,
-    };
-    for (const f of metricFields) select[f] = true;
-
-    // Current + previous period in one fetch; rows are split by date below.
-    const [rows, tenantStores] = await Promise.all([
-      this.prisma.reconcileMarketing.findMany({
-        where: { tenantId, date: { gte: prevStartDate_dt, lte: endDate_dt } },
-        select: select as any,
-      }) as Promise<Array<Record<string, any>>>,
-      this.prisma.posStore.findMany({
-        where: { tenantId },
-        select: { id: true, shopId: true, name: true },
-      }),
-    ]);
-
-    const storeByShopId = new Map(tenantStores.map((st) => [st.shopId, st.id.toLowerCase()]));
-    const storeNameById = new Map(tenantStores.map((st) => [st.id.toLowerCase(), st.name]));
-
-    const unshoppedRows = rows.filter((r) => !(Array.isArray(r.shops) && r.shops.length > 0));
-    const unshoppedAdIds = [...new Set(unshoppedRows.map((r) => r.adId as string).filter(Boolean))];
-    const detectedCodes = new Set<string>();
-    const detectedPrefixes = new Set<string>();
-    for (const row of unshoppedRows) {
-      const parts = creativeCodeParts(typeof row.adName === 'string' ? row.adName : null);
-      if (!parts) continue;
-      detectedCodes.add(parts.code);
-      detectedPrefixes.add(parts.prefix);
-    }
-
-    // All fallbacks are tenant-scoped and loaded in parallel. Explicit links
-    // remain authoritative; exact codes and unique active prefixes cover
-    // unlinked static creatives and newly arrived ads with no POS orders yet.
-    const [links, tenantProducts, codedCreatives, prefixConfigs] = await Promise.all([
-      unshoppedAdIds.length > 0
-        ? this.prisma.creativeMetaAdLink.findMany({
-            where: { tenantId, adId: { in: unshoppedAdIds } },
-            select: { adId: true, creative: { select: { storeConfig: { select: { storeId: true } } } } },
-          })
-        : Promise.resolve([]),
-      this.prisma.posProduct.findMany({
-        where: { store: { is: { tenantId } }, mapping: { not: null } },
-        select: { storeId: true, mapping: true },
-      }),
-      detectedCodes.size > 0
-        ? this.prisma.creative.findMany({
-            where: { tenantId, code: { in: [...detectedCodes] } },
-            select: { code: true, storeConfig: { select: { storeId: true } } },
-          })
-        : Promise.resolve([]),
-      detectedPrefixes.size > 0
-        ? this.prisma.creativeStoreConfig.findMany({
-            where: {
-              tenantId,
-              active: true,
-              storeId: { not: null },
-              codePrefix: { in: [...detectedPrefixes] },
-            },
-            select: { codePrefix: true, storeId: true },
-          })
-        : Promise.resolve([]),
-    ]);
-
-    const storeByAdId = new Map<string, string>();
-    for (const link of links) {
-      const sid = link.creative?.storeConfig?.storeId;
-      if (sid && !storeByAdId.has(link.adId)) storeByAdId.set(link.adId, sid.toLowerCase());
-    }
-
-    const storeByCreativeCode = new Map<string, string>();
-    for (const creative of codedCreatives) {
-      const sid = creative.storeConfig?.storeId;
-      if (sid) storeByCreativeCode.set(creative.code.toUpperCase(), sid.toLowerCase());
-    }
-
-    const storeByCodePrefix = new Map<string, string>();
-    for (const config of prefixConfigs) {
-      if (config.storeId) storeByCodePrefix.set(config.codePrefix.toUpperCase(), config.storeId.toLowerCase());
-    }
-
-    // Coarse legacy mapping -> store only when the label is unambiguous.
-    const storeByLabel = new Map<string, string | null>();
-    for (const p of tenantProducts) {
-      const label = p.mapping?.trim().toLowerCase();
-      if (!label) continue;
-      const sid = p.storeId.toLowerCase();
-      if (storeByLabel.has(label) && storeByLabel.get(label) !== sid) storeByLabel.set(label, null);
-      else storeByLabel.set(label, sid);
-    }
-
-    const resolveStore = (row: Record<string, any>): string => resolveStoreAttribution(row, {
-      storeByShopId,
-      storeByAdId,
-      storeByCreativeCode,
-      storeByCodePrefix,
-      storeByLabel,
-    });
-
     const allSelected = selectedStoreIds.length === 0;
-    const isSelected = (storeKey: string) => allSelected || selectedStoreIds.includes(storeKey);
-
-    const newBucket = () => {
-      const b: Record<string, number> = {};
-      for (const f of metricFields) b[f] = 0;
-      return b;
+    const isSelected = (key: string) => allSelected || selectedStoreIds.includes(key);
+    const add = (target: Record<string, number>, source: Record<string, any>) => {
+      for (const [key, value] of Object.entries(source)) {
+        if (typeof value === 'number') target[key] = (target[key] || 0) + value;
+      }
     };
-    const addRow = (bucket: Record<string, number>, row: Record<string, any>) => {
-      for (const f of metricFields) bucket[f] += Number(row[f] ?? 0) || 0;
-    };
+    const empty = () => Object.fromEntries(metricFields.map(key => [key, 0])) as Record<string, number>;
 
-    const currentAggSums = newBucket();
-    const prevAggSums = newBucket();
+    // All source identities and all pages share one read-only snapshot. The
+    // projection deliberately excludes snapshots, names and customer details.
+    const snapshot = await this.prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SET TRANSACTION READ ONLY`;
+      const [rows, tenantStores] = await Promise.all([
+        tx.reconcileMarketing.findMany({
+          where: { tenantId, date: { gte: prevStartDate_dt, lte: endDate_dt } },
+          select: Object.fromEntries([
+            'adId', 'adName', 'mapping', 'shops', 'date', 'updatedAt', ...metricFields,
+          ].map(key => [key, true])) as any,
+        }) as Promise<Array<Record<string, any>>>,
+        tx.posStore.findMany({
+          where: activeStoreWhere,
+          select: { id: true, shopId: true, name: true },
+        }),
+      ]);
+      const validStoreIds = new Set(tenantStores.map(store => store.id.toLowerCase()));
+      const storeByShopId = new Map<string, string | null>();
+      const insertUnique = (map: Map<string, string | null>, key: string, store: string | null | undefined) => {
+        const value = store?.toLowerCase();
+        const scoped = value && validStoreIds.has(value) ? value : null;
+        if (map.has(key) && map.get(key) !== scoped) map.set(key, null);
+        else map.set(key, scoped);
+      };
+      for (const store of tenantStores) insertUnique(storeByShopId, store.shopId, store.id);
+      const adIds = [...new Set(rows.map(row => row.adId as string).filter(Boolean))];
+      const codes = rows.map(row => creativeCodeParts(row.adName)).filter(Boolean);
+      const [links, products, creatives, configs] = await Promise.all([
+        adIds.length ? tx.creativeMetaAdLink.findMany({
+          where: { tenantId, adId: { in: adIds } },
+          select: { adId: true, creative: { select: { tenantId: true, storeConfig: { select: { tenantId: true, storeId: true } } } } },
+        }) : [],
+        tx.posProduct.findMany({
+          where: { store: { is: { tenantId, status: 'ACTIVE', OR: [{ enabled: true }, { enabled: null }] } }, mapping: { not: null } },
+          select: { storeId: true, mapping: true },
+        }),
+        codes.length ? tx.creative.findMany({
+          where: { tenantId, code: { in: [...new Set(codes.map(code => code!.code))] } },
+          select: { code: true, storeConfig: { select: { tenantId: true, storeId: true } } },
+        }) : [],
+        codes.length ? tx.creativeStoreConfig.findMany({
+          where: { tenantId, active: true, storeId: { in: [...validStoreIds] }, codePrefix: { in: [...new Set(codes.map(code => code!.prefix))] } },
+          select: { codePrefix: true, storeId: true },
+        }) : [],
+      ]);
+      const storeByAdId = new Map<string, string | null>();
+      for (const link of links) insertUnique(storeByAdId, link.adId,
+        link.creative?.tenantId === tenantId && link.creative?.storeConfig?.tenantId === tenantId
+          ? link.creative.storeConfig.storeId : null);
+      const storeByCreativeCode = new Map<string, string | null>();
+      for (const creative of creatives) insertUnique(storeByCreativeCode, creative.code.toUpperCase(),
+        creative.storeConfig?.tenantId === tenantId ? creative.storeConfig.storeId : null);
+      const storeByCodePrefix = new Map<string, string | null>();
+      for (const config of configs) insertUnique(storeByCodePrefix, config.codePrefix.toUpperCase(), config.storeId);
+      const storeByLabel = new Map<string, string | null>();
+      for (const product of products) {
+        const label = product.mapping?.trim().toLowerCase();
+        if (label) insertUnique(storeByLabel, label, product.storeId);
+      }
+      const index = { validStoreIds, storeByShopId, storeByAdId, storeByCreativeCode, storeByCodePrefix, storeByLabel };
+      const dayBuckets = new Map<string, { date: string; store: string; sums: ReturnType<typeof createEmptyPosAggregateBucket> & Record<string, any> }>();
+      let cursor: string | undefined;
+      let ambiguousOrderCount = 0;
+      let zeroCogsOrderCount = 0;
+      let orderCount = 0;
+      let sourceUpdatedAt: Date | null = null;
+      const shopIds = [...storeByShopId.keys()];
+      while (shopIds.length) {
+        const orders = await tx.posOrder.findMany({
+          where: { tenantId, shopId: { in: shopIds }, dateLocal: { gte: prevStartStr, lte: endStr }, ...(cursor ? { id: { gt: cursor } } : {}) },
+          select: { id: true, shopId: true, posOrderId: true, dateLocal: true, status: true, isVoid: true,
+            cod: true, cogs: true, isRepurchase: true, isAbandoned: true, wasAbandonedCart: true, tracking: true, updatedAt: true },
+          orderBy: { id: 'asc' }, take: 2000,
+        });
+        for (const order of orders) {
+          const store = storeByShopId.get(order.shopId) ?? UNATTRIBUTED;
+          const key = `${order.dateLocal}|${order.shopId}`;
+          let day = dayBuckets.get(key);
+          if (!day) {
+            day = { date: order.dateLocal, store, sums: createEmptyPosAggregateBucket() };
+            dayBuckets.set(key, day);
+          }
+          accumulatePosOrder(day.sums, order, false);
+          orderCount++;
+          if (store === UNATTRIBUTED) ambiguousOrderCount++;
+          if (!order.isVoid && order.status !== 7 && this.toNumber(order.cogs) === 0) zeroCogsOrderCount++;
+          if (order.dateLocal >= startStr && isSelected(store) && order.updatedAt && (!sourceUpdatedAt || order.updatedAt > sourceUpdatedAt)) sourceUpdatedAt = order.updatedAt;
+          // These direct-source projections retain their existing status and
+          // denominator policies; the tracking-based count remains separate.
+          if (!order.isVoid && (!excludeRepurchase || !order.isRepurchase)) {
+            if ((PROCESSED_SALES_STATUSES as readonly number[]).includes(order.status!)) day.sums.processedSales = (day.sums.processedSales || 0) + this.toNumber(order.cod);
+            if (order.status !== 7) day.sums.cancellationTotal = (day.sums.cancellationTotal || 0) + 1;
+            if (order.status === 6) day.sums.canceledOrders = (day.sums.canceledOrders || 0) + 1;
+            if (order.status === 4) day.sums.undeliveredOrders = (day.sums.undeliveredOrders || 0) + 1;
+            if (order.status === 5) day.sums.returnedOrders = (day.sums.returnedOrders || 0) + 1;
+          }
+        }
+        if (orders.length < 2000) break;
+        cursor = orders[orders.length - 1].id;
+      }
+      return { rows, tenantStores, index, dayBuckets, ambiguousOrderCount, zeroCogsOrderCount, orderCount, sourceUpdatedAt };
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead, maxWait: 5000, timeout: 60000 });
+
+    const { rows, tenantStores, index } = snapshot;
+    const storeNameById = new Map(tenantStores.map(store => [store.id.toLowerCase(), store.name]));
+    const currentAggSums = empty();
+    const prevAggSums = empty();
+    const sourceCurrent = empty();
+    const sourcePrevious = empty();
+    const canonicalCurrent = empty();
+    const canonicalPrevious = empty();
     const storeBuckets = new Map<string, Record<string, number>>();
     const presentStoreKeys = new Set<string>();
-    let lastUpdatedAt: Date | null = null;
-
-    for (const row of rows) {
-      const storeKey = resolveStore(row);
-      const isCurrent = row.date >= startDate_dt;
-      if (isCurrent) presentStoreKeys.add(storeKey);
-      if (!isSelected(storeKey)) continue;
-      if (isCurrent) {
-        addRow(currentAggSums, row);
-        let bucket = storeBuckets.get(storeKey);
-        if (!bucket) {
-          bucket = newBucket();
-          storeBuckets.set(storeKey, bucket);
-        }
-        addRow(bucket, row);
-        if (row.updatedAt instanceof Date && (!lastUpdatedAt || row.updatedAt > lastUpdatedAt)) {
-          lastUpdatedAt = row.updatedAt;
-        }
-      } else {
-        addRow(prevAggSums, row);
+    let lastUpdatedAt = snapshot.sourceUpdatedAt;
+    const addComponents = (store: string, current: boolean, components: Record<string, any>) => {
+      if (current) presentStoreKeys.add(store);
+      if (!isSelected(store)) return;
+      add(current ? currentAggSums : prevAggSums, components);
+      if (current) {
+        if (!storeBuckets.has(store)) storeBuckets.set(store, empty());
+        add(storeBuckets.get(store)!, components);
       }
+    };
+    const money = (value: number) => new Prisma.Decimal(value).toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP).toNumber();
+    for (const day of snapshot.dayBuckets.values()) {
+      const fees = calculatePosFees(day.sums);
+      const components = { ...day.sums, orders: undefined,
+        sfPos: fees.sf, ffPos: fees.ff, ifPos: fees.inf,
+        sfSdrPos: fees.sfSdr, ffSdrPos: fees.ffSdr, ifSdrPos: fees.infSdr,
+        repurchaseSfPos: fees.repurchaseSf, repurchaseFfPos: fees.repurchaseFf, repurchaseIfPos: fees.repurchaseIf,
+        repurchaseSfSdrPos: fees.repurchaseSfSdr, repurchaseFfSdrPos: fees.repurchaseFfSdr, repurchaseIfSdrPos: fees.repurchaseIfSdr,
+        codFeePos: money(fees.codFee), codFeeDeliveredPos: money(fees.codFeeDelivered),
+        repurchaseCodFeePos: money(fees.repurchaseCodFee), repurchaseCodFeeDeliveredPos: money(fees.repurchaseCodFeeDelivered),
+      };
+      const current = day.date >= startStr;
+      add(current ? sourceCurrent : sourcePrevious, components);
+      addComponents(day.store, current, components);
     }
-
-    // POS-order-backed metrics (processed sales, cancellation, undelivered)
-    // scope by the selected stores' shopIds — the store analog of the product
-    // overview's activeShopIds scope. Unattributed rows have no POS orders by
-    // definition, so this is exact.
-    const selectedShopIds = tenantStores
-      .filter((st) => allSelected || selectedStoreIds.includes(st.id.toLowerCase()))
-      .map((st) => st.shopId);
-    const posScope = { shopId: { in: selectedShopIds } };
-    const processedSalesWhere = this.teamContext.buildTenantWhereClause({
-      dateLocal: { gte: startStr, lte: endStr },
-      isVoid: false,
-      ...posScope,
-      status: { in: [...PROCESSED_SALES_STATUSES] },
-      ...(excludeRepurchase ? { isRepurchase: false } : {}),
-    });
-    const prevProcessedSalesWhere = this.teamContext.buildTenantWhereClause({
-      dateLocal: { gte: prevStartStr, lte: prevEndStr },
-      isVoid: false,
-      ...posScope,
-      status: { in: [...PROCESSED_SALES_STATUSES] },
-      ...(excludeRepurchase ? { isRepurchase: false } : {}),
-    });
-    const cancellationRateWhere = this.teamContext.buildTenantWhereClause({
-      dateLocal: { gte: startStr, lte: endStr },
-      isVoid: false,
-      ...posScope,
-      ...(excludeRepurchase ? { isRepurchase: false } : {}),
-    });
-    const prevCancellationRateWhere = this.teamContext.buildTenantWhereClause({
-      dateLocal: { gte: prevStartStr, lte: prevEndStr },
-      isVoid: false,
-      ...posScope,
-      ...(excludeRepurchase ? { isRepurchase: false } : {}),
-    });
-
-    const [
-      processedSalesAgg,
-      prevProcessedSalesAgg,
-      totalOrdersCount,
-      cancelledOrdersCount,
-      prevTotalOrdersCount,
-      prevCancelledOrdersCount,
-      undeliveredOrdersCount,
-      returnedOrdersCount,
-      prevUndeliveredOrdersCount,
-      prevReturnedOrdersCount,
-    ] = await Promise.all([
-      this.prisma.posOrder.aggregate({ where: processedSalesWhere, _sum: { cod: true } }),
-      this.prisma.posOrder.aggregate({ where: prevProcessedSalesWhere, _sum: { cod: true } }),
-      this.prisma.posOrder.count({ where: { ...cancellationRateWhere, OR: [{ status: { not: 7 } }, { status: null }] } }),
-      this.prisma.posOrder.count({ where: { ...cancellationRateWhere, status: 6 } }),
-      this.prisma.posOrder.count({ where: { ...prevCancellationRateWhere, OR: [{ status: { not: 7 } }, { status: null }] } }),
-      this.prisma.posOrder.count({ where: { ...prevCancellationRateWhere, status: 6 } }),
-      this.prisma.posOrder.count({ where: { ...cancellationRateWhere, status: 4 } }),
-      this.prisma.posOrder.count({ where: { ...cancellationRateWhere, status: 5 } }),
-      this.prisma.posOrder.count({ where: { ...prevCancellationRateWhere, status: 4 } }),
-      this.prisma.posOrder.count({ where: { ...prevCancellationRateWhere, status: 5 } }),
-    ]);
+    let unattributedAdRows = 0;
+    let unattributedAdSpend = 0;
+    let previousUnattributedAdRows = 0;
+    let previousUnattributedAdSpend = 0;
+    for (const row of rows) {
+      const current = row.date >= startDate_dt;
+      // Persisted POS components are comparison evidence only. They must never
+      // be added to the direct POS components a second time.
+      const comparison = current ? canonicalCurrent : canonicalPrevious;
+      for (const field of metricFields) if (field !== 'spend' && field !== 'leads') comparison[field] += this.toNumber(row[field]);
+      const store = resolveStoreAttribution(row, index);
+      if (current && store === UNATTRIBUTED && (this.toNumber(row.spend) || this.toNumber(row.leads))) {
+        unattributedAdRows++;
+        unattributedAdSpend += this.toNumber(row.spend);
+      } else if (!current && store === UNATTRIBUTED && (this.toNumber(row.spend) || this.toNumber(row.leads))) {
+        previousUnattributedAdRows++;
+        previousUnattributedAdSpend += this.toNumber(row.spend);
+      }
+      if (this.toNumber(row.spend) || this.toNumber(row.leads)) addComponents(store, current, { spend: this.toNumber(row.spend), leads: this.toNumber(row.leads) });
+      if (current && isSelected(store) && row.updatedAt instanceof Date && (!lastUpdatedAt || row.updatedAt > lastUpdatedAt)) lastUpdatedAt = row.updatedAt;
+    }
+    const differences = (source: Record<string, number>, canonical: Record<string, number>) =>
+      Object.fromEntries(metricFields.filter(field => field !== 'spend' && field !== 'leads')
+        .map(field => [field, money(canonical[field] - source[field])]).filter(([, value]) => value !== 0));
+    const currentDifferences = differences(sourceCurrent, canonicalCurrent);
+    const previousDifferences = differences(sourcePrevious, canonicalPrevious);
+    const coverage = {
+      basis: 'SAVED_ERP_POS_ORDER_COMPONENTS', adOwnership: 'EXPLICIT_LINK_THEN_UNAMBIGUOUS_HINTS',
+      feeBasis: 'EXISTING_RATES_PER_SHOP_DAY', comparisonScope: 'ACTIVE_TENANT_SHOPS_CURRENT_AND_PREVIOUS',
+      ambiguousShopCount: [...index.storeByShopId.values()].filter(value => !value).length,
+      ambiguousOrderCount: snapshot.ambiguousOrderCount, examinedOrderCount: snapshot.orderCount,
+      zeroCogsOrderCount: snapshot.zeroCogsOrderCount,
+      unattributedAdRows, unattributedAdSpend: money(unattributedAdSpend),
+      previousUnattributedAdRows, previousUnattributedAdSpend: money(previousUnattributedAdSpend),
+      unknownSelectedStoreCount: selectedStoreIds.filter(key => key !== UNATTRIBUTED && !index.validStoreIds.has(key)).length,
+      // Signed canonical minus direct-source residuals expose rounding and
+      // reconciliation lag; none are allocated to a guessed store.
+      canonicalMinusSource: { current: currentDifferences, previous: previousDifferences },
+      hasCanonicalDifferences: Object.keys(currentDifferences).length > 0 || Object.keys(previousDifferences).length > 0,
+    };
 
     const rtsForecastPct = 20;
+    const processedSalesAgg = { _sum: { cod: currentAggSums.processedSales } };
+    const prevProcessedSalesAgg = { _sum: { cod: prevAggSums.processedSales } };
+    const totalOrdersCount = currentAggSums.cancellationTotal || 0;
+    const cancelledOrdersCount = currentAggSums.canceledOrders || 0;
+    const prevTotalOrdersCount = prevAggSums.cancellationTotal || 0;
+    const prevCancelledOrdersCount = prevAggSums.canceledOrders || 0;
+    const undeliveredOrdersCount = currentAggSums.undeliveredOrders || 0;
+    const returnedOrdersCount = currentAggSums.returnedOrders || 0;
+    const prevUndeliveredOrdersCount = prevAggSums.undeliveredOrders || 0;
+    const prevReturnedOrdersCount = prevAggSums.returnedOrders || 0;
     const agg = { _sum: currentAggSums };
     const prevAgg = { _sum: prevAggSums };
     const kpiOpts = { excludeCancel, excludeRestocking, excludeAbandoned, excludeRts, excludeRepurchase, includeTax12, includeTax1, rtsForecastPct };
@@ -1755,8 +1768,9 @@ export class SalesAnalyticsService {
       products,
       deliveryStatuses,
       volumeGrowthTrend: [],
+      coverage,
     };
-    await this.analyticsCache.set(cacheKey, response);
+    if (JSON.stringify(scopeKey(scopeStores)) === JSON.stringify(scopeKey(tenantStores))) await this.analyticsCache.set(cacheKey, response);
     return response;
   }
 
