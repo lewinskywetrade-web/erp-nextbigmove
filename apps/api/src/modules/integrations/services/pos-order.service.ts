@@ -1,4 +1,4 @@
-import { Injectable, Logger, Optional } from '@nestjs/common';
+import { ConflictException, Injectable, Logger, Optional } from '@nestjs/common';
 import { PrismaService } from '../../../common/prisma/prisma.service';
 import { buildProductMappingKey } from '../../workflows/utils/product-mapping-key';
 import { Prisma } from '@prisma/client';
@@ -10,6 +10,7 @@ import * as timezone from 'dayjs/plugin/timezone';
 import { WmsFulfillmentSyncService } from '../../wms-fulfillment/wms-fulfillment-sync.service';
 import { WmsInventoryService } from '../../wms-inventory/wms-inventory.service';
 import { WmsOutboundRecordsService } from '../../wms-inventory/wms-outbound-records.service';
+import { COGS_REFRESH_PARENT_LOCK_SQL } from './product-cogs-recalculation.service';
 import { WorkflowExecutionGateway } from '../../workflows/gateways/workflow-execution.gateway';
 import {
   ORDERS_STATUS_SUMMARY_UPDATED_EVENT,
@@ -491,19 +492,72 @@ export class PosOrderService {
     return unique.join('-');
   }
 
-  /**
-   * Calculate COGS from note_product using PosProductCogs table
-   * @param tenantId - Tenant ID
-   * @param storeId - POS store ID
-   * @param items - Order items array
-   * @param dateLocal - Order date in YYYY-MM-DD format
-   * @returns Total COGS and total quantity
-   */
+  /** Resolve one catalog identity without guessing between sibling variants. */
+  private async resolveCogsProduct(tenantId: string, storeId: string, item: any,
+    client: Pick<Prisma.TransactionClient, 'posProduct'> = this.prisma) {
+    const identifier = this.readCogsIdentifier;
+    const variationId = identifier(item?.variation_id) ?? identifier(item?.variationId);
+    const productIds = [identifier(item?.product_id), identifier(item?.productId)]
+      .filter((value): value is string => Boolean(value));
+    const displayIds = [
+      identifier(item?.product_display_id),
+      identifier(item?.productDisplayId),
+      identifier(item?.variation_info?.product_display_id),
+      identifier(item?.variation_info?.display_id),
+      identifier(item?.variation_info?.barcode),
+    ].filter((value): value is string => Boolean(value));
+    const candidateIds = Array.from(new Set([...productIds, ...displayIds]));
+    if (!variationId && candidateIds.length === 0) return null;
+
+    const products = await client.posProduct.findMany({
+      where: {
+        storeId,
+        store: { tenantId },
+        OR: [
+          ...(variationId ? [{ variationId }] : []),
+          { productId: { in: candidateIds } },
+          { customId: { in: candidateIds } },
+        ],
+      },
+      select: { id: true, productId: true, variationId: true, customId: true },
+    });
+
+    // A parent product may have differently priced variants. An explicit
+    // variation is authoritative and must never resolve to an arbitrary sibling.
+    if (variationId) {
+      const exact = products.find((product) => product.variationId === variationId);
+      if (exact) return exact;
+    }
+
+    // Older catalog rows may have no real variation ID. Preserve their unique
+    // product/display lookup, but do not substitute a different modern variant
+    // when the source variation is absent from the catalog.
+    const eligible = variationId
+      ? products.filter((product) => !product.variationId || product.variationId === product.productId)
+      : products;
+    const displayMatches = eligible.filter((product) =>
+      product.customId && displayIds.includes(product.customId));
+    if (displayMatches.length > 0) {
+      return displayMatches.length === 1 ? displayMatches[0] : null;
+    }
+    const legacyMatches = eligible.filter((product) =>
+      candidateIds.includes(product.productId)
+      || Boolean(product.customId && candidateIds.includes(product.customId)));
+    return legacyMatches.length === 1 ? legacyMatches[0] : null;
+  }
+
+  private readCogsIdentifier(value: unknown): string | null {
+    if (typeof value !== 'string' && typeof value !== 'number') return null;
+    return String(value).trim() || null;
+  }
+
+  /** Calculate catalog COGS for the order date, with the legacy note fallback. */
   private async calculateCogs(
     tenantId: string,
     storeId: string,
     items: any[],
     dateLocal: string,
+    client: Pick<Prisma.TransactionClient, 'posProduct' | 'posProductCogs'> = this.prisma,
   ): Promise<{ cogs: number; totalQuantity: number }> {
     let totalCogs = 0;
     let totalQuantity = 0;
@@ -513,40 +567,30 @@ export class PosOrderService {
     for (const item of items) {
       const quantity = parseInt(item.quantity || '0', 10);
       const noteCogs = this.parseNoteProductCogs(item?.note_product, quantity);
-      // Accept multiple identifiers to find the product (pancake can send either product_id or product_display_id)
-      const candidateIds = [
-        item.product_id?.toString?.(),
-        item.product_display_id?.toString?.(),
-        item.variation_info?.product_display_id?.toString?.(),
-      ].filter((v) => !!v) as string[];
-
-      if (candidateIds.length === 0 || quantity === 0) {
+      if (quantity === 0) {
         if (noteCogs > 0) {
           totalCogs += noteCogs;
         }
         continue;
       }
 
-      // Find product in database (match productId or customId to any of the known identifiers)
-      const product = await this.prisma.posProduct.findFirst({
-        where: {
-          storeId,
-          OR: [
-            { productId: { in: candidateIds } },
-            { customId: { in: candidateIds } },
-          ],
-        },
-      });
+      const product = await this.resolveCogsProduct(tenantId, storeId, item, client);
 
       if (!product) {
         if (noteCogs > 0) {
           totalCogs += noteCogs;
+        } else {
+          this.logger.warn(`COGS unresolved catalog identity ${JSON.stringify({
+            storeId,
+            productId: this.readCogsIdentifier(item?.product_id) ?? this.readCogsIdentifier(item?.productId),
+            variationId: this.readCogsIdentifier(item?.variation_id) ?? this.readCogsIdentifier(item?.variationId),
+          })}`);
         }
         continue;
       }
 
       // Get COGS for the order date
-      let cogsEntry = await this.prisma.posProductCogs.findFirst({
+      let cogsEntry = await client.posProductCogs.findFirst({
         where: {
           tenantId,
           productId: product.id,
@@ -558,11 +602,15 @@ export class PosOrderService {
       });
 
       if (!cogsEntry) {
-        cogsEntry = await this.prisma.posProductCogs.findFirst({
+        // Undated legacy defaults may fill a gap, but a dated cost must never
+        // leak outside its effective window when an older order is reingested.
+        cogsEntry = await client.posProductCogs.findFirst({
           where: {
             tenantId,
             productId: product.id,
             storeId,
+            startDate: null,
+            OR: [{ endDate: { gte: orderDate } }, { endDate: null }],
           },
           orderBy: [{ updatedAt: 'desc' }, { createdAt: 'desc' }],
         });
@@ -579,6 +627,63 @@ export class PosOrderService {
     }
 
     return { cogs: totalCogs, totalQuantity };
+  }
+
+  private legacyOrderCogsFallback(cogs: number, items: any[]): number {
+    // Fallback COGS: if DB cogs 0, sum per-item note_product numeric part * qty
+    let cogsFallback = 0;
+    if (cogs === 0) {
+      for (const item of items) {
+        const np = item?.note_product;
+        if (!np || typeof np !== 'string') continue;
+        const parts = np.split('-');
+        const numRaw = parts[1] ?? '';
+        const num = parseFloat((numRaw || '').toString().replace(/[^0-9.\\-]/g, ''));
+        if (isNaN(num)) continue;
+        const unit = num;
+        const qty = parseInt(item.quantity || '0', 10);
+        const qtySafe = Math.max(qty || 0, 1);
+        cogsFallback += unit * qtySafe;
+      }
+      if (cogsFallback > 0) {
+        cogs = cogsFallback;
+      }
+    }
+
+    return cogs;
+  }
+
+  /** Re-read the ERP source and persist under the same source locks. */
+  private async withLockedErpCogsSource<T>(tenantId: string, storeId: string, items: any[], order: PosOrderData,
+    persist: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+    return this.prisma.$transaction(async tx => {
+      await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '5000ms'");
+      await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '15000ms'");
+      await tx.$executeRawUnsafe('LOCK TABLE pos_stores,pos_products IN SHARE MODE');
+      const stores = await tx.posStore.findMany({ where: { tenantId, shopId: order.shopId }, select: { id: true } });
+      if (stores.length !== 1 || stores[0].id !== storeId) throw new ConflictException('ERP COGS store scope is ambiguous');
+      // Catalog identity cannot change under table locks. Resolve before
+      // sorting parents, but defer every history read until parents are held.
+      const ids = new Set<string>();
+      for (const item of items) {
+        if (parseInt(item.quantity || '0', 10) === 0) continue;
+        const product = await this.resolveCogsProduct(tenantId, storeId, item, tx);
+        if (product) ids.add(product.id);
+      }
+      const sortedIds = [...ids].sort();
+      if (sortedIds.length) {
+        const locked = await tx.$queryRawUnsafe<Array<{ id: string }>>(COGS_REFRESH_PARENT_LOCK_SQL, sortedIds, storeId, tenantId);
+        if (locked.length !== sortedIds.length) throw new ConflictException('ERP COGS catalog scope changed');
+      }
+      const fresh = await this.calculateCogs(tenantId, storeId, items, order.dateLocal, tx);
+      order.cogs = this.legacyOrderCogsFallback(fresh.cogs, items);
+      order.totalQuantity = fresh.totalQuantity;
+      // Existing deletion/ownership transactions can lock an order before
+      // changing stores. Retry rather than wait on them under catalog locks.
+      await tx.$queryRawUnsafe(`SELECT id FROM pos_orders
+        WHERE "tenantId"=$1::uuid AND "shopId"=$2 AND "posOrderId"=$3 FOR UPDATE NOWAIT`, tenantId, order.shopId, order.posOrderId);
+      return persist(tx);
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10000, timeout: 20000 });
   }
 
   /**
@@ -631,9 +736,11 @@ export class PosOrderService {
       const variation = item.variation_info || {};
       return {
         quantity: item.quantity ?? null,
-        productId: item.product_id ?? null,
+        productId: item.product_id ?? item.productId ?? null,
+        variationId: item.variation_id ?? item.variationId ?? null,
         variationName: variation.name ?? null,
-        productDisplayId: variation.product_display_id ?? null,
+        productDisplayId: variation.product_display_id ?? item.product_display_id ?? item.productDisplayId
+          ?? variation.display_id ?? variation.barcode ?? null,
       };
     });
 
@@ -914,25 +1021,7 @@ export class PosOrderService {
       mapping = mapping.trim().toLowerCase();
     }
 
-    // Fallback COGS: if DB cogs 0, sum per-item note_product numeric part * qty
-    let cogsFallback = 0;
-    if (cogs === 0) {
-      for (const item of items) {
-        const np = item?.note_product;
-        if (!np || typeof np !== 'string') continue;
-        const parts = np.split('-');
-        const numRaw = parts[1] ?? '';
-        const num = parseFloat((numRaw || '').toString().replace(/[^0-9.\\-]/g, ''));
-        if (isNaN(num)) continue;
-        const unit = num;
-        const qty = parseInt(item.quantity || '0', 10);
-        const qtySafe = Math.max(qty || 0, 1);
-        cogsFallback += unit * qtySafe;
-      }
-      if (cogsFallback > 0) {
-        cogs = cogsFallback;
-      }
-    }
+    cogs = this.legacyOrderCogsFallback(cogs, items);
 
     const partnerExtend = (rawOrder.partner && typeof rawOrder.partner === 'object')
       ? rawOrder.partner.extend_code || rawOrder.partner.extendCode || null
@@ -1075,7 +1164,11 @@ export class PosOrderService {
 
       const hasItemsPayload = Array.isArray(rawOrder.items);
       const items = hasItemsPayload ? rawOrder.items : [];
-      const hasProduct = items.some((item: any) => !!item?.product_id);
+      const hasProduct = items.some((item: any) => [
+        item?.product_id, item?.productId, item?.variation_id, item?.variationId,
+        item?.product_display_id, item?.productDisplayId, item?.variation_info?.product_display_id,
+        item?.variation_info?.display_id, item?.variation_info?.barcode,
+      ].some(value => this.readCogsIdentifier(value) !== null));
       const isNoProductOrder = hasItemsPayload && (items.length === 0 || !hasProduct);
 
       try {
@@ -1134,107 +1227,127 @@ export class PosOrderService {
           order.isVoid = true;
         }
 
-        const persistedOrder = await this.prisma.posOrder.upsert({
-          where: {
-            tenantId_shopId_posOrderId: {
+        const persistOrder = async (client: Prisma.TransactionClient) => {
+          const persistedOrder = await client.posOrder.upsert({
+            where: {
+              tenantId_shopId_posOrderId: {
+                tenantId,
+                shopId: order.shopId,
+                posOrderId: order.posOrderId,
+              },
+            },
+            create: {
               tenantId,
+              teamId,
               shopId: order.shopId,
               posOrderId: order.posOrderId,
+              insertedAt: order.insertedAt,
+              dateLocal: order.dateLocal,
+              deliveredAt: order.deliveredAt,
+              rtsAt: order.rtsAt,
+              undeliverableAt: order.undeliverableAt,
+              status: order.status,
+              statusName: order.statusName,
+              cod: order.cod ? new Decimal(order.cod) : null,
+              salesCod: new Decimal(order.salesCod || 0),
+              mktgCod: new Decimal(order.mktgCod || 0),
+              isMarketingSource: !!order.isMarketingSource,
+              forUpsell: !!order.forUpsell,
+              isRiskConfirmation: !!order.isRiskConfirmation,
+              isAbandoned: !!order.isAbandoned,
+              wasAbandonedCart: !!order.wasAbandonedCart,
+              isRepurchase: !!order.isRepurchase,
+              isUndeliverable: !!order.isUndeliverable,
+              isVoid: !!order.isVoid,
+              confirmationUpdateRequestedAt: null,
+              confirmationUpdateTargetStatus: null,
+              pUtmCampaign: order.pUtmCampaign,
+              pUtmContent: order.pUtmContent,
+              cogs: new Decimal(order.cogs),
+              totalQuantity: order.totalQuantity,
+              tracking: order.tracking,
+              mapping: order.mapping,
+              itemData: order.itemData,
+              tags: this.jsonOrDbNull(order.tags),
+              customerCare: order.customerCare,
+              marketer: order.marketer,
+              salesAssignee: order.salesAssignee,
+              customerName: order.customerName,
+              customerPhone: order.customerPhone,
+              customerAddress: order.customerAddress,
+              deliveryAttemptFailed: order.deliveryAttemptFailed ?? 0,
+              statusHistory: this.jsonOrDbNull(order.statusHistory),
+              trackingUpdates: this.jsonOrDbNull(order.trackingUpdates ?? null),
+              rtsReason: this.jsonOrDbNull(order.rtsReason),
+              upsellBreakdown: this.jsonOrDbNull(order.upsellBreakdown),
+              orderSnapshot: this.jsonOrDbNull(order.orderSnapshot),
+              assigningCare: order.assigningCare,
             },
-          },
-          create: {
-            tenantId,
-            teamId,
-            shopId: order.shopId,
-            posOrderId: order.posOrderId,
-            insertedAt: order.insertedAt,
-            dateLocal: order.dateLocal,
-            deliveredAt: order.deliveredAt,
-            rtsAt: order.rtsAt,
-            undeliverableAt: order.undeliverableAt,
-            status: order.status,
-            statusName: order.statusName,
-            cod: order.cod ? new Decimal(order.cod) : null,
-            salesCod: new Decimal(order.salesCod || 0),
-            mktgCod: new Decimal(order.mktgCod || 0),
-            isMarketingSource: !!order.isMarketingSource,
-            forUpsell: !!order.forUpsell,
-            isRiskConfirmation: !!order.isRiskConfirmation,
-            isAbandoned: !!order.isAbandoned,
-            wasAbandonedCart: !!order.wasAbandonedCart,
-            isRepurchase: !!order.isRepurchase,
-            isUndeliverable: !!order.isUndeliverable,
-            isVoid: !!order.isVoid,
-            confirmationUpdateRequestedAt: null,
-            confirmationUpdateTargetStatus: null,
-            pUtmCampaign: order.pUtmCampaign,
-            pUtmContent: order.pUtmContent,
-            cogs: new Decimal(order.cogs),
-            totalQuantity: order.totalQuantity,
-            tracking: order.tracking,
-            mapping: order.mapping,
-            itemData: order.itemData,
-            tags: this.jsonOrDbNull(order.tags),
-            customerCare: order.customerCare,
-            marketer: order.marketer,
-            salesAssignee: order.salesAssignee,
-            customerName: order.customerName,
-            customerPhone: order.customerPhone,
-            customerAddress: order.customerAddress,
-            deliveryAttemptFailed: order.deliveryAttemptFailed ?? 0,
-            statusHistory: this.jsonOrDbNull(order.statusHistory),
-            trackingUpdates: this.jsonOrDbNull(order.trackingUpdates ?? null),
-            rtsReason: this.jsonOrDbNull(order.rtsReason),
-            upsellBreakdown: this.jsonOrDbNull(order.upsellBreakdown),
-            orderSnapshot: this.jsonOrDbNull(order.orderSnapshot),
-            assigningCare: order.assigningCare,
-          },
-          update: {
-            teamId,
-            insertedAt: order.insertedAt,
-            ...(order.deliveredAt ? { deliveredAt: order.deliveredAt } : {}),
-            ...(order.rtsAt ? { rtsAt: order.rtsAt } : {}),
-            undeliverableAt: order.undeliverableAt,
-            status: order.status,
-            statusName: order.statusName,
-            cod: order.cod ? new Decimal(order.cod) : null,
-            salesCod: new Decimal(order.salesCod || 0),
-            mktgCod: new Decimal(order.mktgCod || 0),
-            isMarketingSource: !!order.isMarketingSource,
-            forUpsell: !!order.forUpsell,
-            isRiskConfirmation: !!order.isRiskConfirmation,
-            isAbandoned: !!order.isAbandoned,
-            ...(order.wasAbandonedCart ? { wasAbandonedCart: true } : {}),
-            isRepurchase: !!order.isRepurchase,
-            isUndeliverable: !!order.isUndeliverable,
-            isVoid: !!order.isVoid,
-            confirmationUpdateRequestedAt: null,
-            confirmationUpdateTargetStatus: null,
-            pUtmCampaign: order.pUtmCampaign,
-            pUtmContent: order.pUtmContent,
-            cogs: new Decimal(order.cogs),
-            totalQuantity: order.totalQuantity,
-            tracking: order.tracking,
-            mapping: order.mapping,
-            itemData: order.itemData,
-            tags: this.jsonOrDbNull(order.tags),
-            customerCare: order.customerCare,
-            marketer: order.marketer,
-            salesAssignee: order.salesAssignee,
-            customerName: order.customerName,
-            customerPhone: order.customerPhone,
-            customerAddress: order.customerAddress,
-            deliveryAttemptFailed: order.deliveryAttemptFailed ?? 0,
-            statusHistory: this.jsonOrDbNull(order.statusHistory),
-            ...(order.trackingUpdates !== undefined
-              ? { trackingUpdates: this.jsonOrDbNull(order.trackingUpdates) }
-              : {}),
-            rtsReason: this.jsonOrDbNull(order.rtsReason),
-            upsellBreakdown: this.jsonOrDbNull(order.upsellBreakdown),
-            orderSnapshot: this.jsonOrDbNull(order.orderSnapshot),
-            assigningCare: order.assigningCare,
-          },
-        });
+            update: {
+              teamId,
+              insertedAt: order.insertedAt,
+              ...(order.deliveredAt ? { deliveredAt: order.deliveredAt } : {}),
+              ...(order.rtsAt ? { rtsAt: order.rtsAt } : {}),
+              undeliverableAt: order.undeliverableAt,
+              status: order.status,
+              statusName: order.statusName,
+              cod: order.cod ? new Decimal(order.cod) : null,
+              salesCod: new Decimal(order.salesCod || 0),
+              mktgCod: new Decimal(order.mktgCod || 0),
+              isMarketingSource: !!order.isMarketingSource,
+              forUpsell: !!order.forUpsell,
+              isRiskConfirmation: !!order.isRiskConfirmation,
+              isAbandoned: !!order.isAbandoned,
+              ...(order.wasAbandonedCart ? { wasAbandonedCart: true } : {}),
+              isRepurchase: !!order.isRepurchase,
+              isUndeliverable: !!order.isUndeliverable,
+              isVoid: !!order.isVoid,
+              confirmationUpdateRequestedAt: null,
+              confirmationUpdateTargetStatus: null,
+              pUtmCampaign: order.pUtmCampaign,
+              pUtmContent: order.pUtmContent,
+              // ERP reporting costs are updated separately only for explicit
+              // item payloads. WMS actual unit costs are an independent basis.
+              totalQuantity: order.totalQuantity,
+              tracking: order.tracking,
+              mapping: order.mapping,
+              itemData: order.itemData,
+              tags: this.jsonOrDbNull(order.tags),
+              customerCare: order.customerCare,
+              marketer: order.marketer,
+              salesAssignee: order.salesAssignee,
+              customerName: order.customerName,
+              customerPhone: order.customerPhone,
+              customerAddress: order.customerAddress,
+              deliveryAttemptFailed: order.deliveryAttemptFailed ?? 0,
+              statusHistory: this.jsonOrDbNull(order.statusHistory),
+              ...(order.trackingUpdates !== undefined
+                ? { trackingUpdates: this.jsonOrDbNull(order.trackingUpdates) }
+                : {}),
+              rtsReason: this.jsonOrDbNull(order.rtsReason),
+              upsellBreakdown: this.jsonOrDbNull(order.upsellBreakdown),
+              orderSnapshot: this.jsonOrDbNull(order.orderSnapshot),
+              assigningCare: order.assigningCare,
+            },
+          });
+          if (hasItemsPayload) {
+            await client.posOrder.updateMany({
+              where: {
+                id: persistedOrder.id,
+                tenantId,
+                shopId: order.shopId,
+                posOrderId: order.posOrderId,
+                // Preserve a concurrent ERP reporting-cost correction.
+                updatedAt: persistedOrder.updatedAt,
+              },
+              data: { cogs: new Decimal(order.cogs) },
+            });
+          }
+          return persistedOrder;
+        };
+        const persistedOrder = hasItemsPayload
+          ? await this.withLockedErpCogsSource(tenantId, storeId, items, order, persistOrder)
+          : await persistOrder(this.prisma);
         await this.syncUndeliverableAttempts({
           tenantId,
           storeId,
@@ -1378,21 +1491,6 @@ export class PosOrderService {
       }
     }
 
-    const wmsCogsCandidates = Array.from(
-      new Map(
-        [...fulfillmentCandidates, ...dispatchCandidates]
-          .map((ref) => [`${ref.shopId}::${ref.posOrderId}`, ref] as const),
-      ).values(),
-    );
-
-    if (wmsCogsCandidates.length > 0) {
-      await this.wmsInventoryService.syncPosOrderCogsFromMatchedInventoryUnits({
-        tenantId,
-        storeId,
-        posOrderRefs: wmsCogsCandidates,
-      });
-    }
-
     const changedSummaryCount = outcomes.filter((outcome) => (
       outcome.upsertStatus === 'UPSERTED' || outcome.upsertStatus === 'DELETED'
     )).length;
@@ -1420,10 +1518,15 @@ export class PosOrderService {
 
     return (
       code === 'P2034' ||
+      code === 'P2028' ||
       code === '40001' ||
       code === '40P01' ||
+      code === '55P03' ||
+      code === '57014' ||
       metaCode === '40P01' ||
       metaCode === '40001' ||
+      metaCode === '55P03' ||
+      metaCode === '57014' ||
       message.includes('deadlock detected') ||
       message.includes('40p01') ||
       message.includes('could not serialize access due to') ||

@@ -59,6 +59,12 @@ import {
   type SalesProductsExportRow,
 } from '../../_utils/sales-products-export';
 
+import {
+  buildSalesKpiForecast,
+  buildSalesProductForecast,
+  getSafeRtsForecastPct,
+} from '../../_utils/sales-forecast';
+
 const Datepicker = dynamic(() => import('react-tailwindcss-datepicker'), { ssr: false });
 
 const KPI_VISIBILITY_STORAGE_KEY = 'sales-attribution-analytics-visible-kpis';
@@ -74,60 +80,6 @@ const DEFAULT_VISIBLE_KPI_KEYS = [
   ...metricDefinitions.map((def) => String(def.key)),
   ...secondaryMetricDefinitions.map((def) => String(def.key)),
 ].filter((key) => !DEFAULT_HIDDEN_KPI_KEYS.has(key));
-
-function getSafeRtsForecastPct(pct: number) {
-  return Math.max(0, Math.min(100, Number.isFinite(pct) ? pct : 20));
-}
-
-function computeCmRtsForecast(params: {
-  revenueBase: number;
-  adSpend: number;
-  sf: number;
-  ff: number;
-  iF: number;
-  codFeeDelivered: number;
-  cogsAdjusted: number;
-  cogsRts: number;
-  rtsPct: number;
-}) {
-  const rtsFraction = getSafeRtsForecastPct(params.rtsPct) / 100;
-  const revenueAfterRts = (1 - rtsFraction) * params.revenueBase;
-  const cmForecast =
-    revenueAfterRts -
-    params.adSpend -
-    params.sf -
-    params.ff -
-    params.iF -
-    params.codFeeDelivered -
-    params.cogsAdjusted +
-    params.cogsRts;
-  return { revenueAfterRts, cmForecast, rtsFraction };
-}
-
-function computeAdjustedCod(
-  cod: number,
-  canceled: number,
-  restocking: number,
-  opts: { excludeCancel: boolean; excludeRestocking: boolean },
-) {
-  return (
-    cod -
-    (opts.excludeCancel ? canceled : 0) -
-    (opts.excludeRestocking ? restocking : 0)
-  );
-}
-
-function computeAdjustedGrossCod(
-  kpis: OverviewResponse['kpis'],
-  opts: { excludeCancel: boolean; excludeRestocking: boolean },
-) {
-  return computeAdjustedCod(
-    kpis.gross_cod ?? 0,
-    kpis.canceled_cod ?? 0,
-    kpis.restocking_cod ?? 0,
-    opts,
-  );
-}
 
 function computeRtsPctFromCounts(counts?: OverviewResponse['counts'] | null) {
   if (!counts) return 0;
@@ -456,105 +408,37 @@ export default function SalesByTeamAnalyticsPage() {
     />
   );
 
+  const forecastOptions = {
+    excludeCancel: excludeCanceled,
+    excludeRestocking,
+    excludeAbandoned: true,
+    excludeRts,
+  };
   const computedKpis = data
-    ? (() => {
-        const adjustedGrossCod = computeAdjustedGrossCod(data.kpis, {
-          excludeCancel: excludeCanceled,
-          excludeRestocking,
-        });
-        const purchasesForCmRts =
-          (data.counts.purchases ?? 0) + (excludeRts ? data.counts.rts ?? 0 : 0);
-        const aovForCmRts = purchasesForCmRts > 0 ? adjustedGrossCod / purchasesForCmRts : 0;
-        const revenueBaseForCmRts = aovForCmRts * purchasesForCmRts;
-        const cogsTotal = data.kpis.cogs ?? 0;
-        const cogsCanceled = excludeCanceled ? data.kpis.cogs_canceled ?? 0 : 0;
-        const cogsRestocking = excludeRestocking ? data.kpis.cogs_restocking ?? 0 : 0;
-        const cogsAdjusted = cogsTotal - cogsCanceled - cogsRestocking;
-        return {
-          ...data.kpis,
-          rts_pct: computeRtsPctFromCounts(data.counts),
-          cm_rts_forecast: computeCmRtsForecast({
-            revenueBase: revenueBaseForCmRts,
-            adSpend: data.kpis.ad_spend ?? 0,
-            sf: data.kpis.sf_fees ?? 0,
-            ff: data.kpis.ff_fees ?? 0,
-            iF: data.kpis.if_fees ?? 0,
-            codFeeDelivered: data.kpis.cod_fee_delivered ?? 0,
-            cogsAdjusted,
-            cogsRts: data.kpis.cogs_rts ?? 0,
-            rtsPct: rtsForecastSafe,
-          }).cmForecast,
-        };
-      })()
+    ? {
+        ...data.kpis,
+        rts_pct: computeRtsPctFromCounts(data.counts),
+        cm_rts_forecast: buildSalesKpiForecast(
+          data.kpis, data.counts, forecastOptions, rtsForecastSafe,
+        ).cmForecast,
+      }
     : null;
-
   const computedPrevKpis = data
-    ? (() => {
-        const adjustedGrossCod = computeAdjustedGrossCod(data.prevKpis, {
-          excludeCancel: excludeCanceled,
-          excludeRestocking,
-        });
-        const purchasesForCmRts =
-          (data.prevCounts.purchases ?? 0) + (excludeRts ? data.prevCounts.rts ?? 0 : 0);
-        const aovForCmRts = purchasesForCmRts > 0 ? adjustedGrossCod / purchasesForCmRts : 0;
-        const revenueBaseForCmRts = aovForCmRts * purchasesForCmRts;
-        const cogsTotal = data.prevKpis.cogs ?? 0;
-        const cogsCanceled = excludeCanceled ? data.prevKpis.cogs_canceled ?? 0 : 0;
-        const cogsRestocking = excludeRestocking ? data.prevKpis.cogs_restocking ?? 0 : 0;
-        const cogsAdjusted = cogsTotal - cogsCanceled - cogsRestocking;
-        return {
-          ...data.prevKpis,
-          rts_pct: computeRtsPctFromCounts(data.prevCounts),
-          cm_rts_forecast: computeCmRtsForecast({
-            revenueBase: revenueBaseForCmRts,
-            adSpend: data.prevKpis.ad_spend ?? 0,
-            sf: data.prevKpis.sf_fees ?? 0,
-            ff: data.prevKpis.ff_fees ?? 0,
-            iF: data.prevKpis.if_fees ?? 0,
-            codFeeDelivered: data.prevKpis.cod_fee_delivered ?? 0,
-            cogsAdjusted,
-            cogsRts: data.prevKpis.cogs_rts ?? 0,
-            rtsPct: rtsForecastSafe,
-          }).cmForecast,
-        };
-      })()
+    ? {
+        ...data.prevKpis,
+        rts_pct: computeRtsPctFromCounts(data.prevCounts),
+        cm_rts_forecast: buildSalesKpiForecast(
+          data.prevKpis, data.prevCounts, forecastOptions, rtsForecastSafe,
+        ).cmForecast,
+      }
     : null;
 
   const products = data?.products || [];
   const sortableProducts: SalesProductRowItem[] = products.map((row, index) => {
     const normalized = (row.mapping || '__null__').toLowerCase();
     const display = row.mapping ? (mappingDisplayMap[normalized] || row.mapping) : 'Unassigned';
-    const baseCod = row.cod_raw ?? row.revenue ?? 0;
-    const canceledCod = row.canceled_cod ?? 0;
-    const restockingCod = row.restocking_cod ?? 0;
-    const adjustedGrossCod = Math.max(
-      0,
-      computeAdjustedCod(baseCod, canceledCod, restockingCod, {
-        excludeCancel: excludeCanceled,
-        excludeRestocking,
-      }),
-    );
-    const purchasesForCmRts =
-      (row.gross_sales ?? 0) + (excludeRts ? row.rts_count ?? 0 : 0);
-    const aovForCmRts = purchasesForCmRts > 0 ? adjustedGrossCod / purchasesForCmRts : 0;
-    const revenueBaseForCmRts = aovForCmRts * purchasesForCmRts;
-    const sf = row.sf_raw ?? row.sf_fees ?? 0;
-    const ff = row.ff_raw ?? row.ff_fees ?? 0;
-    const iF = row.if_raw ?? row.if_fees ?? 0;
-    const codFeeDelivered = row.cod_fee_delivered_raw ?? row.cod_fee_delivered ?? 0;
-    const cogsBase = row.cogs ?? 0;
-    const cogsAdjusted = cogsBase;
-    const forecast = computeCmRtsForecast({
-      revenueBase: revenueBaseForCmRts,
-      adSpend: row.ad_spend ?? 0,
-      sf,
-      ff,
-      iF,
-      codFeeDelivered,
-      cogsAdjusted,
-      cogsRts: row.cogs_rts ?? 0,
-      rtsPct: rtsForecastSafe,
-    });
+    const forecast = buildSalesProductForecast(row, forecastOptions, rtsForecastSafe);
+    const { sf, ff, iF, codFeeDelivered, cogsAdjusted, cogsRts } = forecast;
     const deliveredCount = row.delivered_count ?? 0;
     const rtsCount = row.rts_count ?? 0;
     const rtsPct = deliveredCount + rtsCount > 0 ? (rtsCount / (deliveredCount + rtsCount)) * 100 : 0;
@@ -571,7 +455,7 @@ export default function SalesByTeamAnalyticsPage() {
         iF,
         codFeeDelivered,
         cogsAdjusted,
-        cogsRts: row.cogs_rts ?? 0,
+        cogsRts,
       },
     };
   });
@@ -1028,29 +912,13 @@ export default function SalesByTeamAnalyticsPage() {
     const nf = (value: number) => formatMetricValue(value, 'currency');
     const neg = (value: number) => (value === 0 ? nf(0) : `- ${nf(Math.abs(value))}`);
     const pos = (value: number) => (value === 0 ? nf(0) : `+ ${nf(Math.abs(value))}`);
-    const cogsTotal = kpis.cogs ?? 0;
-    const cogsCanceled = excludeCanceled ? kpis.cogs_canceled ?? 0 : 0;
-    const cogsRestocking = excludeRestocking ? kpis.cogs_restocking ?? 0 : 0;
-    const cogsAdjusted = cogsTotal - cogsCanceled - cogsRestocking;
-    const adjustedGrossCod = computeAdjustedGrossCod(kpis, {
-      excludeCancel: excludeCanceled,
-      excludeRestocking,
-    });
-    const purchasesForCmRts =
-      (data.counts.purchases ?? 0) + (excludeRts ? data.counts.rts ?? 0 : 0);
-    const aovForCmRts = purchasesForCmRts > 0 ? adjustedGrossCod / purchasesForCmRts : 0;
-    const revenueBaseForCmRts = aovForCmRts * purchasesForCmRts;
-    const forecast = computeCmRtsForecast({
-      revenueBase: revenueBaseForCmRts,
-      adSpend: kpis.ad_spend ?? 0,
-      sf: kpis.sf_fees ?? 0,
-      ff: kpis.ff_fees ?? 0,
-      iF: kpis.if_fees ?? 0,
-      codFeeDelivered: kpis.cod_fee_delivered ?? 0,
-      cogsAdjusted,
-      cogsRts: kpis.cogs_rts ?? 0,
-      rtsPct: rtsForecastSafe,
-    });
+    const forecast = buildSalesKpiForecast(
+      kpis, data?.counts ?? {}, forecastOptions, rtsForecastSafe,
+    );
+    const {
+      cogsTotal, cogsCanceled, cogsRestocking, cogsAdjusted,
+      purchases: purchasesForCmRts, aov: aovForCmRts, revenueBase: revenueBaseForCmRts,
+    } = forecast;
     const filtersLabel = [
       `${startDate} → ${endDate}`,
       selectedTeamCode ? teamDisplay(selectedTeamCode) : 'All teams',
@@ -1099,12 +967,12 @@ export default function SalesByTeamAnalyticsPage() {
           <span>{neg(cogsTotal)}</span>
         </div>
         <div className="flex justify-between text-foreground">
-          <span>COGS Canceled</span>
-          <span>{neg(cogsCanceled)}</span>
+          <span>Excluded COGS Canceled</span>
+          <span>{pos(cogsCanceled)}</span>
         </div>
         <div className="flex justify-between text-foreground">
-          <span>COGS Restocking</span>
-          <span>{neg(cogsRestocking)}</span>
+          <span>Excluded COGS Restocking</span>
+          <span>{pos(cogsRestocking)}</span>
         </div>
         <div className="flex justify-between border-t border-slate-100 pt-1 text-foreground">
           <span>COGS (adjusted)</span>

@@ -26,6 +26,9 @@ dayjs.extend(customParseFormat);
 
 const TIMEZONE = 'Asia/Manila';
 const PROCESSED_SALES_STATUSES = [1, 2, 3, 9, 12, 13] as const;
+// Separate calculation revisions from data-cache versions and response shapes:
+// persisted responses from earlier math must not survive a calculation deploy.
+const SALES_CALCULATION_VERSION = 2;
 
 type SalesKpis = {
   revenue: number;
@@ -99,6 +102,8 @@ type ProductRow = {
   revenue: number;
   gross_sales: number;
   cogs: number;
+  cogs_raw: number;
+  cogs_canceled: number;
   aov: number;
   cpp: number;
   processed_cpp: number;
@@ -121,6 +126,7 @@ type ProductRow = {
   canceled_cod: number;
   restocking_cod: number;
   rts_cod: number;
+  abandoned_cod: number;
   cm_rts_forecast?: number;
 };
 
@@ -212,6 +218,8 @@ export class SalesAnalyticsService {
         processedPurchases: 0,
         cogsVisible: 0,
         cogsRaw: 0,
+        cogsCanceled: 0,
+        cogsRestocking: 0,
         cogsDelivered: 0,
         cogsRts: 0,
         deliveredCod: 0,
@@ -267,6 +275,8 @@ export class SalesAnalyticsService {
         (opts.excludeCancel ? this.toNumber(sum?._sum?.repurchaseCogsCanceledPos) : 0) -
         (opts.excludeRestocking ? this.toNumber(sum?._sum?.repurchaseCogsRestockingPos) : 0),
       cogsRaw: repurchaseCogs,
+      cogsCanceled: this.toNumber(sum?._sum?.repurchaseCogsCanceledPos),
+      cogsRestocking: this.toNumber(sum?._sum?.repurchaseCogsRestockingPos),
       cogsDelivered: this.toNumber(sum?._sum?.repurchaseCogsDeliveredPos),
       cogsRts: this.toNumber(sum?._sum?.repurchaseCogsRtsPos),
       deliveredCod: this.toNumber(sum?._sum?.repurchaseDeliveredCodPos),
@@ -431,7 +441,10 @@ export class SalesAnalyticsService {
       - (opts.excludeCancel ? canceledCod : 0)
       - (opts.excludeRestocking ? restockingCod : 0)
       - (opts.excludeAbandoned ? abandonedCod : 0)
-      - repurchaseAdj.codVisible;
+      // The forecast keeps RTS revenue before applying its scenario percentage,
+      // so it must remove the repurchase RTS subset as well.
+      - repurchaseAdj.codVisible
+      - (opts.excludeRts ? repurchaseAdj.rtsCod : 0);
     const cogsAdjustedForCmRts =
       cogs
       - (opts.excludeCancel ? cogsCanceled : 0)
@@ -439,7 +452,8 @@ export class SalesAnalyticsService {
       - repurchaseAdj.cogsVisible;
     const purchasesAdjForCmRts = Math.max(
       0,
-      purchasesRaw - cancelAdjCount - restockAdjCount - abandonedAdjCount - repurchaseAdj.purchases,
+      purchasesRaw - cancelAdjCount - restockAdjCount - abandonedAdjCount
+        - repurchaseAdj.purchases - (opts.excludeRts ? repurchaseAdj.rtsCount : 0),
     );
     const aovForCmRts = purchasesAdjForCmRts > 0 ? grossCodAdjusted / purchasesAdjForCmRts : 0;
     const revenueBaseForCmRts = aovForCmRts * purchasesAdjForCmRts;
@@ -479,8 +493,8 @@ export class SalesAnalyticsService {
       contribution_margin: cm,
       net_margin: net,
       cogs: cogs - repurchaseAdj.cogsRaw,
-      cogs_canceled: cogsCanceled,
-      cogs_restocking: cogsRestocking,
+      cogs_canceled: cogsCanceled - repurchaseAdj.cogsCanceled,
+      cogs_restocking: cogsRestocking - repurchaseAdj.cogsRestocking,
       cogs_rts: cogsRtsAdj,
       cogs_delivered: cogsDeliveredAdj,
       cod_fee: codFeeAdj,
@@ -619,7 +633,7 @@ export class SalesAnalyticsService {
       - (codFee - repurchaseAdj.codFee)
       + (cogsRts - repurchaseAdj.cogsRts);
 
-    const delivered = this.toNumber(sum?._sum?.deliveredCodPos);
+    const delivered = this.toNumber(sum?._sum?.deliveredCodPos) - repurchaseAdj.deliveredCod;
     const sfSdr = this.toNumber(sum?._sum?.sfSdrPos);
     const ffSdr = this.toNumber(sum?._sum?.ffSdrPos);
     const ifSdr = this.toNumber(sum?._sum?.ifSdrPos);
@@ -641,14 +655,16 @@ export class SalesAnalyticsService {
     const processedCpp = processedPurchases > 0 ? spend / processedPurchases : 0;
     const purchasesAdjForCmRts = Math.max(
       0,
-      purchasesRaw - cancelAdjCount - restockAdjCount - abandonedAdjCount - repurchaseAdj.purchases,
+      purchasesRaw - cancelAdjCount - restockAdjCount - abandonedAdjCount
+        - repurchaseAdj.purchases - (opts.excludeRts ? repurchaseAdj.rtsCount : 0),
     );
     const grossCodAdjusted =
       cod
       - (opts.excludeCancel ? canceledCod : 0)
       - (opts.excludeRestocking ? restockingCod : 0)
       - (opts.excludeAbandoned ? abandonedCod : 0)
-      - repurchaseAdj.codVisible;
+      - repurchaseAdj.codVisible
+      - (opts.excludeRts ? repurchaseAdj.rtsCod : 0);
     const aovForCmRts = purchasesAdjForCmRts > 0 ? grossCodAdjusted / purchasesAdjForCmRts : 0;
     const revenueBaseForCmRts = aovForCmRts * purchasesAdjForCmRts;
     const rtsForecast = typeof opts.rtsForecastPct === 'number' ? opts.rtsForecastPct : 20;
@@ -668,6 +684,8 @@ export class SalesAnalyticsService {
       revenue,
       gross_sales: purchasesAdj,
       cogs: cogsAdjusted,
+      cogs_raw: cogs - repurchaseAdj.cogsRaw,
+      cogs_canceled: cogsCanceled - repurchaseAdj.cogsCanceled,
       aov,
       cpp,
       processed_cpp: processedCpp,
@@ -689,12 +707,13 @@ export class SalesAnalyticsService {
       if_raw: inf - repurchaseAdj.inf,
       cod_fee_delivered_raw:
         this.toNumber(sum?._sum?.codFeeDeliveredPos) - repurchaseAdj.codFeeDelivered,
-      cogs_ec: cogs - cogsCanceled, // exclude canceled only
+      cogs_ec: cogs - repurchaseAdj.cogsRaw - (cogsCanceled - repurchaseAdj.cogsCanceled),
       cogs_rts: cogsRts - repurchaseAdj.cogsRts,
-      cogs_restocking: this.toNumber(sum?._sum?.cogsRestockingPos),
-      canceled_cod: canceledCod,
-      restocking_cod: restockingCod,
-      rts_cod: rtsCod,
+      cogs_restocking: cogsRestocking - repurchaseAdj.cogsRestocking,
+      canceled_cod: canceledCod - repurchaseAdj.canceledCod,
+      restocking_cod: restockingCod - repurchaseAdj.restockingCod,
+      rts_cod: rtsCod - repurchaseAdj.rtsCod,
+      abandoned_cod: abandonedCod - repurchaseAdj.abandonedCod,
       cm_rts_forecast: cmRtsForecast,
     };
   }
@@ -777,6 +796,7 @@ export class SalesAnalyticsService {
     };
     const processedSalesWhere = this.teamContext.buildTenantWhereClause({
       dateLocal: { gte: startStr, lte: endStr },
+      isVoid: false,
       shopId: { in: activeShopIds },
       status: { in: [...PROCESSED_SALES_STATUSES] },
       ...(excludeRepurchase ? { isRepurchase: false } : {}),
@@ -784,6 +804,7 @@ export class SalesAnalyticsService {
     });
     const prevProcessedSalesWhere = this.teamContext.buildTenantWhereClause({
       dateLocal: { gte: prevStartStr, lte: prevEndStr },
+      isVoid: false,
       shopId: { in: activeShopIds },
       status: { in: [...PROCESSED_SALES_STATUSES] },
       ...(excludeRepurchase ? { isRepurchase: false } : {}),
@@ -791,12 +812,14 @@ export class SalesAnalyticsService {
     });
     const cancellationRateWhere = this.teamContext.buildTenantWhereClause({
       dateLocal: { gte: startStr, lte: endStr },
+      isVoid: false,
       shopId: { in: activeShopIds },
       ...(excludeRepurchase ? { isRepurchase: false } : {}),
       ...mappingFilter,
     });
     const prevCancellationRateWhere = this.teamContext.buildTenantWhereClause({
       dateLocal: { gte: prevStartStr, lte: prevEndStr },
+      isVoid: false,
       shopId: { in: activeShopIds },
       ...(excludeRepurchase ? { isRepurchase: false } : {}),
       ...mappingFilter,
@@ -805,6 +828,7 @@ export class SalesAnalyticsService {
     const cacheVersion = await this.analyticsCache.getVersion(tenantId);
     const cacheKeyPayload = {
       responseShapeVersion: 7,
+      calculationVersion: SALES_CALCULATION_VERSION,
       tenantId,
       analyticsScope: 'tenant',
       activeShopIds: [...activeShopIds].sort(),
@@ -1429,6 +1453,7 @@ export class SalesAnalyticsService {
     const cacheVersion = await this.analyticsCache.getVersion(tenantId);
     const cacheKeyPayload = {
       responseShapeVersion: 1,
+      calculationVersion: SALES_CALCULATION_VERSION,
       start: startStr,
       end: endStr,
       stores: [...selectedStoreIds].sort(),
@@ -1613,23 +1638,27 @@ export class SalesAnalyticsService {
     const posScope = { shopId: { in: selectedShopIds } };
     const processedSalesWhere = this.teamContext.buildTenantWhereClause({
       dateLocal: { gte: startStr, lte: endStr },
+      isVoid: false,
       ...posScope,
       status: { in: [...PROCESSED_SALES_STATUSES] },
       ...(excludeRepurchase ? { isRepurchase: false } : {}),
     });
     const prevProcessedSalesWhere = this.teamContext.buildTenantWhereClause({
       dateLocal: { gte: prevStartStr, lte: prevEndStr },
+      isVoid: false,
       ...posScope,
       status: { in: [...PROCESSED_SALES_STATUSES] },
       ...(excludeRepurchase ? { isRepurchase: false } : {}),
     });
     const cancellationRateWhere = this.teamContext.buildTenantWhereClause({
       dateLocal: { gte: startStr, lte: endStr },
+      isVoid: false,
       ...posScope,
       ...(excludeRepurchase ? { isRepurchase: false } : {}),
     });
     const prevCancellationRateWhere = this.teamContext.buildTenantWhereClause({
       dateLocal: { gte: prevStartStr, lte: prevEndStr },
+      isVoid: false,
       ...posScope,
       ...(excludeRepurchase ? { isRepurchase: false } : {}),
     });

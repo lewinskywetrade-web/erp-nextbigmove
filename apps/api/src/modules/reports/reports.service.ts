@@ -137,6 +137,7 @@ export class ReportsService {
         AND po."dateLocal" >= ${startDate}
         AND po."dateLocal" <= ${endDate}
         AND po."status" IS DISTINCT FROM 7
+        AND po."isVoid" IS DISTINCT FROM true
         AND EXISTS (
           SELECT 1
           FROM "pos_stores" ps

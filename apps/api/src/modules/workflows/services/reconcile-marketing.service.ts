@@ -469,31 +469,51 @@ export class ReconcileMarketingService {
       },
     });
 
-    // Build normalized map for Meta insights
-    const normToInsights: Record<string, typeof metaInsights> = {};
+    // A normalized identifier can refer to more than one imported Meta row.
+    // Keep exact identities too: copying one POS bucket to every collision
+    // duplicates revenue, costs, fees and order counts in all downstream reports.
+    const exactToInsights = new Map<string, typeof metaInsights>();
+    const normToInsights = new Map<string, typeof metaInsights>();
     for (const insight of metaInsights) {
+      const exact = insight.adId.trim();
+      if (exact) exactToInsights.set(exact, [...(exactToInsights.get(exact) ?? []), insight]);
       const norm = normalizeAdId(insight.adId);
       if (!norm) continue;
-      if (!normToInsights[norm]) normToInsights[norm] = [];
-      normToInsights[norm].push(insight);
+      normToInsights.set(norm, [...(normToInsights.get(norm) ?? []), insight]);
     }
 
-    // Aggregate POS by normalized ad id
-    const posAgg: Record<string, PosAggregateBucket> = {};
+    // Every order has at most one insight owner. Prefer an unambiguous exact
+    // identifier, otherwise accept a unique normalized match. Ambiguous matches
+    // stay as store-scoped synthetic POS rows rather than guessing an ad owner.
+    const posAggByAdId = new Map<string, PosAggregateBucket>();
+    const attributedOrders = new Set<PosOrderLite>();
+    let ambiguousOrderCount = 0;
     for (const order of posOrders) {
-      const norm = normalizeAdId(order.pUtmContent || '');
-      if (!norm) continue;
-      if (!posAgg[norm]) {
-        posAgg[norm] = this.createEmptyPosAggregateBucket();
+      const raw = order.pUtmContent?.trim() || '';
+      const norm = normalizeAdId(raw);
+      const candidates = exactToInsights.get(raw) ?? normToInsights.get(norm);
+      if (!candidates || candidates.length !== 1) {
+        if (candidates && candidates.length > 1) ambiguousOrderCount += 1;
+        continue;
       }
-      this.accumulatePosOrder(posAgg[norm], order);
+      const ownerId = candidates[0].adId;
+      let bucket = posAggByAdId.get(ownerId);
+      if (!bucket) {
+        bucket = this.createEmptyPosAggregateBucket();
+        posAggByAdId.set(ownerId, bucket);
+      }
+      this.accumulatePosOrder(bucket, order);
+      attributedOrders.add(order);
+    }
+    if (ambiguousOrderCount > 0) {
+      this.logger.warn(`Kept ${ambiguousOrderCount} POS orders unmatched because their ad attribution is ambiguous`);
     }
 
     // Upsert reconciled rows for matched insights
     const expectedAdIds = new Set(metaInsights.map((insight) => insight.adId));
     for (const insight of metaInsights) {
       const norm = normalizeAdId(insight.adId);
-      const agg = norm ? posAgg[norm] : undefined;
+      const agg = posAggByAdId.get(insight.adId);
       const matchedOrders = agg?.orders?.map((o) => ({
         shopId: o.shopId,
         posOrderId: o.posOrderId,
@@ -746,11 +766,9 @@ export class ReconcileMarketingService {
       });
     }
 
-    // Insert synthetic rows for unmatched POS orders (no matching Meta norm)
-    const marketingNormSet = new Set(Object.keys(normToInsights));
+    // Retain every unattributed order once, including ambiguous Meta matches.
     for (const order of posOrders) {
-      const norm = normalizeAdId(order.pUtmContent || '');
-      if (norm && marketingNormSet.has(norm)) {
+      if (attributedOrders.has(order)) {
         continue; // matched already
       }
       const syntheticAdId = `${order.shopId}-${order.posOrderId}`;
