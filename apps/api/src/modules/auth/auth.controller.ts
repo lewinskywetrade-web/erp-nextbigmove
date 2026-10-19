@@ -8,6 +8,7 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import * as bcrypt from 'bcrypt';
 import { PermissionWorkspaceQueryDto } from '../../common/dto/permission-workspace-query.dto';
 import {
+  filterPermissionKeysByWorkspace,
   normalizePermissionWorkspace,
   roleBelongsToWorkspace,
   type PermissionWorkspace,
@@ -144,7 +145,21 @@ export class AuthController {
     const tenantId = user.tenantId;
     const workspace = normalizePermissionWorkspace(query.workspace);
 
-    if (!userId || (!tenantId && workspace !== 'wms')) {
+    if (!userId) {
+      return { permissions: [] };
+    }
+
+    if (user.role === 'SUPER_ADMIN') {
+      const permissions = await this.prisma.permission.findMany({
+        select: { key: true },
+        orderBy: { key: 'asc' },
+      });
+      return {
+        permissions: filterPermissionKeysByWorkspace(permissions.map(({ key }) => key), workspace),
+      };
+    }
+
+    if (!tenantId && workspace !== 'wms') {
       return { permissions: [] };
     }
 
