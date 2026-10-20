@@ -1,7 +1,7 @@
 'use client';
 
 import { ImpersonationBanner } from './_components/impersonation-banner';
-import { getCurrentTenantId, getMemberships, type Membership } from '@/lib/session';
+import { applySession, getCurrentTenantId, getMemberships, type Membership } from '@/lib/session';
 import { switchTenant } from '@/lib/tenant-switch';
 
 import { ReactNode, useEffect, useState, useRef, useMemo } from 'react';
@@ -546,13 +546,8 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
   }, [user, canViewAllTeams]);
 
   const handleLogout = () => {
-    localStorage.removeItem('access_token');
-    localStorage.removeItem('refresh_token');
-    localStorage.removeItem('current_tenant_id');
-    localStorage.removeItem('tenant');
-    localStorage.removeItem('user');
-    localStorage.removeItem('impersonating_user');
-    router.push('/login');
+    applySession({});
+    window.location.href = '/login';
   };
 
   const handleTeamSelection = (teamId: string) => {

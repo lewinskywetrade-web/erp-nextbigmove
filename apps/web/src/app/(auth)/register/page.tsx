@@ -1,12 +1,12 @@
 'use client';
 
 import { useState } from 'react';
-import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import * as z from 'zod';
 import apiClient from '@/lib/api-client';
+import { applySession } from '@/lib/session';
 import { AlertBanner } from '@/components/ui/feedback';
 
 const registerSchema = z.object({
@@ -35,7 +35,6 @@ const parseRegisterError = (error: unknown) => {
 };
 
 export default function RegisterPage() {
-  const router = useRouter();
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
 
@@ -63,15 +62,10 @@ export default function RegisterPage() {
     try {
       const response = await apiClient.post('/auth/register', data);
 
-      // Store tokens and tenant info
-      localStorage.setItem('access_token', response.data.accessToken);
-      localStorage.setItem('refresh_token', response.data.refreshToken);
-      localStorage.setItem('current_tenant_id', response.data.tenant.id);
-      localStorage.setItem('tenant', JSON.stringify(response.data.tenant));
-      localStorage.setItem('user', JSON.stringify(response.data.user));
+      applySession(response.data);
 
       // Redirect to dashboard
-      router.push('/dashboard');
+      window.location.href = '/dashboard';
     } catch (error: unknown) {
       setError(parseRegisterError(error));
     } finally {

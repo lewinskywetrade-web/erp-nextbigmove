@@ -7,8 +7,8 @@ import { getImpersonation, stopImpersonation, syncImpersonationWithServer, type 
 /**
  * Always-visible reminder that this session is not your own.
  *
- * Without it an admin forgets and acts as someone else — every write lands
- * under the target's name, and the confusion surfaces much later.
+ * API-enforced read-only preview: keep the identity and return action visible
+ * even while the report underneath is scrolled.
  */
 export function ImpersonationBanner() {
   const [banner, setBanner] = useState<Banner | null>(null);
@@ -30,12 +30,13 @@ export function ImpersonationBanner() {
   if (!banner) return null;
 
   return (
-    <div className="flex items-center justify-center gap-3 bg-warning px-4 py-2 text-center text-sm font-medium text-white">
+    <div role="status" className="sticky top-0 z-50 flex flex-wrap items-center justify-center gap-3 bg-warning px-4 py-2 text-center text-sm font-medium text-white">
       <Eye className="h-4 w-4 shrink-0" aria-hidden="true" />
       <span>
-        Viewing as <strong>{banner.name}</strong>
+        Read-only preview: <strong>{banner.name}</strong>
         {banner.email ? <span className="font-normal opacity-80"> · {banner.email}</span> : null}
       </span>
+      <span className="text-xs font-normal">Record changes are blocked · Up to 15 minutes</span>
       <button
         type="button"
         disabled={isExiting}
@@ -49,7 +50,7 @@ export function ImpersonationBanner() {
         }}
         className="rounded-md bg-surface px-2.5 py-1 text-xs font-semibold text-foreground transition hover:opacity-90 disabled:opacity-60"
       >
-        {isExiting ? 'Exiting…' : 'Exit'}
+        {isExiting ? 'Exiting…' : 'Exit preview'}
       </button>
       {error ? <span className="text-xs font-normal">{error}</span> : null}
     </div>

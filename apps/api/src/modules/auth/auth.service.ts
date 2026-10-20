@@ -11,6 +11,17 @@ import { toStoredPermissionWorkspace } from '../../common/rbac/permission-worksp
 import { WmsStaffActivityService } from '../../common/services/wms-staff-activity.service';
 import { EffectiveAccessService } from '../../common/services/effective-access.service';
 
+const IMPERSONATION_MAX_SECONDS = 15 * 60;
+type ImpersonationClaims = {
+  userId: string;
+  tenantId: string | null;
+  impersonatedBy?: string | null;
+  originalSessionId?: string | null;
+  sessionId?: string | null;
+  impersonationExpiresAt?: number;
+  exp?: number;
+};
+
 @Injectable()
 export class AuthService {
   constructor(
@@ -257,6 +268,34 @@ export class AuthService {
         secret: this.configService.get<string>('jwt.refreshSecret'),
       });
 
+      if (payload.impersonatedBy) {
+        // Old preview refresh tokens had a seven-day expiry and lost the actor
+        // on refresh. Never turn one into an ordinary target session.
+        if (!Number.isInteger(payload.impersonationExpiresAt)) {
+          throw new UnauthorizedException('This View As session has expired. Sign in again.');
+        }
+        const preview = await this.validateImpersonationSession(payload);
+        const target = preview.target!;
+        const tokens = await this.generateTokens(
+          target.id, preview.tenant.id, target.role,
+          typeof payload.sessionId === 'string' ? payload.sessionId : crypto.randomUUID(),
+          {
+            impersonatedBy: preview.actor.id,
+            originalSessionId: payload.originalSessionId ?? null,
+            impersonationExpiresAt: preview.expiresAt,
+          },
+        );
+        return {
+          user: this.sanitizeUser({ ...target, tenantId: preview.tenant.id, defaultTeamId: preview.targetDefaultTeamId }),
+          tenant: this.sanitizeTenant(preview.tenant),
+          memberships: this.previewMemberships(preview.tenant),
+          impersonatedBy: preview.actor.id,
+          impersonationReadOnly: true,
+          impersonationExpiresAt: preview.expiresAt,
+          ...tokens,
+        };
+      }
+
       // Verify user still exists and is active
       const user = await this.prisma.user.findUnique({
         where: { id: payload.userId },
@@ -363,7 +402,7 @@ export class AuthService {
     tenantId: string | null,
     role: string,
     sessionId: string,
-    impersonation?: { impersonatedBy: string; originalSessionId: string | null },
+    impersonation?: { impersonatedBy: string; originalSessionId: string | null; impersonationExpiresAt: number },
   ) {
     const payload = {
       userId,
@@ -376,14 +415,20 @@ export class AuthService {
       ...(impersonation ?? {}),
     };
 
+    const remainingPreviewSeconds = impersonation
+      ? impersonation.impersonationExpiresAt - Math.floor(Date.now() / 1000)
+      : null;
+    if (remainingPreviewSeconds !== null && (remainingPreviewSeconds <= 0 || remainingPreviewSeconds > IMPERSONATION_MAX_SECONDS)) {
+      throw new UnauthorizedException('This View As session has expired. Sign in again.');
+    }
     const [accessToken, refreshToken] = await Promise.all([
       this.jwtService.signAsync(payload, {
         secret: this.configService.get<string>('jwt.secret'),
-        expiresIn: this.configService.get<string>('jwt.expiresIn'),
+        expiresIn: remainingPreviewSeconds ?? this.configService.get<string>('jwt.expiresIn'),
       }),
       this.jwtService.signAsync(payload, {
         secret: this.configService.get<string>('jwt.refreshSecret'),
-        expiresIn: this.configService.get<string>('jwt.refreshExpiresIn'),
+        expiresIn: remainingPreviewSeconds ?? this.configService.get<string>('jwt.refreshExpiresIn'),
       }),
     ]);
 
@@ -400,7 +445,7 @@ export class AuthService {
    * Permissions are resolved server-side from the token's userId on every
    * request, so a token minted for the target grants exactly their access —
    * no module needs to know impersonation exists. What the token adds is the
-   * real actor, so writes can be attributed and the session can be handed back.
+   * real actor. JwtAuthGuard separately enforces read-only preview requests.
    */
   async impersonate(actor: { userId: string; tenantId: string | null; sessionId: string | null; impersonatedBy?: string }, targetUserId: string, request?: any) {
     if (actor.impersonatedBy) {
@@ -413,40 +458,15 @@ export class AuthService {
       throw new ForbiddenException('Tenant context is required');
     }
 
-    // Membership, not the row's tenantId, decides who is "in" this tenant now
-    // that an identity can belong to several.
-    const target = await this.prisma.user.findFirst({
-      where: {
-        id: targetUserId,
-        OR: [
-          { tenantId: actor.tenantId },
-          { tenantMemberships: { some: { tenantId: actor.tenantId, status: 'ACTIVE' } } },
-        ],
-      },
-    });
-    if (!target) {
-      throw new NotFoundException('User not found in this tenant');
-    }
-    const activeTenant = await this.prisma.tenant.findUnique({ where: { id: actor.tenantId } });
-    if (target.status !== 'ACTIVE') {
-      throw new BadRequestException('Cannot view as a deactivated user');
-    }
-    // SUPER_ADMIN bypasses every permission check, so impersonating one would
-    // escalate a tenant admin to platform-wide access.
-    if (target.role === 'SUPER_ADMIN') {
-      throw new ForbiddenException('This user cannot be impersonated');
-    }
-
-    const targetAccess = await this.effectiveAccessService.resolveUserAccess({
-      userId: target.id,
+    const expiresAt = Math.floor(Date.now() / 1000) + IMPERSONATION_MAX_SECONDS;
+    const preview = await this.validateImpersonationSession({
+      userId: targetUserId,
       tenantId: actor.tenantId,
-      basePermissions: [],
+      impersonatedBy: actor.userId,
+      impersonationExpiresAt: expiresAt,
     });
-    // Blocked both ways round: chaining through another admin would put every
-    // account in the tenant one hop away from a single compromised session.
-    if (targetAccess.permissions.includes('user.impersonate')) {
-      throw new ForbiddenException('Cannot view as a user who can impersonate others');
-    }
+    const target = preview.target!;
+    const activeTenant = preview.tenant;
 
     const sessionId = crypto.randomUUID();
     const tokens = await this.generateTokens(
@@ -454,7 +474,7 @@ export class AuthService {
       actor.tenantId,
       target.role,
       sessionId,
-      { impersonatedBy: actor.userId, originalSessionId: actor.sessionId },
+      { impersonatedBy: actor.userId, originalSessionId: actor.sessionId, impersonationExpiresAt: expiresAt },
     );
 
     await this.recordImpersonationAudit(request, {
@@ -466,33 +486,31 @@ export class AuthService {
     });
 
     return {
-      user: this.sanitizeUser(target),
-      tenant: activeTenant ? this.sanitizeTenant(activeTenant) : null,
+      user: this.sanitizeUser({ ...target, tenantId: activeTenant.id, defaultTeamId: preview.targetDefaultTeamId }),
+      tenant: this.sanitizeTenant(activeTenant),
+      memberships: this.previewMemberships(activeTenant),
       impersonatedBy: actor.userId,
+      impersonationReadOnly: true,
+      impersonationExpiresAt: expiresAt,
       ...tokens,
     };
   }
 
   /** Hand the session back to the admin who started it. */
-  async stopImpersonation(actor: { userId: string; tenantId: string | null; impersonatedBy?: string }, request?: any) {
+  async stopImpersonation(actor: ImpersonationClaims, request?: any) {
     if (!actor.impersonatedBy) {
       throw new BadRequestException('This session is not viewing as another user');
     }
 
-    const admin = await this.prisma.user.findFirst({
-      where: { id: actor.impersonatedBy },
-      include: { tenant: true },
-    });
-    if (!admin || admin.status !== 'ACTIVE') {
-      throw new UnauthorizedException('The original session is no longer valid');
-    }
+    const preview = await this.validateImpersonationSession(actor, true);
+    const admin = preview.actor;
 
     const sessionId = crypto.randomUUID();
     // The impersonated session was minted inside the admin's active tenant, so
     // that is where they return — not wherever the row's last-active pointer is.
-    const returnTenantId = actor.tenantId ?? admin.tenantId;
+    const returnTenantId = preview.tenant.id;
     const tokens = await this.generateTokens(admin.id, returnTenantId, admin.role, sessionId);
-    const returnTenant = returnTenantId ? await this.prisma.tenant.findUnique({ where: { id: returnTenantId } }) : null;
+    const returnTenant = preview.tenant;
 
     await this.recordImpersonationAudit(request, {
       tenantId: returnTenantId,
@@ -503,11 +521,85 @@ export class AuthService {
     });
 
     return {
-      user: this.sanitizeUser(admin),
-      tenant: returnTenant ? this.sanitizeTenant(returnTenant) : null,
+      user: this.sanitizeUser({ ...admin, tenantId: returnTenantId, defaultTeamId: preview.actorDefaultTeamId }),
+      tenant: this.sanitizeTenant(returnTenant),
       ...tokens,
       memberships: await this.listMemberships(admin.id),
     };
+  }
+
+  /**
+   * Resolve both identities against the fixed preview tenant on every request.
+   * Normal-login workspace fallback must never move a preview to another tenant.
+   * The exact stop route can restore the actor even after the target is removed.
+   */
+  async validateImpersonationSession(claims: ImpersonationClaims, stopping = false) {
+    const now = Math.floor(Date.now() / 1000);
+    const expiresAt = claims.impersonationExpiresAt ?? claims.exp;
+    if (!claims.impersonatedBy || !claims.tenantId || !claims.userId
+      || claims.impersonatedBy === claims.userId
+      || !Number.isInteger(expiresAt) || expiresAt! <= now || expiresAt! > now + IMPERSONATION_MAX_SECONDS) {
+      throw new UnauthorizedException('This View As session has expired or is no longer valid. Sign in again.');
+    }
+    const tenant = await this.prisma.tenant.findUnique({ where: { id: claims.tenantId } });
+    if (!tenant || !['ACTIVE', 'TRIAL'].includes(tenant.status)) {
+      throw new UnauthorizedException('The preview workspace is no longer active');
+    }
+    const actor = await this.prisma.user.findUnique({ where: { id: claims.impersonatedBy } });
+    if (!actor || actor.status !== 'ACTIVE') {
+      throw new UnauthorizedException('The original administrator is no longer active');
+    }
+    const actorDefaultTeamId = actor.role === 'SUPER_ADMIN'
+      ? (actor.tenantId === tenant.id ? actor.defaultTeamId : null)
+      : await this.assertPreviewTenantMembership(actor, tenant.id);
+    if (actor.role !== 'SUPER_ADMIN') {
+      const actorAccess = await this.effectiveAccessService.resolveUserAccess({
+        userId: actor.id, tenantId: tenant.id, basePermissions: actor.permissions ?? [], workspace: 'erp',
+      });
+      if (!actorAccess.permissions.includes('user.impersonate')) {
+        throw new ForbiddenException('The original administrator no longer has View As access');
+      }
+    }
+    if (stopping) return { actor, actorDefaultTeamId, tenant, target: null, targetDefaultTeamId: null, expiresAt: expiresAt! };
+
+    const target = await this.prisma.user.findUnique({ where: { id: claims.userId } });
+    if (!target) throw new NotFoundException('User not found in this workspace');
+    if (target.status !== 'ACTIVE') throw new ForbiddenException('Cannot view as a deactivated user');
+    if (target.role === 'SUPER_ADMIN' && actor.role !== 'SUPER_ADMIN') {
+      throw new ForbiddenException('Only a Super Admin can preview this user');
+    }
+    const targetDefaultTeamId = await this.assertPreviewTenantMembership(target, tenant.id);
+    const targetAccess = await this.effectiveAccessService.resolveUserAccess({
+      userId: target.id, tenantId: tenant.id, basePermissions: target.permissions ?? [],
+    });
+    if (targetAccess.permissions.includes('user.impersonate') && actor.role !== 'SUPER_ADMIN') {
+      throw new ForbiddenException('Cannot view as a user who can impersonate others');
+    }
+    return { actor, actorDefaultTeamId, tenant, target, targetDefaultTeamId, expiresAt: expiresAt! };
+  }
+
+  private async assertPreviewTenantMembership(user: { id: string; tenantId: string | null; defaultTeamId: string | null }, tenantId: string) {
+    const membership = await this.prisma.tenantMembership.findUnique({
+      where: { userId_tenantId: { userId: user.id, tenantId } },
+      select: { status: true, defaultTeamId: true },
+    });
+    // An explicitly revoked membership wins over the legacy row pointer.
+    if (membership) {
+      if (membership.status !== 'ACTIVE') throw new ForbiddenException('User no longer belongs to the preview workspace');
+      return membership.defaultTeamId;
+    }
+    if (user.tenantId === tenantId) return user.defaultTeamId;
+    throw new ForbiddenException('User does not belong to the preview workspace');
+  }
+
+  private previewMemberships(tenant: { id: string; name: string; slug: string | null }) {
+    return [{ tenantId: tenant.id, name: tenant.name, slug: tenant.slug ?? null, status: 'ACTIVE' }];
+  }
+
+  async listSessionMemberships(user: { userId: string; tenantId: string | null; impersonatedBy?: string | null }) {
+    if (!user.impersonatedBy) return this.listMemberships(user.userId);
+    const tenant = user.tenantId ? await this.prisma.tenant.findUnique({ where: { id: user.tenantId } }) : null;
+    return tenant ? this.previewMemberships(tenant) : [];
   }
 
   private async recordImpersonationAudit(request: any, params: {

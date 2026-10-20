@@ -1776,6 +1776,12 @@ export class OrdersService {
     shopIds: string[];
     shopDisplayMap: Map<string, string>;
   }) {
+    // Preview reads must not create, clear or change the target user's
+    // notification state. Existing summaries and unread rows remain readable.
+    if (this.cls.get('impersonatedBy')) {
+      return;
+    }
+
     const normalizedShopIds = this.normalizeAgingOrderScopeShopIds(params.shopIds);
     if (normalizedShopIds.length === 0) {
       return;
