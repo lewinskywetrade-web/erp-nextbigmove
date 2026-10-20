@@ -1,4 +1,6 @@
 import { Module } from '@nestjs/common';
+import { APP_INTERCEPTOR } from '@nestjs/core';
+import { WmsPartnerCostInterceptor } from './common/interceptors/wms-partner-cost.interceptor';
 import { CacheModule } from '@nestjs/cache-manager';
 import { ConfigModule } from '@nestjs/config';
 import { ThrottlerModule } from '@nestjs/throttler';
@@ -128,6 +130,6 @@ import { AiSettingsModule } from './modules/ai-settings/ai-settings.module';
     AiSettingsModule,
   ],
   controllers: [],
-  providers: [],
+  providers: [{ provide: APP_INTERCEPTOR, useClass: WmsPartnerCostInterceptor }],
 })
 export class AppModule {}

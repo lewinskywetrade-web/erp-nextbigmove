@@ -5,8 +5,10 @@ import { Prisma } from '@prisma/client';
 export const MAX_PRODUCT_COGS = 9_999_999_999.99;
 
 export function assertValidProductCogs(cogs: number): void {
-  if (!Number.isFinite(cogs) || cogs <= 0) {
-    throw new BadRequestException('cogs must be a finite number greater than 0');
+  // An explicit zero records stock supplied by a partner at no warehouse cost.
+  // Missing/null values must still fail validation rather than becoming zero.
+  if (!Number.isFinite(cogs) || cogs < 0) {
+    throw new BadRequestException('cogs must be a finite number greater than or equal to 0');
   }
   if (cogs > MAX_PRODUCT_COGS) {
     throw new BadRequestException(`cogs must not exceed ${MAX_PRODUCT_COGS}`);

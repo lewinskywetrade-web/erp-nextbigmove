@@ -173,25 +173,35 @@ export function RequestDetailPanel({
   const linkedInvoiceSummary = batch.invoice.linked;
   const isSelfBuy = batch.requestType === 'SELF_BUY';
   const paymentProofImageUrl = getSafeImageUrl(batch.paymentProofImageUrl);
-  const lineItemsTotal = batch.lines.reduce((sum, line) => {
+  const lineItemsTotal = batch.lines.reduce<number | null>((sum, line) => {
     const quantity = line.approvedQuantity ?? line.requestedQuantity;
-    const unitRate = line.partnerUnitCost ?? 0;
-    return sum + quantity * unitRate;
+    if (sum === null || !isKnownPartnerCost(line.partnerUnitCost)
+      || !Number.isFinite(quantity) || quantity < 0) return null;
+    const amount = sum + quantity * line.partnerUnitCost;
+    return Number.isFinite(amount) ? amount : null;
   }, 0);
-  const invoiceAmount = batch.invoice.amount ?? lineItemsTotal;
+  const hasPendingPartnerCost = lineItemsTotal === null;
+  const invoiceAmount = hasPendingPartnerCost ? null
+    : batch.invoice.amount == null ? lineItemsTotal
+      : isKnownPartnerCost(batch.invoice.amount) ? batch.invoice.amount : null;
+  const linkedInvoicePricesKnown = !linkedInvoice || (
+    isKnownPartnerCost(linkedInvoice.amountDue) && linkedInvoice.lines.length > 0
+    && linkedInvoice.lines.every((line) => isKnownPartnerCost(line.unitRate) && isKnownPartnerCost(line.amount))
+  );
+  const canPrintInvoice = !hasPendingPartnerCost && linkedInvoicePricesKnown;
   const revisedLines = batch.lines
     .map((line) => {
       const sourceSnapshot =
         line.sourceSnapshot && typeof line.sourceSnapshot === 'object' && !Array.isArray(line.sourceSnapshot)
           ? line.sourceSnapshot
           : null;
-      const originalPartnerUnitCost =
-        typeof sourceSnapshot?.originalPartnerUnitCost === 'number'
-          ? sourceSnapshot.originalPartnerUnitCost
-          : line.partnerUnitCost;
+      const revisedPartnerUnitCost = isKnownPartnerCost(line.partnerUnitCost) ? line.partnerUnitCost : null;
+      const originalPartnerUnitCost = sourceSnapshot && 'originalPartnerUnitCost' in sourceSnapshot
+        ? isKnownPartnerCost(sourceSnapshot.originalPartnerUnitCost) ? sourceSnapshot.originalPartnerUnitCost : null
+        : revisedPartnerUnitCost;
       const revisedQuantity = line.approvedQuantity ?? line.requestedQuantity;
       const hasQuantityChange = revisedQuantity !== line.requestedQuantity;
-      const hasRateChange = (line.partnerUnitCost ?? 0) !== (originalPartnerUnitCost ?? 0);
+      const hasRateChange = revisedPartnerUnitCost !== originalPartnerUnitCost;
 
       if (!hasQuantityChange && !hasRateChange) {
         return null;
@@ -203,7 +213,7 @@ export function RequestDetailPanel({
         originalQuantity: line.requestedQuantity,
         revisedQuantity,
         originalRate: originalPartnerUnitCost,
-        revisedRate: line.partnerUnitCost,
+        revisedRate: revisedPartnerUnitCost,
       };
     })
     .filter((line): line is NonNullable<typeof line> => Boolean(line));
@@ -263,7 +273,7 @@ export function RequestDetailPanel({
               <tbody className="divide-y divide-[#edf2f7] bg-white dark:divide-border dark:bg-surface">
                 {batch.lines.map((line) => {
                   const quantity = line.approvedQuantity ?? line.requestedQuantity;
-                  const rate = line.partnerUnitCost ?? 0;
+                  const rate = isKnownPartnerCost(line.partnerUnitCost) ? line.partnerUnitCost : null;
                   return (
                     <tr key={line.id}>
                       <td className="px-3 py-2.5 text-[#4d6677] dark:text-slate-300">{line.lineNo}</td>
@@ -271,9 +281,9 @@ export function RequestDetailPanel({
                         {line.requestedProductName || line.variationId || line.productId || 'Item'}
                       </td>
                       <td className="px-3 py-2.5 text-right tabular-nums text-forergound">{quantity}</td>
-                      <td className="px-3 py-2.5 text-right tabular-nums text-forergound">{formatMoney(rate)}</td>
+                      <td className="px-3 py-2.5 text-right tabular-nums text-forergound">{formatPartnerCost(rate)}</td>
                       <td className="px-3 py-2.5 text-right tabular-nums font-semibold text-forergound">
-                        {formatMoney(quantity * rate)}
+                        {formatPartnerCost(rate === null ? null : quantity * rate)}
                       </td>
                     </tr>
                   );
@@ -287,9 +297,15 @@ export function RequestDetailPanel({
               <div className="rounded-xl border border-[#e3e9ef] dark:border-border bg-surface p-3">
                 <div className="flex items-center justify-between text-sm">
                   <span className="font-semibold text-forergound">Total Amount</span>
-                  <span className="font-semibold text-forergound">{formatMoney(invoiceAmount)}</span>
+                  <span className="font-semibold text-forergound">{formatPartnerCost(invoiceAmount)}</span>
                 </div>
               </div>
+
+              {hasPendingPartnerCost ? (
+                <p className="text-sm text-[#6d8191] dark:text-slate-300">
+                  Partner cost pending. Totals and invoice printing are unavailable until every line has a valid partner price.
+                </p>
+              ) : null}
 
               <div className="card">
                 <p className="card-label">
@@ -316,14 +332,15 @@ export function RequestDetailPanel({
                       <p className="mt-1 text-xs text-[#6d8191] dark:text-slate-300">
                         {formatShortDate(linkedInvoiceSummary.issueDate)} to {formatShortDate(linkedInvoiceSummary.dueDate)}
                         {' · '}
-                        {formatMoney(linkedInvoiceSummary.amountDue)}
+                        {formatPartnerCost(hasPendingPartnerCost ? null : linkedInvoiceSummary.amountDue)}
                       </p>
                     </div>
                     <div className="flex shrink-0 flex-wrap justify-end gap-2">
                       <button
                         type="button"
-                        disabled={isLoadingLinkedInvoice}
+                        disabled={isLoadingLinkedInvoice || hasPendingPartnerCost}
                         onClick={() => {
+                          if (hasPendingPartnerCost) return;
                           void onLoadLinkedInvoice().then((invoice) => {
                             if (invoice) {
                               setIsInvoicePreviewOpen(true);
@@ -336,8 +353,8 @@ export function RequestDetailPanel({
                       </button>
                       <button
                         type="button"
-                        disabled={isPrintingLinkedInvoice}
-                        onClick={() => void onPrintLinkedInvoice()}
+                        disabled={isPrintingLinkedInvoice || !canPrintInvoice}
+                        onClick={() => { if (canPrintInvoice) void onPrintLinkedInvoice(); }}
                         className="btn btn-sm btn-primary-soft"
                       >
                         {isPrintingLinkedInvoice ? 'Preparing...' : 'Print / Save PDF'}
@@ -395,8 +412,8 @@ export function RequestDetailPanel({
                         <span className="font-semibold text-forergound">{line.revisedQuantity}</span>
                       </p>
                       <p>
-                        Rate: <span className="font-semibold text-forergound">{formatMoney(line.originalRate)}</span> to{' '}
-                        <span className="font-semibold text-forergound">{formatMoney(line.revisedRate)}</span>
+                        Rate: <span className="font-semibold text-forergound">{formatPartnerCost(line.originalRate)}</span> to{' '}
+                        <span className="font-semibold text-forergound">{formatPartnerCost(line.revisedRate)}</span>
                       </p>
                     </div>
                   </div>
@@ -694,7 +711,7 @@ export function RequestDetailPanel({
               </div>
               <div className="rounded-xl border border-[#e3e9ef] bg-[#fbfdff] p-3">
                 <p className="card-label">Amount Due</p>
-                <p className="mt-1 text-sm font-semibold text-forergound">{formatMoney(linkedInvoice.amountDue)}</p>
+                <p className="mt-1 text-sm font-semibold text-forergound">{formatPartnerCost(hasPendingPartnerCost ? null : linkedInvoice.amountDue)}</p>
               </div>
             </div>
 
@@ -722,8 +739,8 @@ export function RequestDetailPanel({
                         ) : null}
                       </td>
                       <td className="px-3 py-2.5 text-right tabular-nums text-forergound">{line.quantity}</td>
-                      <td className="px-3 py-2.5 text-right tabular-nums text-forergound">{formatMoney(line.unitRate)}</td>
-                      <td className="px-3 py-2.5 text-right tabular-nums font-semibold text-forergound">{formatMoney(line.amount)}</td>
+                      <td className="px-3 py-2.5 text-right tabular-nums text-forergound">{formatPartnerCost(hasPendingPartnerCost ? null : line.unitRate)}</td>
+                      <td className="px-3 py-2.5 text-right tabular-nums font-semibold text-forergound">{formatPartnerCost(hasPendingPartnerCost ? null : line.amount)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -740,8 +757,8 @@ export function RequestDetailPanel({
               </button>
               <button
                 type="button"
-                disabled={isPrintingLinkedInvoice}
-                onClick={() => void onPrintLinkedInvoice()}
+                disabled={isPrintingLinkedInvoice || !canPrintInvoice}
+                onClick={() => { if (canPrintInvoice) void onPrintLinkedInvoice(); }}
                 className="btn btn-sm btn-primary-soft"
               >
                 {isPrintingLinkedInvoice ? 'Preparing...' : 'Print / Save PDF'}
@@ -802,4 +819,12 @@ function getSafeImageUrl(url: string | null | undefined) {
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
+}
+
+function isKnownPartnerCost(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function formatPartnerCost(value: unknown) {
+  return isKnownPartnerCost(value) ? formatMoney(value) : 'Partner cost pending / unavailable';
 }

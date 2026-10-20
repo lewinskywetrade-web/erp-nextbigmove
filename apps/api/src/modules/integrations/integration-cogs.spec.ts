@@ -170,7 +170,7 @@ function createHarness(initialRows: any[] = []) {
 }
 
 const invalidAmounts: unknown[] = [
-  undefined, null, '12.34', {}, NaN, Infinity, -Infinity, -1, 0,
+  undefined, null, '12.34', {}, NaN, Infinity, -Infinity, -1,
   0.001, 12.345, 10_000_000_000,
 ];
 
@@ -206,7 +206,7 @@ describe('product COGS service validation', () => {
     expect(getStore).not.toHaveBeenCalled();
   });
 
-  it.each([0.01, 12.34, MAX_PRODUCT_COGS])('stores valid peso amounts unchanged: %p', async (amount) => {
+  it.each([0, 0.01, 12.34, MAX_PRODUCT_COGS])('stores valid peso amounts unchanged: %p', async (amount) => {
     const { service, operations } = createHarness();
     const entry = await service.addCogsEntry('product-1', 'store-1', amount);
     expect(operations.create).toHaveBeenCalledWith({
@@ -272,7 +272,7 @@ describe('date-aware current COGS writes and reads', () => {
   it.each<[string, any[]]>([
     ['wrong tenant', [costEntry({ tenantId: 'other-tenant' })]],
     ['wrong store', [costEntry({ storeId: 'other-store' })]],
-    ['nonpositive cost', [costEntry({ cogs: new Decimal(0) })]],
+    ['negative cost', [costEntry({ cogs: new Decimal(-1) })]],
     ['invalid range', [costEntry({ startDate: today, endDate: yesterday })]],
     ['future start', [costEntry({ startDate: new Date('2026-10-20') })]],
     ['finite future expiry', [costEntry({ endDate: new Date('2026-10-20') })]],
@@ -362,6 +362,19 @@ describe('date-aware current COGS writes and reads', () => {
     expect((await service.getCogsForDate('product-1', 'store-1', yesterday))!.toString()).toBe('8');
   });
 
+  it('preserves a dated zero for partner-supplied stock and keeps the earlier paid rate', async () => {
+    const { service, rows, operations } = createHarness([costEntry({ startDate: new Date('2026-10-01') })]);
+    await service.addCogsEntry('product-1', 'store-1', 0);
+    expect((await service.getCogsForDate('product-1', 'store-1', yesterday))!.toString()).toBe('10');
+    expect((await service.getCogsForDate('product-1', 'store-1', today))!.toString()).toBe('0');
+    const zero = rows().find(row => row.startDate?.getTime() === today.getTime());
+    expect(zero!.cogs.toString()).toBe('0');
+    operations.update.mockClear();
+    await service.addCogsEntry('product-1', 'store-1', 0);
+    expect(operations.update).not.toHaveBeenCalled();
+    expect(rows()).toHaveLength(2);
+  });
+
   it('does not use a future baseline or an expired undated row for an earlier date', async () => {
     const { service } = createHarness([
       costEntry({ startDate: today }),
@@ -415,7 +428,7 @@ describe('single product COGS HTTP contracts', () => {
 
   it.each([
     undefined, null, {}, true, false, [], [12.34], '', ' ', '12.34',
-    NaN, Infinity, -Infinity, -1, 0, 0.001, 12.345, 10_000_000_000,
+    NaN, Infinity, -Infinity, -1, 0.001, 12.345, 10_000_000_000,
   ])(
     'returns a validation error for invalid request amount %p', async (amount) => {
       await expect(pipe.transform({ cogs: amount }, { type: 'body', metatype: ProductCogsDto }))
@@ -423,7 +436,7 @@ describe('single product COGS HTTP contracts', () => {
     },
   );
 
-  it.each([0.01, 12.34, MAX_PRODUCT_COGS])('accepts valid currency amount %p', async (amount) => {
+  it.each([0, 0.01, 12.34, MAX_PRODUCT_COGS])('accepts valid currency amount %p', async (amount) => {
     await expect(pipe.transform({ cogs: amount }, { type: 'body', metatype: ProductCogsDto }))
       .resolves.toMatchObject({ cogs: amount });
   });

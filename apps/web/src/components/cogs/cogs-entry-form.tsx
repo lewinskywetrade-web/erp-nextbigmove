@@ -78,14 +78,14 @@ export function CogsEntryForm({
       newErrors.cogs = "COGS amount is required";
       validationErrors.push("COGS amount is required");
     } else {
-      const cogsValue = parseFloat(cogs);
+      const cogsValue = Number(cogs);
 
-      if (Number.isNaN(cogsValue)) {
+      if (!Number.isFinite(cogsValue)) {
         newErrors.cogs = "COGS must be a valid number";
         validationErrors.push("COGS must be a valid number");
-      } else if (cogsValue <= 0) {
-        newErrors.cogs = "COGS must be greater than 0";
-        validationErrors.push("COGS must be greater than 0");
+      } else if (cogsValue < 0) {
+        newErrors.cogs = "COGS must be 0 or greater";
+        validationErrors.push("COGS must be 0 or greater");
       } else if (cogsValue > 1000000000) {
         newErrors.cogs = "COGS value is too large (max: PHP 1,000,000,000)";
         validationErrors.push("COGS value is too large (maximum: PHP 1,000,000,000)");
@@ -104,7 +104,7 @@ export function CogsEntryForm({
       return;
     }
 
-    void onSubmit(parseFloat(cogs));
+    void onSubmit(Number(cogs));
   };
 
   return (

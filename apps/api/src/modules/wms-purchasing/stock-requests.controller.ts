@@ -92,7 +92,9 @@ export class StockRequestsController {
   @Post('batches')
   @Permissions('stock_request.write')
   async createBatch(@Request() req: TenantRequest, @Body() body: CreateWmsPurchasingBatchDto) {
-    return this.wmsPurchasingService.createBatch(body, this.getTenantId(req));
+    // Managed procurement prices are quoted by the server from current ERP
+    // history. Self-buy retains the partner's explicit actual purchase price.
+    return this.wmsPurchasingService.createBatch(body, this.getTenantId(req), true);
   }
 
   @Post(':id/payment-proof')

@@ -57,7 +57,9 @@ function getSourceRequestId() {
 
 function getUnitAmount(product: WmsPurchasingProductOption, requestType: WmsPurchasingRequestType) {
   if (requestType === 'PROCUREMENT') {
-    return product.inhouseUnitCost ?? 0;
+    return typeof product.partnerUnitCost === 'number'
+      && Number.isFinite(product.partnerUnitCost) && product.partnerUnitCost >= 0
+      ? product.partnerUnitCost : null;
   }
   return null;
 }
@@ -364,9 +366,11 @@ export function useRequestsController() {
     );
     return {
       totalItems,
-      totalAmount,
+      totalAmount: cartLines.some((line) => line.unitAmount === null
+        || !Number.isFinite(line.unitAmount)
+        || (createRequestType === 'SELF_BUY' ? line.unitAmount <= 0 : line.unitAmount < 0)) ? null : totalAmount,
     };
-  }, [cartLines]);
+  }, [cartLines, createRequestType]);
 
   const submitRequest = useCallback(async () => {
     if (!cartLines.length) {
@@ -380,14 +384,15 @@ export function useRequestsController() {
       return;
     }
 
-    if (createRequestType === 'SELF_BUY') {
-      const missingUnitAmountLine = cartLines.find(
-        (line) => line.unitAmount === null || line.unitAmount <= 0,
-      );
-      if (missingUnitAmountLine) {
-        addToast('error', `Enter actual unit COGS for ${missingUnitAmountLine.product.name}`);
-        return;
-      }
+    const missingUnitAmountLine = cartLines.find(
+      (line) => line.unitAmount === null || !Number.isFinite(line.unitAmount)
+        || (createRequestType === 'SELF_BUY' ? line.unitAmount <= 0 : line.unitAmount < 0),
+    );
+    if (missingUnitAmountLine) {
+      addToast('error', createRequestType === 'SELF_BUY'
+        ? `Enter actual unit COGS for ${missingUnitAmountLine.product.name}`
+        : `Partner cost unavailable for ${missingUnitAmountLine.product.name}`);
+      return;
     }
 
     const payload: CreateWmsPurchasingBatchInput = {
@@ -399,11 +404,7 @@ export function useRequestsController() {
       sourceStatus: 'UNDER_REVIEW',
       partnerNotes: createPartnerNotes.trim() || undefined,
       lines: cartLines.map((line, index) => {
-        const unitAmount = line.unitAmount ?? 0;
-        const supplierUnitCost =
-          createRequestType === 'SELF_BUY'
-            ? undefined
-            : line.product.supplierUnitCost ?? undefined;
+        const unitAmount = line.unitAmount!;
         return {
           lineNo: index + 1,
           sourceItemId: line.product.posProductId,
@@ -411,7 +412,6 @@ export function useRequestsController() {
             profileId: line.product.profileId,
             storeId: line.product.store.id,
             originalPartnerUnitCost: unitAmount,
-            originalSupplierUnitCost: supplierUnitCost ?? null,
             originalApprovedQuantity: line.quantity,
           },
           productId: line.product.productId,
@@ -421,7 +421,6 @@ export function useRequestsController() {
           requestedQuantity: line.quantity,
           uom: 'unit',
           partnerUnitCost: unitAmount,
-          supplierUnitCost,
           needsProfiling: false,
           resolvedPosProductId: line.product.posProductId,
           resolvedProfileId: line.product.profileId,
