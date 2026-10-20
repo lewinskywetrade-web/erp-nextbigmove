@@ -46,6 +46,8 @@ export type SalesOverviewResponse = {
     contribution_margin: number;
     net_margin: number;
     cogs: number;
+    /** SUPER_ADMIN only. Actual delivered item quantities, never projected. */
+    actual_delivered_units?: number | null;
     cogs_adjusted?: number;
     cogs_abandoned?: number | null;
     cogs_rts_credit?: number;
@@ -153,6 +155,8 @@ export type SalesOverviewResponse = {
     revenue: number;
     gross_sales: number;
     cogs: number;
+    /** Omitted for other roles; null when quantity evidence is unavailable. */
+    actual_delivered_units?: number | null;
     cogs_adjusted?: number;
     cogs_abandoned?: number | null;
     cogs_rts_credit?: number;
@@ -209,7 +213,7 @@ export type SalesOverviewResponse = {
 };
 
 export const salesMetricDefinitions: Array<{
-  key: keyof SalesOverviewResponse['kpis'];
+  key: Exclude<keyof SalesOverviewResponse['kpis'], 'actual_delivered_units'>;
   label: string;
   format: 'currency' | 'number' | 'percent';
   countKey?: keyof SalesOverviewResponse['counts'];
@@ -227,7 +231,7 @@ export const salesMetricDefinitions: Array<{
 ] as const;
 
 export const salesSecondaryMetricDefinitions: Array<{
-  key: keyof SalesOverviewResponse['kpis'];
+  key: Exclude<keyof SalesOverviewResponse['kpis'], 'actual_delivered_units'>;
   label: string;
   format: 'currency' | 'number' | 'percent';
 }> = [
