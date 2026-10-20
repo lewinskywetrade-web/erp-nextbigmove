@@ -18,9 +18,8 @@ import { ReconcileSalesService } from '../workflows/services/reconcile-sales.ser
 import { ReconcileSalesAttributionService } from '../workflows/services/reconcile-sales-attribution.service';
 import { AnalyticsRequestCoordinatorService } from './analytics-request-coordinator.service';
 import { readCurrentAbandonedCosts, attachCurrentAbandonedCosts } from './utils/current-abandoned-cogs';
+import { loadSalesStoreAttribution, partitionTeamAdSpend } from './utils/team-ad-spend';
 import {
-  creativeCodeParts,
-  resolveStoreAttribution,
   UNATTRIBUTED_STORE_KEY,
 } from './utils/store-attribution';
 
@@ -32,7 +31,7 @@ const TIMEZONE = 'Asia/Manila';
 const PROCESSED_SALES_STATUSES = [1, 2, 3, 9, 12, 13] as const;
 // Separate calculation revisions from data-cache versions and response shapes:
 // persisted responses from earlier math must not survive a calculation deploy.
-const SALES_CALCULATION_VERSION = 3;
+const SALES_CALCULATION_VERSION = 4;
 
 type SalesKpis = {
   revenue: number;
@@ -853,7 +852,7 @@ export class SalesAnalyticsService {
         status: 'ACTIVE',
         OR: [{ enabled: true }, { enabled: null }],
       },
-      select: { shopId: true },
+      select: { id: true, shopId: true, teamId: true },
     });
     const activeShopIds = Array.from(new Set(activeStores.map((store) => store.shopId)));
 
@@ -926,6 +925,7 @@ export class SalesAnalyticsService {
       analyticsScope: 'tenant',
       teamIds,
       activeShopIds: [...activeShopIds].sort(),
+      adTeamStores: teamIds.length ? activeStores.map(store => `${store.id}:${store.shopId}:${store.teamId ?? ''}`).sort() : [],
       start: startStr,
       end: endStr,
       mappings: normalizedMappings.sort(),
@@ -1373,6 +1373,43 @@ export class SalesAnalyticsService {
       }),
     ]);
 
+    // Ad import rows can have a missing teamId even when their exact owning
+    // store is known. Keep historical POS team scope intact, but resolve the
+    // spend independently so a team cannot report its revenue with zero ads.
+    let teamSpendCoverage: ReturnType<typeof partitionTeamAdSpend>['coverage'] | null = null;
+    let additionalNullSpendMapping = false;
+    let spendUpdatedAt: Date | null = null;
+    if (teamIds.length) {
+      const spendRows = await db.reconcileMarketing.findMany({
+        where: { tenantId, date: { gte: prevStartDate_dt, lte: endDate_dt }, ...mappingFilter },
+        select: { teamId: true, adId: true, adName: true, mapping: true, shops: true,
+          date: true, spend: true, leads: true, updatedAt: true },
+      });
+      const spendIndex = await loadSalesStoreAttribution(db, tenantId, spendRows, activeStores);
+      const allocation = partitionTeamAdSpend(spendRows, activeStores, spendIndex, teamIds, startDate_dt);
+      teamSpendCoverage = allocation.coverage;
+      (agg._sum as any).spend = 0; (agg._sum as any).leads = 0;
+      (prevAgg._sum as any).spend = 0; (prevAgg._sum as any).leads = 0;
+      for (const group of productGroups) { (group._sum as any).spend = 0; (group._sum as any).leads = 0; }
+      for (const { row, included, period } of allocation.rows) {
+        if (!included) continue;
+        const spend = this.toNumber(row.spend), leads = this.toNumber(row.leads);
+        const sum = period === 'current' ? agg._sum : prevAgg._sum;
+        (sum as any).spend += spend; (sum as any).leads += leads;
+        if (period !== 'current' || (!spend && !leads)) continue;
+        let group = productGroups.find(value => value.mapping === row.mapping);
+        if (!group) {
+          group = { mapping: row.mapping ?? null, _sum: {} } as any;
+          productGroups.push(group!);
+        }
+        (group!._sum as any).spend = this.toNumber(group!._sum.spend) + spend;
+        (group!._sum as any).leads = this.toNumber(group!._sum.leads) + leads;
+        if (row.mapping === null) additionalNullSpendMapping = true;
+        else if (row.mapping && !mappingRows.some(value => value.mapping === row.mapping)) mappingRows.push({ mapping: row.mapping });
+        if (row.updatedAt && (!spendUpdatedAt || row.updatedAt > spendUpdatedAt)) spendUpdatedAt = row.updatedAt;
+      }
+    }
+
     // Only the nonzero abandoned buckets need an exact live cost lookup.
     // Match their persisted per-ad memberships, not the unrelated order mapping.
     if (excludeAbandoned) {
@@ -1403,9 +1440,9 @@ export class SalesAnalyticsService {
     // labels pass through untouched.
     await resolveMappingDisplayNames(db, mappingDisplayMap);
 
-    if (nullCount > 0) {
+    if (nullCount > 0 || additionalNullSpendMapping) {
       const key = this.normalize('__null__');
-      mappingDisplayMap[key] = `Unassigned (${nullCount})`;
+      mappingDisplayMap[key] = nullCount > 0 ? `Unassigned (${nullCount})` : 'Unassigned';
       mappingOptions.push(key);
     }
     mappingOptions.sort((a, b) => (mappingDisplayMap[a] || a).localeCompare(mappingDisplayMap[b] || b));
@@ -1505,7 +1542,8 @@ export class SalesAnalyticsService {
         team_ids: teamIds,
       },
       rangeDays,
-      lastUpdatedAt: lastUpdatedAgg?._max?.updatedAt || null,
+      lastUpdatedAt: spendUpdatedAt && (!lastUpdatedAgg?._max?.updatedAt || spendUpdatedAt > lastUpdatedAgg._max.updatedAt) ? spendUpdatedAt : lastUpdatedAgg?._max?.updatedAt || null,
+      teamSpendCoverage,
       products,
       deliveryStatuses,
       volumeGrowthTrend,
@@ -1610,9 +1648,9 @@ export class SalesAnalyticsService {
       await tx.$executeRaw`SET TRANSACTION READ ONLY`;
       const [rows, tenantStores] = await Promise.all([
         tx.reconcileMarketing.findMany({
-          where: { tenantId, ...teamWhere, date: { gte: prevStartDate_dt, lte: endDate_dt } },
+          where: { tenantId, date: { gte: prevStartDate_dt, lte: endDate_dt } },
           select: Object.fromEntries([
-            'adId', 'adName', 'mapping', 'shops', 'date', 'updatedAt', ...metricFields,
+            'teamId', 'adId', 'adName', 'mapping', 'shops', 'date', 'updatedAt', ...metricFields,
           ].map(key => [key, true])) as any,
         }) as Promise<Array<Record<string, any>>>,
         tx.posStore.findMany({
@@ -1623,50 +1661,8 @@ export class SalesAnalyticsService {
       await this.analyticsTeamWhere(tx, tenantId, teamIds);
       // Team membership belongs to each historical RM/order record. A later
       // store reassignment must not erase earlier team-owned activity.
-      const validStoreIds = new Set(tenantStores.map(store => store.id.toLowerCase()));
-      const storeByShopId = new Map<string, string | null>();
-      const insertUnique = (map: Map<string, string | null>, key: string, store: string | null | undefined) => {
-        const value = store?.toLowerCase();
-        const scoped = value && validStoreIds.has(value) ? value : null;
-        if (map.has(key) && map.get(key) !== scoped) map.set(key, null);
-        else map.set(key, scoped);
-      };
-      for (const store of tenantStores) insertUnique(storeByShopId, store.shopId, store.id);
-      const adIds = [...new Set(rows.map(row => row.adId as string).filter(Boolean))];
-      const codes = rows.map(row => creativeCodeParts(row.adName)).filter(Boolean);
-      const [links, products, creatives, configs] = await Promise.all([
-        adIds.length ? tx.creativeMetaAdLink.findMany({
-          where: { tenantId, adId: { in: adIds } },
-          select: { adId: true, creative: { select: { tenantId: true, storeConfig: { select: { tenantId: true, storeId: true } } } } },
-        }) : [],
-        tx.posProduct.findMany({
-          where: { store: { is: { tenantId, status: 'ACTIVE', OR: [{ enabled: true }, { enabled: null }] } }, mapping: { not: null } },
-          select: { storeId: true, mapping: true },
-        }),
-        codes.length ? tx.creative.findMany({
-          where: { tenantId, code: { in: [...new Set(codes.map(code => code!.code))] } },
-          select: { code: true, storeConfig: { select: { tenantId: true, storeId: true } } },
-        }) : [],
-        codes.length ? tx.creativeStoreConfig.findMany({
-          where: { tenantId, active: true, storeId: { in: [...validStoreIds] }, codePrefix: { in: [...new Set(codes.map(code => code!.prefix))] } },
-          select: { codePrefix: true, storeId: true },
-        }) : [],
-      ]);
-      const storeByAdId = new Map<string, string | null>();
-      for (const link of links) insertUnique(storeByAdId, link.adId,
-        link.creative?.tenantId === tenantId && link.creative?.storeConfig?.tenantId === tenantId
-          ? link.creative.storeConfig.storeId : null);
-      const storeByCreativeCode = new Map<string, string | null>();
-      for (const creative of creatives) insertUnique(storeByCreativeCode, creative.code.toUpperCase(),
-        creative.storeConfig?.tenantId === tenantId ? creative.storeConfig.storeId : null);
-      const storeByCodePrefix = new Map<string, string | null>();
-      for (const config of configs) insertUnique(storeByCodePrefix, config.codePrefix.toUpperCase(), config.storeId);
-      const storeByLabel = new Map<string, string | null>();
-      for (const product of products) {
-        const label = product.mapping?.trim().toLowerCase();
-        if (label) insertUnique(storeByLabel, label, product.storeId);
-      }
-      const index = { validStoreIds, storeByShopId, storeByAdId, storeByCreativeCode, storeByCodePrefix, storeByLabel };
+      const index = await loadSalesStoreAttribution(tx, tenantId, rows as any, tenantStores);
+      const { storeByShopId } = index;
       const dayBuckets = new Map<string, { date: string; store: string; sums: ReturnType<typeof createEmptyPosAggregateBucket> & Record<string, any> }>();
       let cursor: string | undefined;
       let ambiguousOrderCount = 0;
@@ -1749,13 +1745,16 @@ export class SalesAnalyticsService {
     let unattributedAdSpend = 0;
     let previousUnattributedAdRows = 0;
     let previousUnattributedAdSpend = 0;
-    for (const row of rows) {
+    const adTeamAllocation = partitionTeamAdSpend(rows as any, tenantStores, index, teamIds, startDate_dt);
+    for (const { row, storeId: store, included } of adTeamAllocation.rows) {
       const current = row.date >= startDate_dt;
       // Persisted POS components are comparison evidence only. They must never
       // be added to the direct POS components a second time.
       const comparison = current ? canonicalCurrent : canonicalPrevious;
-      for (const field of metricFields) if (field !== 'spend' && field !== 'leads') comparison[field] += this.toNumber(row[field]);
-      const store = resolveStoreAttribution(row, index);
+      if (!teamIds.length || (row.teamId && teamIds.includes(row.teamId))) {
+        for (const field of metricFields) if (field !== 'spend' && field !== 'leads') comparison[field] += this.toNumber((row as any)[field]);
+      }
+      if (!included) continue;
       if (current && store === UNATTRIBUTED && (this.toNumber(row.spend) || this.toNumber(row.leads))) {
         unattributedAdRows++;
         unattributedAdSpend += this.toNumber(row.spend);
@@ -1854,6 +1853,7 @@ export class SalesAnalyticsService {
       deliveryStatuses,
       volumeGrowthTrend: [],
       coverage,
+      teamSpendCoverage: adTeamAllocation.coverage,
     };
     if (JSON.stringify(scopeKey(scopeStores)) === JSON.stringify(scopeKey(tenantStores))) await this.analyticsCache.set(cacheKey, response);
     return response;

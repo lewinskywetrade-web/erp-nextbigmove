@@ -20,6 +20,8 @@ type SalesProductsExportInput = {
   endDate: string;
   cmRtsLabel: string;
   rows: SalesProductsExportRow[];
+  view?: 'actual' | 'forecast';
+  entityLabel?: 'Product' | 'Store';
 };
 
 const escapeCsvValue = (value: string | number) => {
@@ -32,7 +34,8 @@ const buildFilename = (
   startDate: string,
   endDate: string,
   extension: 'csv' | 'xlsx',
-) => `sales-products_${startDate}_to_${endDate}.${extension}`;
+  view: 'actual' | 'forecast' = 'actual',
+) => `sales-products${view === 'forecast' ? '_forecast' : ''}_${startDate}_to_${endDate}.${extension}`;
 
 const downloadBlob = (blob: Blob, filename: string) => {
   const url = URL.createObjectURL(blob);
@@ -45,8 +48,8 @@ const downloadBlob = (blob: Blob, filename: string) => {
   URL.revokeObjectURL(url);
 };
 
-const buildHeaders = (cmRtsLabel: string) => [
-  'Product',
+const buildHeaders = (cmRtsLabel: string, entityLabel = 'Product') => [
+  entityLabel,
   'Gross Revenue',
   'Gross Sales',
   'COGS',
@@ -62,24 +65,32 @@ const buildHeaders = (cmRtsLabel: string) => [
   'Net Margin',
 ];
 
+export function salesProductsExportGrid(input: SalesProductsExportInput) {
+  const forecast = input.view === 'forecast';
+  const headers = buildHeaders(input.cmRtsLabel, input.entityLabel);
+  if (forecast) {
+    headers[1] = 'Forecast Revenue'; headers[2] = 'Expected Deliveries';
+    headers[3] = 'Forecast COGS'; headers[9] = 'Assumed RTS %';
+    headers[11] = 'Forecast CM'; headers[13] = 'Forecast Net (before overhead)';
+  }
+  const indices = headers.map((_, i) => i).filter(i => !forecast || (i !== 6 && i !== 12));
+  const rows = input.rows.map(row => [
+    row.product, row.grossRevenue, row.grossSales, row.cogs, row.aov, row.cpp,
+    row.processedCpp, row.adSpend, row.arPct / 100, row.rtsPct / 100, row.pePct / 100,
+    row.contributionMargin, row.cmRtsForecast, row.netMargin,
+  ].map(value => typeof value === 'number' && !Number.isFinite(value) ? '' : value));
+  return { headers: indices.map(i => headers[i]), rows: rows.map(row => indices.map(i => row[i])), indices };
+}
+
 export function exportSalesProductsCsv(input: SalesProductsExportInput) {
-  const headers = buildHeaders(input.cmRtsLabel);
-  const rows = input.rows.map((row) => [
-    row.product,
-    row.grossRevenue.toFixed(2),
-    Math.round(row.grossSales),
-    row.cogs.toFixed(2),
-    row.aov.toFixed(2),
-    row.cpp.toFixed(2),
-    row.processedCpp.toFixed(2),
-    row.adSpend.toFixed(2),
-    `${row.arPct.toFixed(2)}%`,
-    `${row.rtsPct.toFixed(2)}%`,
-    `${row.pePct.toFixed(2)}%`,
-    row.contributionMargin.toFixed(2),
-    row.cmRtsForecast.toFixed(2),
-    row.netMargin.toFixed(2),
-  ]);
+  const { headers, rows: values, indices } = salesProductsExportGrid(input);
+  const rows = values.map(row => row.map((value, index) => {
+    if (typeof value !== 'number') return value;
+    const originalIndex = indices[index];
+    if ([8, 9, 10].includes(originalIndex)) return `${(value * 100).toFixed(2)}%`;
+    if (originalIndex === 2 && input.view !== 'forecast') return Math.round(value);
+    return value.toFixed(2);
+  }));
 
   const csv = [headers, ...rows]
     .map((row) => row.map((cell) => escapeCsvValue(cell)).join(','))
@@ -87,31 +98,16 @@ export function exportSalesProductsCsv(input: SalesProductsExportInput) {
 
   downloadBlob(
     new Blob([csv], { type: 'text/csv;charset=utf-8;' }),
-    buildFilename(input.startDate, input.endDate, 'csv'),
+    buildFilename(input.startDate, input.endDate, 'csv', input.view),
   );
 }
 
 export async function exportSalesProductsXlsx(input: SalesProductsExportInput) {
   const XLSX = await import('xlsx');
-  const headers = buildHeaders(input.cmRtsLabel);
+  const { headers, rows: values, indices } = salesProductsExportGrid(input);
   const rows: Array<Array<string | number>> = [
     headers,
-    ...input.rows.map((row) => [
-      row.product,
-      row.grossRevenue,
-      row.grossSales,
-      row.cogs,
-      row.aov,
-      row.cpp,
-      row.processedCpp,
-      row.adSpend,
-      row.arPct / 100,
-      row.rtsPct / 100,
-      row.pePct / 100,
-      row.contributionMargin,
-      row.cmRtsForecast,
-      row.netMargin,
-    ]),
+    ...values,
   ];
 
   const worksheet = XLSX.utils.aoa_to_sheet(rows);
@@ -130,7 +126,7 @@ export async function exportSalesProductsXlsx(input: SalesProductsExportInput) {
     { wch: 20 },
     { wch: 20 },
     { wch: 14 },
-  ];
+  ].filter((_, index) => indices.includes(index));
 
   const currencyColumns = new Set([1, 3, 4, 5, 6, 7, 11, 12, 13]);
   const percentColumns = new Set([8, 9, 10]);
@@ -141,23 +137,36 @@ export async function exportSalesProductsXlsx(input: SalesProductsExportInput) {
       const cell = worksheet[cellAddress];
       if (!cell || cell.t !== 'n') continue;
 
-      if (columnIndex === 2) {
-        cell.z = '0';
+      const originalIndex = indices[columnIndex];
+      if (originalIndex === 2) {
+        cell.z = input.view === 'forecast' ? '0.00' : '0';
         continue;
       }
 
-      if (percentColumns.has(columnIndex)) {
+      if (percentColumns.has(originalIndex)) {
         cell.z = '0.00%';
         continue;
       }
 
-      if (currencyColumns.has(columnIndex)) {
+      if (currencyColumns.has(originalIndex)) {
         cell.z = '#,##0.00';
       }
     }
   }
 
   const workbook = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(workbook, worksheet, 'Revenue per Product');
-  XLSX.writeFile(workbook, buildFilename(input.startDate, input.endDate, 'xlsx'));
+  XLSX.utils.book_append_sheet(workbook, worksheet, input.view === 'forecast' ? 'Forecast' : `Revenue per ${input.entityLabel ?? 'Product'}`);
+  if (input.view === 'forecast') {
+    const notes = XLSX.utils.aoa_to_sheet([
+      ['Forecast assumptions'],
+      ['Revenue, goods cost and expected deliveries use the selected RTS success percentage.'],
+      ['Returned goods are assumed fully recoverable. Advertising and existing shipping, fulfillment and IF fee estimates stay fixed.'],
+      ['COD fees use the selected cohort’s blended delivered fee/revenue rate. Missing evidence is blank.'],
+      ['Forecast Net is before overhead and equals Forecast CM on the same available expense basis.'],
+      ['These are projections from saved source values, not actual results or cost corrections.'],
+    ]);
+    notes['!cols'] = [{ wch: 120 }];
+    XLSX.utils.book_append_sheet(workbook, notes, 'Forecast assumptions');
+  }
+  XLSX.writeFile(workbook, buildFilename(input.startDate, input.endDate, 'xlsx', input.view));
 }
