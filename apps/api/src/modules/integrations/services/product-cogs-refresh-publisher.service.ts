@@ -21,13 +21,16 @@ export class ProductCogsRefreshPublisherService {
   /** Await inside the source transaction, after writes while its parent locks remain held. */
   async enqueue(input: ProductCogsRefreshScope): Promise<void> {
     const scope = normalizeCogsRefreshScope(input);
-    // A current edit must also heal older saved orders whose propagation was
-    // missed. Re-read each order's own applicable dated/default ERP cost; this
-    // does not backdate the newly entered rate or change any catalog interval.
+    // Keep the edit's authorized revaluation intervals. Extend only zero-cost
+    // propagation into older 2026 orders; an undated current default cannot
+    // establish that their existing positive historical rates were wrong.
     const until = productCogsManilaDate();
-    const changes = [...new Set(scope.changes.map(change => change.productId))]
-      .map(productId => ({ productId, fromDate: PRODUCT_COGS_REFRESH_FROM, toDate: until }));
     if (until < PRODUCT_COGS_REFRESH_FROM) return;
+    const changes = normalizeCogsRefreshScope({ ...scope, changes: [
+      ...scope.changes,
+      ...[...new Set(scope.changes.map(change => change.productId))]
+        .map(productId => ({ productId, fromDate: PRODUCT_COGS_REFRESH_FROM, toDate: until, zeroOnly: true })),
+    ] }).changes;
     const refreshId = randomUUID();
     // Every accepted edit gets a new identity; an active older job must never
     // absorb a newer change. Redis failure propagates and rolls back the edit.

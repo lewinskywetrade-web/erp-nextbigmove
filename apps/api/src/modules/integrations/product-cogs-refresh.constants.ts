@@ -36,12 +36,14 @@ export function normalizeCogsRefreshScope(scope: ProductCogsRefreshScope): Produ
   const changes = new Map<string, ProductCogsRefreshChange>();
   for (const change of scope.changes) {
     if (!change || !UUID.test(change.productId ?? '')
+      || (change.zeroOnly !== undefined && typeof change.zeroOnly !== 'boolean')
       || (change.fromDate !== null && !isCogsRefreshDate(change.fromDate))
       || (change.toDate !== null && !isCogsRefreshDate(change.toDate))
       || (change.fromDate !== null && change.toDate !== null && change.fromDate > change.toDate)) {
       throw new BadRequestException('Invalid product COGS refresh interval');
     }
-    const normalized = { productId: change.productId, fromDate: change.fromDate, toDate: change.toDate };
+    const normalized = { productId: change.productId, fromDate: change.fromDate, toDate: change.toDate,
+      ...(change.zeroOnly !== undefined ? { zeroOnly: change.zeroOnly } : {}) };
     changes.set(JSON.stringify(normalized), normalized);
   }
   return { tenantId: scope.tenantId, storeId: scope.storeId, changes: [...changes.values()] };

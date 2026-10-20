@@ -52,6 +52,21 @@ describe('ProductCogsRefreshProcessor', () => {
       expect.objectContaining({ jobId: `product-cogs-refresh-${data.refreshId}-${cursor}`, attempts: 8, removeOnFail: false }));
   });
 
+  it('preserves zero-only restrictions through page processing and durable continuations', async () => {
+    const changes = [{ ...data.changes[0], fromDate: '2026-01-01', zeroOnly: true }];
+    recalculation.recalculateBatch.mockResolvedValue(result({ nextCursor: cursor }));
+    await processor.handleRefresh(job({ ...data, changes }));
+    expect(recalculation.recalculateBatch.mock.calls[0][0].changes).toEqual(changes);
+    expect(queue.add.mock.calls[0][1].changes).toEqual(changes);
+  });
+
+  it('rejects malformed zero-only restrictions rather than silently authorizing a full revaluation', async () => {
+    await expect(processor.handleRefresh(job({ ...data, changes: [{ ...data.changes[0], zeroOnly: 'true' as any }] })))
+      .rejects.toThrow('Invalid product COGS refresh interval');
+    expect(recalculation.recalculateBatch).not.toHaveBeenCalled();
+    expect(queue.add).not.toHaveBeenCalled();
+  });
+
   it('rebuilds each affected owner-tenant day once after the last page, without a full reset', async () => {
     recalculation.recalculateBatch.mockResolvedValue(result({ affectedDates: ['2026-10-19', '2026-10-18'] }));
     await processor.handleRefresh(job({ ...data, cursor, affectedDates: ['2026-10-18', '2026-10-17'] }));
