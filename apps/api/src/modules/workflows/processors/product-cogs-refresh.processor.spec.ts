@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, jest } from '@jest/globals';
+import { afterEach, beforeEach, describe, expect, it, jest } from '@jest/globals';
 import { ProductCogsRefreshProcessor } from './product-cogs-refresh.processor';
 import { PANCAKE_WEBHOOK_RECONCILE_JOB } from '../../integrations/pancake-webhook.constants';
 import { PRODUCT_COGS_REFRESH_JOB, ProductCogsRefreshJobData } from '../../integrations/product-cogs-refresh.constants';
@@ -22,11 +22,13 @@ describe('ProductCogsRefreshProcessor', () => {
   let processor: ProductCogsRefreshProcessor;
 
   beforeEach(() => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-10-19T18:00:00Z'));
     recalculation = { waitForSourceTransaction: jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue(undefined),
       recalculateBatch: jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue(result()) };
     queue = { add: jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({}) };
     processor = new ProductCogsRefreshProcessor(recalculation as any, queue as any);
   });
+  afterEach(() => { jest.useRealTimers(); });
 
   it('waits for the source transaction before reading costs in the first bounded page', async () => {
     const phases: string[] = [];
@@ -106,5 +108,14 @@ describe('ProductCogsRefreshProcessor', () => {
     await expect(processor.handleRefresh(job({ ...data, cursor: 'not-an-order-id' }))).rejects.toThrow('Invalid product COGS refresh job');
     expect(recalculation.waitForSourceTransaction).not.toHaveBeenCalled();
     expect(recalculation.recalculateBatch).not.toHaveBeenCalled();
+  });
+
+  it('never rebuilds archived 2025 or future days retained by an old continuation', async () => {
+    recalculation.recalculateBatch.mockResolvedValue(result({
+      affectedDates: ['2025-12-31', '2026-01-01', '2026-10-21'],
+    }));
+    await processor.handleRefresh(job({ ...data, cursor,
+      affectedDates: ['2025-01-01', '2026-06-12', '2027-01-01'] }));
+    expect(queue.add.mock.calls.map(call => call[1].dateLocal)).toEqual(['2026-01-01', '2026-06-12']);
   });
 });
