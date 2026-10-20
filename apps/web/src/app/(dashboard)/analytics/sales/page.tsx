@@ -1532,7 +1532,7 @@ export default function SalesAnalyticsPage() {
             message={[
               'Store revenue and COGS use saved POS orders for each shop.',
               data.coverage.zeroCogsOrderCount > 0
-                ? `${data.coverage.zeroCogsOrderCount} nonvoid, nondeleted orders have saved COGS of zero across the active shops in the selected team scope in the current and previous periods, including orders excluded by the current filters. A saved zero alone does not prove a missing catalog cost.` : '',
+                ? `${data.coverage.zeroCogsOrderCount} nonvoid, nondeleted orders have saved COGS of zero across the active shops in the selected team scope in the current and previous periods, including orders excluded by the current filters. Review the declared ERP cost and affected orders; ERP COGS must be positive.` : '',
               data.coverage.ambiguousShopCount > 0
                 ? `Across the current and previous periods, ${data.coverage.ambiguousOrderCount} orders have conflicting store ownership and remain under Unattributed.` : '',
               data.coverage.unattributedAdRows > 0 || data.coverage.previousUnattributedAdRows > 0
@@ -1652,7 +1652,7 @@ export default function SalesAnalyticsPage() {
         {tableSelection === 'products' && showUnits && !isResultPending && (
           <p className="text-xs text-slate-600 dark:text-slate-300">
             Super Admin review: zero-order rows are hidden. {zeroCogsReviewCount} rows with orders and zero COGS are highlighted,
-            with delivered orders first. Recorded zero cost may be valid. Totals still include hidden rows.
+            with delivered orders first. ERP COGS must be positive. Totals still include hidden rows.
           </p>
         )}
         {tableSelection === 'products' ? (

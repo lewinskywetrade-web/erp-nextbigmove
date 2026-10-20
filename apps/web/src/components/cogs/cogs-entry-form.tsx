@@ -83,9 +83,9 @@ export function CogsEntryForm({
       if (!Number.isFinite(cogsValue)) {
         newErrors.cogs = "COGS must be a valid number";
         validationErrors.push("COGS must be a valid number");
-      } else if (cogsValue < 0) {
-        newErrors.cogs = "COGS must be 0 or greater";
-        validationErrors.push("COGS must be 0 or greater");
+      } else if (cogsValue <= 0) {
+        newErrors.cogs = "ERP COGS must be greater than 0";
+        validationErrors.push("ERP COGS must be greater than 0");
       } else if (cogsValue > 1000000000) {
         newErrors.cogs = "COGS value is too large (max: PHP 1,000,000,000)";
         validationErrors.push("COGS value is too large (maximum: PHP 1,000,000,000)");
@@ -127,7 +127,7 @@ export function CogsEntryForm({
               id="cogs"
               type="number"
               step="0.01"
-              min="0"
+              min="0.01"
               value={cogs}
               onChange={(e) => {
                 setCogs(e.target.value);

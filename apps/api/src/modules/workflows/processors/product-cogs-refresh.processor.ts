@@ -15,6 +15,17 @@ import {
 import { ProductCogsRecalculationService } from '../../integrations/services/product-cogs-recalculation.service';
 import { isProductCogsRefreshDate, productCogsManilaDate } from '../../integrations/product-cogs-refresh-policy';
 
+export type ProductCogsRefreshReceipt = {
+  receiptVersion: 1;
+  refreshId: string;
+  storeId: string;
+  cursor: string | null;
+  nextCursor: string | null;
+  affectedDates: string[];
+  nextJobId: string | null;
+  reconcileJobIds: string[];
+};
+
 @Processor(PANCAKE_WEBHOOK_RECONCILE_QUEUE)
 export class ProductCogsRefreshProcessor {
   constructor(
@@ -24,7 +35,7 @@ export class ProductCogsRefreshProcessor {
   ) {}
 
   @Process({ name: PRODUCT_COGS_REFRESH_JOB, concurrency: 1 })
-  async handleRefresh(job: Job<ProductCogsRefreshJobData>): Promise<void> {
+  async handleRefresh(job: Job<ProductCogsRefreshJobData>): Promise<ProductCogsRefreshReceipt> {
     const data = normalizeCogsRefreshJob(job.data);
     const scope = { tenantId: data.tenantId, storeId: data.storeId, changes: data.changes };
     if (!data.cursor) {
@@ -45,16 +56,20 @@ export class ProductCogsRefreshProcessor {
     if (result.nextCursor) {
       if (result.nextCursor === data.cursor) throw new Error('COGS_REFRESH_CURSOR_DID_NOT_ADVANCE');
       const continuation = normalizeCogsRefreshJob({ ...data, cursor: result.nextCursor, affectedDates });
+      const nextJobId = `product-cogs-refresh-${data.refreshId}-${result.nextCursor}`;
       await this.queue.add(PRODUCT_COGS_REFRESH_JOB, continuation,
-        cogsRefreshJobOptions(`product-cogs-refresh-${data.refreshId}-${result.nextCursor}`));
-      return;
+        cogsRefreshJobOptions(nextJobId));
+      return { receiptVersion: 1, refreshId: data.refreshId, storeId: data.storeId,
+        cursor: data.cursor ?? null, nextCursor: result.nextCursor, affectedDates, nextJobId, reconcileJobIds: [] };
     }
 
     // Rebuild only after the complete scoped scan. Each affected day is queued
     // once per edit; newer edits have distinct IDs and cannot be lost behind an
     // already-running reconciliation. A failed enqueue retries this same final
     // page with its durable accumulated dates, including already-correct rows.
+    const reconcileJobIds: string[] = [];
     for (const dateLocal of affectedDates) {
+      const jobId = `product-cogs-reconcile-${data.refreshId}-${dateLocal}`;
       await this.queue.add(PANCAKE_WEBHOOK_RECONCILE_JOB, {
         tenantId: data.tenantId,
         teamId: null,
@@ -62,10 +77,13 @@ export class ProductCogsRefreshProcessor {
         reconcileMode: 'incremental',
         trigger: 'standard',
         requestId: data.refreshId,
-      }, cogsRefreshJobOptions(`product-cogs-reconcile-${data.refreshId}-${dateLocal}`));
+      }, cogsRefreshJobOptions(jobId));
+      reconcileJobIds.push(jobId);
     }
     // Existing reconcile-day processing runs marketing -> sales -> attribution.
     // The last step bumps the shared tenant analytics cache version before its
     // update events are emitted, invalidating every report cache namespace.
+    return { receiptVersion: 1, refreshId: data.refreshId, storeId: data.storeId,
+      cursor: data.cursor ?? null, nextCursor: null, affectedDates, nextJobId: null, reconcileJobIds };
   }
 }

@@ -63,8 +63,8 @@ test('table renders red and descriptive badges only when Super Admin review is e
     onPrevious() {}, onNext() {}, renderSortLabel: label => label };
   const admin = renderToStaticMarkup(React.createElement(AnalyticsSalesProductsTable, { ...props, showZeroCogsReview: true }));
   assert.match(admin, /data-cogs-review="zero-cogs"/);
-  assert.match(admin, /Delivered orders · Zero COGS/);
+  assert.match(admin, /Delivered orders · Missing ERP COGS/);
   assert.match(admin, /bg-red-50/);
   const ordinary = renderToStaticMarkup(React.createElement(AnalyticsSalesProductsTable, props));
-  assert.doesNotMatch(ordinary, /data-cogs-review|Zero COGS|bg-red-50/);
+  assert.doesNotMatch(ordinary, /data-cogs-review|Missing ERP COGS|bg-red-50/);
 });

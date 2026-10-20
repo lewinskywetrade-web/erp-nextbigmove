@@ -11,6 +11,7 @@ import { WmsFulfillmentSyncService } from '../../wms-fulfillment/wms-fulfillment
 import { WmsInventoryService } from '../../wms-inventory/wms-inventory.service';
 import { WmsOutboundRecordsService } from '../../wms-inventory/wms-outbound-records.service';
 import { COGS_REFRESH_PARENT_LOCK_SQL } from './product-cogs-recalculation.service';
+import { assertValidProductCogs, ERP_COGS_POLICY, MAX_PRODUCT_COGS } from '../product-cogs-validation';
 import { WorkflowExecutionGateway } from '../../workflows/gateways/workflow-execution.gateway';
 import {
   ORDERS_STATUS_SUMMARY_UPDATED_EVENT,
@@ -44,6 +45,7 @@ interface PosOrderData {
   pUtmCampaign?: string;
   pUtmContent?: string;
   cogs: number;
+  cogsUnresolved?: boolean;
   totalQuantity: number;
   tracking?: string;
   mapping?: string;
@@ -558,19 +560,19 @@ export class PosOrderService {
     items: any[],
     dateLocal: string,
     client: Pick<Prisma.TransactionClient, 'posProduct' | 'posProductCogs'> = this.prisma,
-  ): Promise<{ cogs: number; totalQuantity: number }> {
+  ): Promise<{ cogs: number; totalQuantity: number; cogsUnresolved?: boolean }> {
     let totalCogs = 0;
     let totalQuantity = 0;
+    let unresolved = false;
 
     const orderDate = new Date(dateLocal);
 
     for (const item of items) {
-      const quantity = parseInt(item.quantity || '0', 10);
+      const quantity = typeof item?.quantity === 'number' ? item.quantity
+        : typeof item?.quantity === 'string' && /^\d+$/.test(item.quantity) ? Number(item.quantity) : NaN;
       const noteCogs = this.parseNoteProductCogs(item?.note_product, quantity);
-      if (quantity === 0) {
-        if (noteCogs > 0) {
-          totalCogs += noteCogs;
-        }
+      if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+        unresolved = true;
         continue;
       }
 
@@ -580,6 +582,7 @@ export class PosOrderService {
         if (noteCogs > 0) {
           totalCogs += noteCogs;
         } else {
+          unresolved = true;
           this.logger.warn(`COGS unresolved catalog identity ${JSON.stringify({
             storeId,
             productId: this.readCogsIdentifier(item?.product_id) ?? this.readCogsIdentifier(item?.productId),
@@ -617,15 +620,22 @@ export class PosOrderService {
       }
 
       if (cogsEntry) {
-        const itemCogs = parseFloat(cogsEntry.cogs.toString()) * quantity;
-        totalCogs += itemCogs;
+        // Presence keeps date precedence even when the selected rate is zero.
+        // Do not bypass it with a note or the undated default.
+        const unitCost = Number(cogsEntry.cogs.toString());
+        try { assertValidProductCogs(unitCost); totalCogs += unitCost * quantity; }
+        catch { unresolved = true; }
       } else if (noteCogs > 0) {
         totalCogs += noteCogs;
+      } else {
+        unresolved = true;
       }
 
       totalQuantity += quantity;
     }
 
+    if (items.length && (!Number.isFinite(totalCogs) || totalCogs <= 0 || totalCogs > MAX_PRODUCT_COGS)) unresolved = true;
+    if (unresolved) return { cogs: 0, totalQuantity, cogsUnresolved: true };
     return { cogs: totalCogs, totalQuantity };
   }
 
@@ -652,9 +662,10 @@ export class PosOrderService {
         if (locked.length !== sortedIds.length) throw new ConflictException('ERP COGS catalog scope changed');
       }
       const fresh = await this.calculateCogs(tenantId, storeId, items, order.dateLocal, tx);
-      // Per-item fallback runs only when catalog evidence is missing.
-      // A verified catalog total of zero is intentional partner-supplied stock.
+      // Existing saved COGS is not updated when any item lacks positive cost
+      // evidence. New orders retain the schema's unresolved zero placeholder.
       order.cogs = fresh.cogs;
+      order.cogsUnresolved = fresh.cogsUnresolved || (items.length === 0 && !order.isVoid) || undefined;
       order.totalQuantity = fresh.totalQuantity;
       // Existing deletion/ownership transactions can lock an order before
       // changing stores. Retry rather than wait on them under catalog locks.
@@ -693,7 +704,7 @@ export class PosOrderService {
     const firstItem = items[0];
 
     // Calculate COGS from note_product
-    let { cogs, totalQuantity } = await this.calculateCogs(
+    let { cogs, totalQuantity, cogsUnresolved } = await this.calculateCogs(
       tenantId,
       storeId,
       items,
@@ -1027,6 +1038,7 @@ export class PosOrderService {
       pUtmCampaign: rawOrder.p_utm_campaign,
       pUtmContent: rawOrder.p_utm_content,
       cogs,
+      cogsUnresolved,
       totalQuantity,
       // Use partner extend_code as tracking marker; do not fall back to item tracking
       tracking: partnerExtend,
@@ -1175,6 +1187,7 @@ export class PosOrderService {
             && !Array.isArray(previous.orderSnapshot)
             ? previous.orderSnapshot as Record<string, unknown>
             : null;
+          if (!hasItemsPayload && !previous) order.cogsUnresolved = true;
           if (!hasItemsPayload && order.orderSnapshot && previousSnapshot && Array.isArray(previousSnapshot.items)) {
             order.orderSnapshot.items = previousSnapshot.items;
             order.itemData = Array.isArray(previous?.itemData)
@@ -1306,7 +1319,7 @@ export class PosOrderService {
               assigningCare: order.assigningCare,
             },
           });
-          if (hasItemsPayload) {
+          if (hasItemsPayload && !order.cogsUnresolved) {
             await client.posOrder.updateMany({
               where: {
                 id: persistedOrder.id,
@@ -1385,6 +1398,7 @@ export class PosOrderService {
           orderId: order.posOrderId || posOrderId,
           status: typeof order.status === 'number' ? order.status : status,
           upsertStatus: 'UPSERTED',
+          ...(order.cogsUnresolved ? { warning: `${ERP_COGS_POLICY}: positive ERP cost unresolved; existing COGS preserved, new order cost requires review` } : {}),
           ...(isNoProductOrder
             ? {
                 reason: isConfirmedNoProductSnapshot

@@ -6,7 +6,7 @@ export class ProductCogsDto {
   // Validate the JSON value itself, even when the global pipe coerces primitives.
   @Transform(({ obj, key }) => obj[key], { toClassOnly: true })
   @IsNumber({ allowNaN: false, allowInfinity: false, maxDecimalPlaces: 2 })
-  @Min(0)
+  @Min(0.01)
   @Max(MAX_PRODUCT_COGS)
   cogs: number;
 }
