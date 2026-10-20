@@ -1,5 +1,6 @@
 import type { SalesOverviewResponse } from '../_types/sales';
 import { getSafeRtsForecastPct, type SalesForecastOptions } from './sales-forecast';
+import { forecastCogsUnits } from './actual-cogs-units';
 
 type Kpis = SalesOverviewResponse['kpis'];
 type Counts = SalesOverviewResponse['counts'];
@@ -82,6 +83,8 @@ export function forecastSalesProduct(row: Product, options: SalesForecastOptions
 export function forecastKpiValues(kpis: Kpis, forecast: SalesReportForecast): Kpis {
   return {
     ...kpis, revenue: forecast.revenue, delivered: forecast.revenue, rts: forecast.rtsRevenue,
+    ...(Object.prototype.hasOwnProperty.call(kpis, 'actual_units')
+      ? { actual_units: forecastCogsUnits(kpis.actual_units_forecast_basis, forecast.rtsPct) } : {}),
     cogs: forecast.cogs, cogs_adjusted: forecast.cogs, cogs_rts_credit: 0,
     contribution_margin: forecast.margin, net_margin: forecast.margin, cm_rts_forecast: forecast.margin,
     aov: forecast.aov, cpp: forecast.cpp, ar_pct: forecast.arPct,
@@ -92,6 +95,8 @@ export function forecastKpiValues(kpis: Kpis, forecast: SalesReportForecast): Kp
 export function forecastProductValues(row: Product, forecast: SalesReportForecast): Product {
   return {
     ...row, revenue: forecast.revenue, gross_sales: forecast.orders, cogs: forecast.cogs,
+    ...(Object.prototype.hasOwnProperty.call(row, 'actual_units')
+      ? { actual_units: forecastCogsUnits(row.actual_units_forecast_basis, forecast.rtsPct) } : {}),
     contribution_margin: forecast.margin, net_margin: forecast.margin, cm_rts_forecast: forecast.margin,
     aov: forecast.aov, cpp: forecast.cpp, ar_pct: forecast.arPct,
     profit_efficiency: forecast.profitEfficiency, delivered_count: forecast.orders, rts_count: forecast.rtsOrders,

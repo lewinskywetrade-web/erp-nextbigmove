@@ -18,7 +18,7 @@ import { ReconcileSalesService } from '../workflows/services/reconcile-sales.ser
 import { ReconcileSalesAttributionService } from '../workflows/services/reconcile-sales-attribution.service';
 import { AnalyticsRequestCoordinatorService } from './analytics-request-coordinator.service';
 import { readCurrentAbandonedCosts, attachCurrentAbandonedCosts } from './utils/current-abandoned-cogs';
-import { enrichActualDeliveredUnits } from './utils/actual-delivered-units';
+import { enrichActualCogsUnits } from './utils/actual-cogs-units';
 import { loadSalesStoreAttribution, partitionTeamAdSpend } from './utils/team-ad-spend';
 import {
   UNATTRIBUTED_STORE_KEY,
@@ -806,10 +806,10 @@ export class SalesAnalyticsService {
       requestKey,
       () => this.calculateOverview(params),
     );
-    return this.attachDeliveredUnits(response, params, requestingUser, 'product', tenantId);
+    return this.attachCogsUnits(response, params, requestingUser, 'product', tenantId);
   }
 
-  private async attachDeliveredUnits(
+  private async attachCogsUnits(
     response: any, params: SalesOverviewParams, requestingUser: { role?: string } | undefined,
     mode: 'product' | 'store', tenantId: string,
   ) {
@@ -820,15 +820,17 @@ export class SalesAnalyticsService {
     const scope = {
       tenantId, start: response.selected.start_date, end: response.selected.end_date,
       teamIds: params.teamIds ?? [], excludeRepurchase: params.excludeRepurchase !== false,
+      excludeCancel: params.excludeCancel !== false, excludeRestocking: params.excludeRestocking !== false,
+      excludeAbandoned: params.excludeAbandoned !== false, excludeRts: params.excludeRts !== false,
       emptySelection: params.emptySelection === true,
       allSelected: !(params.mappings ?? []).some(value => this.normalize(value).length > 0),
     };
     // The public operation has finished, so this does not hold a coordinator
     // slot while waiting for another one. Bound/coalesce protected SQL reads
     // too; include the base response so concurrent snapshots cannot cross.
-    const key = `sales-actual-delivered-units:${tenantId}:${this.analyticsCache.hashObject({ scope, mode, response })}`;
+    const key = `sales-actual-cogs-units:${tenantId}:${this.analyticsCache.hashObject({ scope, mode, response })}`;
     return this.analyticsRequestCoordinator.run(tenantId, key,
-      () => enrichActualDeliveredUnits(this.prisma, response, scope, mode));
+      () => enrichActualCogsUnits(this.prisma, response, scope, mode));
   }
 
   private async calculateOverview(params: SalesOverviewParams) {
@@ -1590,7 +1592,7 @@ export class SalesAnalyticsService {
       mappings: [...(params.mappings || [])].map(value => this.normalize(value)).sort(),
     })}`;
     const response = await this.analyticsRequestCoordinator.run(tenantId, requestKey, () => this.calculateStoreOverview(params));
-    return this.attachDeliveredUnits(response, params, requestingUser, 'store', tenantId);
+    return this.attachCogsUnits(response, params, requestingUser, 'store', tenantId);
   }
 
   private async calculateStoreOverview(params: SalesOverviewParams) {

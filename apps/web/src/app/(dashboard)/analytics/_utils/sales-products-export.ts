@@ -1,11 +1,11 @@
-import { actualDeliveredUnitsValue } from './actual-delivered-units';
+import { cogsUnitsValue } from './actual-cogs-units';
 
 export type SalesProductsExportRow = {
   product: string;
   grossRevenue: number;
   grossSales: number;
   cogs: number;
-  actualDeliveredUnits?: number | null;
+  units?: number | null;
   aov: number;
   cpp: number;
   processedCpp: number;
@@ -25,7 +25,7 @@ type SalesProductsExportInput = {
   rows: SalesProductsExportRow[];
   view?: 'actual' | 'forecast';
   entityLabel?: 'Product' | 'Store';
-  includeActualDeliveredUnits?: boolean;
+  includeUnits?: boolean;
 };
 
 const escapeCsvValue = (value: string | number) => {
@@ -79,15 +79,15 @@ export function salesProductsExportGrid(input: SalesProductsExportInput) {
   }
   // Keep existing metric indices stable for currency/percentage formatting.
   // The optional protected column is inserted beside COGS only for its caller.
-  headers.push('Actual Units Delivered');
+  headers.push(forecast ? 'Forecast Units' : 'Actual Units');
   const indices = headers.map((_, i) => i)
     .filter(i => i !== 14 && (!forecast || (i !== 6 && i !== 12)));
-  if (input.includeActualDeliveredUnits) indices.splice(indices.indexOf(3) + 1, 0, 14);
+  if (input.includeUnits) indices.splice(indices.indexOf(3) + 1, 0, 14);
   const rows = input.rows.map(row => [
     row.product, row.grossRevenue, row.grossSales, row.cogs, row.aov, row.cpp,
     row.processedCpp, row.adSpend, row.arPct / 100, row.rtsPct / 100, row.pePct / 100,
     row.contributionMargin, row.cmRtsForecast, row.netMargin,
-    input.includeActualDeliveredUnits ? actualDeliveredUnitsValue(row.actualDeliveredUnits) ?? '' : '',
+    input.includeUnits ? cogsUnitsValue(row.units, input.view) ?? '' : '',
   ].map(value => typeof value === 'number' && !Number.isFinite(value) ? '' : value));
   return { headers: indices.map(i => headers[i]), rows: rows.map(row => indices.map(i => row[i])), indices };
 }
@@ -98,7 +98,7 @@ export function exportSalesProductsCsv(input: SalesProductsExportInput) {
     if (typeof value !== 'number') return value;
     const originalIndex = indices[index];
     if ([8, 9, 10].includes(originalIndex)) return `${(value * 100).toFixed(2)}%`;
-    if ((originalIndex === 2 && input.view !== 'forecast') || originalIndex === 14) return Math.round(value);
+    if ([2, 14].includes(originalIndex) && input.view !== 'forecast') return Math.round(value);
     return value.toFixed(2);
   }));
 
@@ -151,7 +151,7 @@ export async function exportSalesProductsXlsx(input: SalesProductsExportInput) {
 
       const originalIndex = indices[columnIndex];
       if (originalIndex === 2 || originalIndex === 14) {
-        cell.z = originalIndex === 2 && input.view === 'forecast' ? '0.00' : '0';
+        cell.z = input.view === 'forecast' ? '0.00' : '0';
         continue;
       }
 
@@ -176,7 +176,7 @@ export async function exportSalesProductsXlsx(input: SalesProductsExportInput) {
       ['COD fees use the selected cohort’s blended delivered fee/revenue rate. Missing evidence is blank.'],
       ['Forecast Net is before overhead and equals Forecast CM on the same available expense basis.'],
       ['These are projections from saved source values, not actual results or cost corrections.'],
-      ...(input.includeActualDeliveredUnits ? [['Actual Units Delivered stays actual: delivered item quantities in the selected order-date cohort and applicable filters; it is not scaled by the RTS assumption. Blank means quantity evidence is unavailable.']] : []),
+      ...(input.includeUnits ? [['Forecast Units uses the same population as Forecast COGS: item quantities before the actual RTS exclusion multiplied by (1 − assumed RTS %). Other selected filters still apply. Fractional units are estimates; blank means quantity evidence is unavailable.']] : []),
     ]);
     notes['!cols'] = [{ wch: 120 }];
     XLSX.utils.book_append_sheet(workbook, notes, 'Forecast assumptions');
