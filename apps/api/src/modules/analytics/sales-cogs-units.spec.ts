@@ -3,15 +3,15 @@ import { createHash } from 'node:crypto';
 import { SalesAnalyticsService } from './sales-analytics.service';
 import { SalesAnalyticsController } from './sales-analytics.controller';
 import { AnalyticsRequestCoordinatorService } from './analytics-request-coordinator.service';
-import * as deliveredUnits from './utils/actual-delivered-units';
+import * as cogsUnits from './utils/actual-cogs-units';
 
-describe('SUPER_ADMIN-only delivered units outside shared report caches', () => {
+describe('SUPER_ADMIN-only COGS-linked units outside shared report caches', () => {
   afterEach(() => { jest.restoreAllMocks(); });
   const modes = ['getOverview', 'getStoreOverview'] as const;
   function fixture(realCoordinator = false) {
     const original = Object.freeze({
-      products: Object.freeze([Object.freeze({ mapping: 'A', delivered_count: 1, cogs: 100 })]),
-      kpis: Object.freeze({ cogs: 100 }), counts: Object.freeze({ delivered: 1 }),
+      products: Object.freeze([Object.freeze({ mapping: 'A', gross_sales: 1, cogs: 100 })]),
+      kpis: Object.freeze({ cogs: 100 }), counts: Object.freeze({ purchases: 1, rts: 0 }),
       selected: Object.freeze({ start_date: '2026-10-01', end_date: '2026-10-19' }),
     });
     const cache = { hashObject: (value: any) => createHash('sha256').update(JSON.stringify(value)).digest('hex') };
@@ -23,10 +23,10 @@ describe('SUPER_ADMIN-only delivered units outside shared report caches', () => 
     // Models the single public object returned from both Redis and in-flight cache.
     const product = jest.spyOn(service as any, 'calculateOverview').mockResolvedValue(original);
     const store = jest.spyOn(service as any, 'calculateStoreOverview').mockResolvedValue(original);
-    const enrich = jest.spyOn(deliveredUnits, 'enrichActualDeliveredUnits').mockImplementation(async (_db, response) => ({
-      ...response, kpis: { ...response.kpis, actual_delivered_units: 7 },
-      products: response.products.map(row => ({ ...row, actual_delivered_units: 7 })),
-      actualDeliveredUnitsCoverage: { policy: deliveredUnits.ACTUAL_DELIVERED_UNITS_POLICY, status: 'COMPLETE' },
+    const enrich = jest.spyOn(cogsUnits, 'enrichActualCogsUnits').mockImplementation(async (_db, response) => ({
+      ...response, kpis: { ...response.kpis, actual_units: 7, actual_units_forecast_basis: 9 },
+      products: response.products.map(row => ({ ...row, actual_units: 7, actual_units_forecast_basis: 9 })),
+      actualUnitsCoverage: { policy: cogsUnits.ACTUAL_COGS_UNITS_POLICY, status: 'COMPLETE' },
     } as any));
     return { service, original, enrich, coordinator, product, store };
   }
@@ -37,23 +37,25 @@ describe('SUPER_ADMIN-only delivered units outside shared report caches', () => 
       expect(await f.service[method]({}, user)).toBe(f.original);
     }
     expect(f.enrich).not.toHaveBeenCalled();
-    expect(f.original.kpis).not.toHaveProperty('actual_delivered_units');
+    expect(f.original.kpis).not.toHaveProperty('actual_units');
   });
   it.each(modes)('%s decorates only current SUPER_ADMIN, leaves cached object unchanged and uses a separate bounded operation', async method => {
     const f = fixture();
     const before = await f.service[method]({}, { role: 'USER' });
-    const elevated = await f.service[method]({ excludeRepurchase: false }, { role: 'SUPER_ADMIN' });
+    const elevated = await f.service[method]({ excludeRepurchase: false, excludeCancel: false,
+      excludeRestocking: false, excludeAbandoned: false, excludeRts: false }, { role: 'SUPER_ADMIN' });
     const after = await f.service[method]({}, { role: 'USER' });
     expect(before).toBe(after);
     expect(after).toBe(f.original);
     expect(elevated).not.toBe(f.original);
-    expect(elevated.kpis.actual_delivered_units).toBe(7);
-    expect(after.kpis).not.toHaveProperty('actual_delivered_units');
-    expect(after.products[0]).not.toHaveProperty('actual_delivered_units');
+    expect(elevated.kpis.actual_units).toBe(7);
+    expect(after.kpis).not.toHaveProperty('actual_units');
+    expect(after.products[0]).not.toHaveProperty('actual_units');
     expect(f.enrich).toHaveBeenCalledWith(expect.anything(), f.original, expect.objectContaining({
       tenantId: 'tenant', start: '2026-10-01', end: '2026-10-19', excludeRepurchase: false,
+      excludeCancel: false, excludeRestocking: false, excludeAbandoned: false, excludeRts: false,
     }), method === 'getOverview' ? 'product' : 'store');
-    expect(f.coordinator.run.mock.calls.filter((call: any) => call[1].startsWith('sales-actual-delivered-units:'))).toHaveLength(1);
+    expect(f.coordinator.run.mock.calls.filter((call: any) => call[1].startsWith('sales-actual-cogs-units:'))).toHaveLength(1);
   });
   it.each(modes)('%s keeps concurrent SUPER_ADMIN/USER requests isolated while coalescing the shared base', async method => {
     const f = fixture(true);
@@ -67,15 +69,15 @@ describe('SUPER_ADMIN-only delivered units outside shared report caches', () => 
     expect(await normal).toBe(f.original);
     expect((method === 'getOverview' ? f.product : f.store)).toHaveBeenCalledTimes(1);
     release();
-    expect((await admin).kpis.actual_delivered_units).toBe(7);
+    expect((await admin).kpis.actual_units).toBe(7);
     const later = await f.service[method]({}, { role: 'USER' });
     expect(later).toBe(f.original);
-    expect(later.products[0]).not.toHaveProperty('actual_delivered_units');
+    expect(later.products[0]).not.toHaveProperty('actual_units');
     expect(f.enrich).toHaveBeenCalledTimes(1);
   });
   it.each(modes)('%s cannot enable protected fields from arbitrary request params', async method => {
     const f = fixture();
-    await f.service[method]({ role: 'SUPER_ADMIN', actual_delivered_units: true, includeActualUnits: true } as any);
+    await f.service[method]({ role: 'SUPER_ADMIN', actual_units: true, includeActualUnits: true } as any);
     expect(f.enrich).not.toHaveBeenCalled();
   });
   it.each(modes)('%s controller passes the authenticated current identity, not the query/header role', async method => {

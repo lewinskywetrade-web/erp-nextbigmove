@@ -6,7 +6,7 @@ import {
 } from './analytics-table-shell';
 import { type SalesOverviewResponse } from '../_types/sales';
 import { formatMetricValue, toTitleCase } from '../_utils/metrics';
-import { ACTUAL_DELIVERED_UNITS_DESCRIPTION, actualDeliveredUnitsValue } from '../_utils/actual-delivered-units';
+import { ACTUAL_UNITS_DESCRIPTION, FORECAST_UNITS_DESCRIPTION, cogsUnitsValue } from '../_utils/actual-cogs-units';
 
 export type SalesProductsSortKey =
   | 'index'
@@ -14,7 +14,7 @@ export type SalesProductsSortKey =
   | 'revenue'
   | 'gross_sales'
   | 'cogs'
-  | 'actual_delivered_units'
+  | 'actual_units'
   | 'aov'
   | 'cpp'
   | 'processed_cpp'
@@ -46,7 +46,7 @@ export type SalesProductsTotalRow = {
   revenue: number;
   grossSales: number;
   cogs: number;
-  actualDeliveredUnits?: number | null;
+  units?: number | null;
   aov: number;
   cpp: number;
   processedCpp: number;
@@ -64,7 +64,7 @@ type AnalyticsSalesProductsTableProps = {
   /** First-column header: 'Product' on the product tab, 'Store' on the store tab. */
   entityLabel?: string;
   reportView?: 'actual' | 'forecast';
-  showActualDeliveredUnits?: boolean;
+  showUnits?: boolean;
   productStart: number;
   productEnd: number;
   totalProducts: number;
@@ -118,7 +118,7 @@ export function AnalyticsSalesProductsTable({
   isLoading,
   entityLabel = 'Product',
   reportView = 'actual',
-  showActualDeliveredUnits = false,
+  showUnits = false,
   productStart,
   productEnd,
   totalProducts,
@@ -136,10 +136,10 @@ export function AnalyticsSalesProductsTable({
   renderSortLabel,
 }: AnalyticsSalesProductsTableProps) {
   const isForecast = reportView === 'forecast';
-  const colCount = (isForecast ? 13 : 15) + (showActualDeliveredUnits ? 1 : 0);
-  const formatActualUnits = (value: unknown) => {
-    const units = actualDeliveredUnitsValue(value);
-    return units === null ? '—' : formatMetricValue(units, 'number', 0);
+  const colCount = (isForecast ? 13 : 15) + (showUnits ? 1 : 0);
+  const formatUnits = (value: unknown) => {
+    const units = cogsUnitsValue(value, reportView);
+    return units === null ? '—' : formatMetricValue(units, 'number', isForecast ? 2 : 0);
   };
   return (
     <AnalyticsTableShell
@@ -170,8 +170,8 @@ export function AnalyticsSalesProductsTable({
               <th className="px-3 py-3 text-center text-xs font-semibold uppercase whitespace-nowrap text-slate-500 dark:text-slate-300 sm:px-4 lg:px-6">
                 {renderSortLabel(isForecast ? 'Forecast COGS' : 'COGS', 'cogs')}
               </th>
-              {showActualDeliveredUnits && <th title={ACTUAL_DELIVERED_UNITS_DESCRIPTION} className="px-3 py-3 text-center text-xs font-semibold uppercase whitespace-nowrap text-slate-500 dark:text-slate-300 sm:px-4 lg:px-6">
-                {renderSortLabel('Actual Units Delivered', 'actual_delivered_units')}
+              {showUnits && <th title={isForecast ? FORECAST_UNITS_DESCRIPTION : ACTUAL_UNITS_DESCRIPTION} className="px-3 py-3 text-center text-xs font-semibold uppercase whitespace-nowrap text-slate-500 dark:text-slate-300 sm:px-4 lg:px-6">
+                {renderSortLabel(isForecast ? 'Forecast Units' : 'Actual Units', 'actual_units')}
               </th>}
               <th className="px-3 py-3 text-center text-xs font-semibold uppercase whitespace-nowrap text-slate-500 dark:text-slate-300 sm:px-4 lg:px-6">
                 {renderSortLabel('AOV', 'aov')}
@@ -234,7 +234,7 @@ export function AnalyticsSalesProductsTable({
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.revenue, 'currency')}</td>
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.gross_sales, 'number', isForecast ? 2 : 0)}</td>
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.cogs, 'currency')}</td>
-                    {showActualDeliveredUnits && <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatActualUnits(row.actual_delivered_units)}</td>}
+                    {showUnits && <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatUnits(row.actual_units)}</td>}
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.aov, 'currency')}</td>
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.cpp, 'currency')}</td>
                     {!isForecast && <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.processed_cpp, 'currency')}</td>}
@@ -269,7 +269,7 @@ export function AnalyticsSalesProductsTable({
                 <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.revenue, 'currency')}</td>
                 <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.grossSales, 'number', isForecast ? 2 : 0)}</td>
                 <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.cogs, 'currency')}</td>
-                {showActualDeliveredUnits && <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatActualUnits(totals.actualDeliveredUnits)}</td>}
+                {showUnits && <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatUnits(totals.units)}</td>}
                 <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.aov, 'currency')}</td>
                 <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.cpp, 'currency')}</td>
                 {!isForecast && <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.processedCpp, 'currency')}</td>}

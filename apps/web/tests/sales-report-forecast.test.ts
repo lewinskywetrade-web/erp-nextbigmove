@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { actualDeliveredUnitsValue, canViewActualDeliveredUnits } from '../src/app/(dashboard)/analytics/_utils/actual-delivered-units';
+import { cogsUnitsValue, canViewCogsUnits, forecastCogsUnits } from '../src/app/(dashboard)/analytics/_utils/actual-cogs-units';
 import { test } from 'node:test';
 import type { SalesOverviewResponse } from '../src/app/(dashboard)/analytics/_types/sales';
 import {
@@ -112,54 +112,93 @@ test('forecast export keeps every row, fractional orders and explicit zeros; una
   assert.ok(actual.headers.includes(input.cmRtsLabel));
 });
 
-test('delivered-unit visibility follows only the current server identity, including View As', () => {
-  assert.equal(canViewActualDeliveredUnits({ role: 'SUPER_ADMIN' }), true);
+test('COGS-unit visibility follows only the current server identity, including View As', () => {
+  assert.equal(canViewCogsUnits({ role: 'SUPER_ADMIN' }), true);
   for (const role of ['ADMIN', 'USER', 'VIEWER', undefined]) {
-    assert.equal(canViewActualDeliveredUnits({ role }), false);
+    assert.equal(canViewCogsUnits({ role }), false);
   }
-  assert.equal(canViewActualDeliveredUnits(null), false);
-  assert.equal(canViewActualDeliveredUnits(undefined), false);
+  assert.equal(canViewCogsUnits(null), false);
+  assert.equal(canViewCogsUnits(undefined), false);
   const preview = { role: 'USER', impersonatedBy: 'super-admin-owner' };
-  assert.equal(canViewActualDeliveredUnits(preview), false);
+  assert.equal(canViewCogsUnits(preview), false);
 });
 
-test('actual delivered quantities accept saved safe counts and never coerce missing evidence to zero', () => {
-  for (const value of [0, 7, 1234]) assert.equal(actualDeliveredUnitsValue(value), value);
+test('actual quantities accept saved safe counts and never coerce missing evidence to zero', () => {
+  for (const value of [0, 7, 1234]) assert.equal(cogsUnitsValue(value), value);
   for (const value of [null, undefined, '', '7', -1, 1.5, Number.NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
-    assert.equal(actualDeliveredUnitsValue(value), null);
+    assert.equal(cogsUnitsValue(value), null);
+  }
+  assert.equal(cogsUnitsValue(5.6, 'forecast'), 5.6);
+  for (const value of [null, undefined, '', '7', -1, Number.NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.equal(cogsUnitsValue(value, 'forecast'), null);
   }
 });
 
-test('all Forecast assumptions retain original actual delivered units and KPI units', () => {
-  const row = { actual_delivered_units: 37 } as SalesOverviewResponse['products'][number];
-  const kpis = { actual_delivered_units: 137 } as SalesOverviewResponse['kpis'];
-  for (const pct of [0, 10, 40, 100]) {
+test('Forecast units use the same pre-RTS COGS population and success ratio for rows and totals', () => {
+  const row = { actual_units: 37, actual_units_forecast_basis: 41 } as SalesOverviewResponse['products'][number];
+  const kpis = { actual_units: 137, actual_units_forecast_basis: 149 } as SalesOverviewResponse['kpis'];
+  for (const pct of [0, 20, 100]) {
     const forecast = projectSalesReport(basis, pct);
-    assert.equal(forecastProductValues(row, forecast).actual_delivered_units, 37);
-    assert.equal(forecastKpiValues(kpis, forecast).actual_delivered_units, 137);
+    const success = 1 - pct / 100;
+    assert.equal(forecastProductValues(row, forecast).actual_units, 41 * success);
+    assert.equal(forecastKpiValues(kpis, forecast).actual_units, 149 * success);
+    assert.equal(forecast.cogs, basis.cogs * success);
+    // Repeated calculations start from the server population, never the prior projection.
+    assert.equal(forecastProductValues(forecastProductValues(row, forecast), forecast).actual_units, 41 * success);
+  }
+  assert.equal(row.actual_units, 37);
+  assert.equal(kpis.actual_units, 137);
+});
+
+test('filtered actual units remain distinct from pre-RTS units, and other exclusions change both bases', () => {
+  const included = { actual_units: 10, actual_units_forecast_basis: 10 } as SalesOverviewResponse['products'][number];
+  const excludeRts = { actual_units: 7, actual_units_forecast_basis: 10 } as SalesOverviewResponse['products'][number];
+  const alsoExcludeCancel = { actual_units: 5, actual_units_forecast_basis: 8 } as SalesOverviewResponse['products'][number];
+  const forecast = projectSalesReport(basis, 20);
+  assert.equal(cogsUnitsValue(included.actual_units), 10);
+  assert.equal(cogsUnitsValue(excludeRts.actual_units), 7);
+  assert.equal(cogsUnitsValue(alsoExcludeCancel.actual_units), 5);
+  assert.equal(forecastProductValues(included, forecast).actual_units, 8);
+  assert.equal(forecastProductValues(excludeRts, forecast).actual_units, 8);
+  assert.equal(forecastProductValues(alsoExcludeCancel, forecast).actual_units, 6.4);
+});
+
+test('unknown quantity remains unknown even at 100% RTS while explicit zero stays zero', () => {
+  for (const pct of [0, 20, 100]) {
+    assert.equal(forecastCogsUnits(0, pct), 0);
+    for (const value of [null, undefined, '', '7', -1, 1.5, Number.NaN, Infinity]) {
+      assert.equal(forecastCogsUnits(value, pct), null);
+    }
+    const forecast = projectSalesReport(basis, pct);
+    const unknown = { actual_units: 7, actual_units_forecast_basis: null } as SalesOverviewResponse['products'][number];
+    assert.equal(forecastProductValues(unknown, forecast).actual_units, null);
+    assert.equal(Object.hasOwn(forecastProductValues({} as SalesOverviewResponse['products'][number], forecast), 'actual_units'), false);
+    assert.equal(Object.hasOwn(forecastKpiValues({} as SalesOverviewResponse['kpis'], forecast), 'actual_units'), false);
   }
 });
 
-test('Actual and Forecast exports include protected actual quantities only when authorized, adjacent to COGS', () => {
+test('Actual and Forecast exports include correctly labeled quantities only when authorized, adjacent to COGS', () => {
   const row: SalesProductsExportRow = {
     product: 'Example', grossRevenue: 100, grossSales: 1.25, cogs: 0, aov: 80, cpp: 10,
     processedCpp: 10, adSpend: 12.5, arPct: 12.5, rtsPct: 23, pePct: 50,
-    contributionMargin: 10, cmRtsForecast: 20, netMargin: 30, actualDeliveredUnits: 7,
+    contributionMargin: 10, cmRtsForecast: 20, netMargin: 30, units: 7,
   };
   const input = {
     startDate: '2026-10-01', endDate: '2026-10-20', cmRtsLabel: 'CM (RTS 23%)',
-    rows: [...Array.from({ length: 30 }, () => row), { ...row, actualDeliveredUnits: 0 }, { ...row, actualDeliveredUnits: null }],
+    rows: [...Array.from({ length: 30 }, () => row), { ...row, units: 0 }, { ...row, units: null }],
   };
   for (const view of ['actual', 'forecast'] as const) {
-    const authorized = salesProductsExportGrid({ ...input, view, includeActualDeliveredUnits: true });
-    assert.equal(authorized.headers[4], 'Actual Units Delivered');
+    const rows = input.rows.map(item => ({ ...item, units: item.units === null ? null : view === 'forecast' ? (item.units ?? 0) * .8 : item.units }));
+    const authorized = salesProductsExportGrid({ ...input, rows, view, includeUnits: true });
+    assert.equal(authorized.headers[4], view === 'actual' ? 'Actual Units' : 'Forecast Units');
     assert.equal(authorized.rows.length, 32);
-    assert.equal(authorized.rows[0][4], 7);
+    assert.equal(authorized.rows[0][4], view === 'actual' ? 7 : 7 * .8);
     assert.equal(authorized.rows[30][4], 0);
     assert.equal(authorized.rows[31][4], '');
     assert.equal(authorized.indices[4], 14);
     const hidden = salesProductsExportGrid({ ...input, view });
-    assert.equal(hidden.headers.includes('Actual Units Delivered'), false);
+    assert.equal(hidden.headers.includes('Actual Units'), false);
+    assert.equal(hidden.headers.includes('Forecast Units'), false);
     assert.equal(hidden.indices.includes(14), false);
     assert.equal(hidden.headers.length, view === 'actual' ? 14 : 12);
   }
