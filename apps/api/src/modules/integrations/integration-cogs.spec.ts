@@ -111,6 +111,8 @@ function createHarness(initialRows: any[] = []) {
       const releases: Array<() => void> = [];
       let hasCogsTableLock = false;
       const tx = {
+        tenant: { findUnique: jest.fn(async () => ({ settings: {} })) },
+        wmsProductProfile: { findUnique: jest.fn(async () => null) },
         posProductCogs: model(overlay, locked, prefix),
         $executeRawUnsafe: async (sql: string) => {
           expect(sql).toBe('LOCK TABLE pos_product_cogs IN ROW EXCLUSIVE MODE');
@@ -150,7 +152,7 @@ function createHarness(initialRows: any[] = []) {
   };
   const service = new IntegrationService(
     prisma as never,
-    {} as never,
+    { get: jest.fn(() => undefined) } as never,
     teamContext as never,
     {} as never,
     {} as never,
@@ -161,6 +163,7 @@ function createHarness(initialRows: any[] = []) {
     {} as never,
     {} as never,
     refresh as never,
+    { syncAfterErpWrites: jest.fn(async () => undefined) } as never,
   );
   const getStore = jest.spyOn(service, 'getPosStore').mockResolvedValue(store as never);
   return { service, prisma, getStore, teamContext, operations, events, hooks, refresh, store, rows: () => rows };

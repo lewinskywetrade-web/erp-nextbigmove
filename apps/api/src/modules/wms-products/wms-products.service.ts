@@ -13,6 +13,7 @@ import {
 import { ClsService } from 'nestjs-cls';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { IntegrationService } from '../integrations/integration.service';
+import { WmsCogsSyncService, WmsCogsSyncResult } from '../product-cogs/wms-cogs-sync.service';
 import { GetWmsProductsOverviewDto } from './dto/get-wms-products-overview.dto';
 import { GetWmsVariationIntegrityAuditDto } from './dto/get-wms-variation-integrity-audit.dto';
 import { UpdateWmsProductProfileDto } from './dto/update-wms-product-profile.dto';
@@ -98,6 +99,7 @@ export class WmsProductsService {
     private readonly prisma: PrismaService,
     private readonly cls: ClsService,
     private readonly integrationService: IntegrationService,
+    private readonly cogsSync: WmsCogsSyncService,
   ) {}
 
   async getOverview(query: GetWmsProductsOverviewDto) {
@@ -780,8 +782,13 @@ export class WmsProductsService {
 
     await this.validateLocationReference(preferredLocationId ?? null, PRODUCT_SECTION_LOCATION_KINDS);
 
-    const updated = await this.prisma.wmsProductProfile.update({
-      where: { id: existing.id },
+    let cogsSync: WmsCogsSyncResult | undefined;
+    const updated = await this.prisma.$transaction(async tx => {
+      const prepared = body.inhouseUnitCost !== undefined ? await this.cogsSync.prepare(tx, scope.activeTenantId!, [existing.id]) : null;
+      if (prepared) this.cogsSync.assertSourceProfiles(prepared);
+      const profile = await tx.wmsProductProfile.update({
+      where: { id: existing.id, tenantId: scope.activeTenantId!, storeId: existing.storeId, posProductId: existing.posProductId,
+        productId: existing.productId, variationId: existing.variationId, updatedAt: existing.updatedAt },
       data: {
         ...(body.status !== undefined ? { status: body.status } : {}),
         ...(body.isSerialized !== undefined ? { isSerialized: body.isSerialized } : {}),
@@ -824,7 +831,15 @@ export class WmsProductsService {
           },
         },
       },
-    });
+      });
+      if (prepared) cogsSync = await this.cogsSync.syncAfter(tx, prepared, { source: 'WMS_PROFILE_EDIT', sourceRef: existing.id,
+        actorId: (this.cls.get('userId') as string | undefined) ?? null });
+      // Fallback may have filled a blank/zero inhouse cost in the same transaction.
+      return prepared?.enabled ? tx.wmsProductProfile.findUniqueOrThrow({ where: { id: profile.id, tenantId: scope.activeTenantId!, storeId: existing.storeId, posProductId: existing.posProductId }, include: { posProduct: { select: {
+        id: true, productId: true, variationId: true, warehouseId: true, customId: true, productSnapshot: true, name: true,
+        retailPrice: true, createdAt: true, updatedAt: true, store: { select: { id: true, name: true, shopName: true, tenant: { select: { name: true } } } },
+      } } } }) : profile;
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10000, timeout: 30000 });
 
     const locationIds = [updated.preferredLocationId, updated.pickLocationId].filter(Boolean) as string[];
     const locations = locationIds.length
@@ -875,6 +890,7 @@ export class WmsProductsService {
       : null;
 
     return {
+      cogsSync,
       profile: this.mapProfile(
         updated,
         new Map(posWarehouse ? [[posWarehouse.warehouseId, posWarehouse]] : []),

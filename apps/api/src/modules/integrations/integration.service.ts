@@ -68,6 +68,8 @@ import {
 import { PosShopOwnershipService } from './services/pos-shop-ownership.service';
 import { assertValidProductCogs } from './product-cogs-validation';
 import { ProductCogsRefreshPublisherService } from './services/product-cogs-refresh-publisher.service';
+import { lockCogsProduct, productCogsToday, findApplicableProductCogs, writeCurrentProductCogs } from '../product-cogs/current-product-cogs';
+import { assertWmsManagedCogsEditable, WmsCogsSyncService } from '../product-cogs/wms-cogs-sync.service';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -233,6 +235,7 @@ export class IntegrationService {
     @Inject(CACHE_MANAGER)
     private readonly cacheManager: Cache,
     private readonly productCogsRefresh: ProductCogsRefreshPublisherService,
+    private readonly wmsCogsSync: WmsCogsSyncService,
   ) {}
 
   private getPosGeoCacheTtlMs(): number {
@@ -3777,6 +3780,7 @@ export class IntegrationService {
         const summary = { id: product.id, name: product.name, productId: product.productId, customId: product.customId };
         (result.hadHistory ? updatedProducts : newProducts).push(summary);
       }
+      await this.wmsCogsSync.syncAfterErpWrites(tx, store, products.map(p => p.id), (this.cls.get('userId') as string | undefined) ?? null);
       await this.productCogsRefresh.enqueue({ tenantId: store.tenantId, storeId: store.id,
         changes: products.map(product => ({ productId: product.id, fromDate: today.toISOString().slice(0, 10), toDate: null })) });
       // A history conflict throws and rolls back the whole bulk operation.
@@ -5617,109 +5621,18 @@ export class IntegrationService {
   // COGS (Cost of Goods Sold) Management
   // ============================================================================
 
-  private async lockCogsProduct(
-    tx: Prisma.TransactionClient,
-    productId: string,
-    store: { id: string; tenantId: string },
-  ): Promise<LockedCogsProduct | null> {
-    // Acquire the normal COGS write table lock before the parent row. The reviewed
-    // repair utility takes a SHARE table lock in the same order to exclude phantoms.
-    await tx.$executeRawUnsafe('LOCK TABLE pos_product_cogs IN ROW EXCLUSIVE MODE');
-    const rows = await tx.$queryRawUnsafe<LockedCogsProduct[]>(`
-      SELECT p.id,p.name,p."productId",p."customId",s."teamId"
-      FROM pos_products p JOIN pos_stores s ON s.id=p."storeId"
-      WHERE p.id=$1::uuid AND p."storeId"=$2::uuid AND s."tenantId"=$3::uuid
-      FOR UPDATE OF p FOR SHARE OF s`, productId, store.id, store.tenantId);
-    return rows[0] ?? null;
-  }
-
-  private async productCogsToday(client: Pick<Prisma.TransactionClient, '$queryRawUnsafe'>): Promise<Date> {
-    const [clock] = await client.$queryRawUnsafe<Array<{ businessDate: string }>>(`
-      SELECT to_char((statement_timestamp() AT TIME ZONE 'Asia/Manila')::date,'YYYY-MM-DD') AS "businessDate"`);
-    return new Date(`${clock.businessDate}T00:00:00.000Z`);
-  }
-
-  private async findApplicableProductCogs(
-    client: Pick<Prisma.TransactionClient, 'posProductCogs'>,
-    productId: string,
-    store: { id: string; tenantId: string },
-    date: Date,
-  ) {
-    const scope = { tenantId: store.tenantId, storeId: store.id, productId };
-    const dated = await client.posProductCogs.findFirst({
-      where: { ...scope, AND: [{ startDate: { not: null } }, { startDate: { lte: date } }],
-        OR: [{ endDate: { gte: date } }, { endDate: null }] },
-      orderBy: [{ startDate: 'desc' }, { updatedAt: 'desc' }, { id: 'asc' }],
-    });
-    if (dated) return dated;
-    return client.posProductCogs.findFirst({
-      where: { ...scope, startDate: null, OR: [{ endDate: { gte: date } }, { endDate: null }] },
-      orderBy: [{ updatedAt: 'desc' }, { createdAt: 'desc' }, { id: 'asc' }],
+  private lockCogsProduct(tx: Prisma.TransactionClient, productId: string, store: { id: string; tenantId: string }) {
+    return lockCogsProduct(tx, productId, store).then(async product => {
+      if (product) await assertWmsManagedCogsEditable(tx, productId, store);
+      return product;
     });
   }
-
-  private validateCurrentCogsHistory(
-    history: PosProductCogs[], productId: string, store: { id: string; tenantId: string }, today: Date,
-  ) {
-    const review = (reason: string): never => {
-      throw new ConflictException(`COGS history requires review (${reason}); no changes applied`);
-    };
-    const todayTime = today.getTime();
-    for (const entry of history) {
-      if (entry.productId !== productId || entry.storeId !== store.id || entry.tenantId !== store.tenantId) review('scope mismatch');
-      try { assertValidProductCogs(Number(entry.cogs.toString())); } catch { review('invalid recorded cost'); }
-      const start = entry.startDate?.getTime();
-      const end = entry.endDate?.getTime();
-      if ((start !== undefined && !Number.isFinite(start)) || (end !== undefined && !Number.isFinite(end))) review('invalid date');
-      if (start !== undefined && end !== undefined && end < start) review('invalid date range');
-      if (start !== undefined && start > todayTime) review('future schedule');
-      if (end !== undefined && end >= todayTime) review('finite current or future expiry');
-    }
-    if (history.filter((entry) => entry.startDate === null).length > 1) review('multiple undated defaults');
-    const dated = history.filter((entry) => entry.startDate !== null)
-      .sort((left, right) => left.startDate!.getTime() - right.startDate!.getTime());
-    let previousEnd = -Infinity;
-    for (const entry of dated) {
-      if (entry.startDate!.getTime() <= previousEnd) review('overlapping dated intervals');
-      previousEnd = entry.endDate?.getTime() ?? Infinity;
-    }
+  private productCogsToday(client: Pick<Prisma.TransactionClient, '$queryRawUnsafe'>) { return productCogsToday(client); }
+  private findApplicableProductCogs(client: Pick<Prisma.TransactionClient, 'posProductCogs'>, productId: string, store: { id: string; tenantId: string }, date: Date) {
+    return findApplicableProductCogs(client, productId, store, date);
   }
-
-  private async writeCurrentProductCogs(
-    tx: Prisma.TransactionClient, product: LockedCogsProduct,
-    store: { id: string; tenantId: string }, cogs: number, today: Date,
-  ) {
-    // Deliberately include all rows for this parent, so wrong-scope history is
-    // rejected rather than hidden by a tenant filter and silently duplicated.
-    const history = await tx.posProductCogs.findMany({ where: { productId: product.id } });
-    this.validateCurrentCogsHistory(history, product.id, store, today);
-    const todayEntry = history.find((entry) => entry.startDate?.getTime() === today.getTime());
-    const olderOpen = history.find((entry) => entry.startDate !== null
-      && entry.startDate.getTime() < today.getTime() && entry.endDate === null);
-    const legacy = history.find((entry) => entry.startDate === null && entry.endDate === null);
-    const current = todayEntry ?? olderOpen ?? legacy;
-    if (current && current.cogs.equals(cogs)) return { entry: current, hadHistory: true };
-    if (todayEntry) {
-      const entry = await tx.posProductCogs.update({
-        where: { id: todayEntry.id, tenantId: store.tenantId, storeId: store.id,
-          productId: product.id, updatedAt: todayEntry.updatedAt },
-        data: { cogs },
-      });
-      return { entry, hadHistory: true };
-    }
-    if (olderOpen) {
-      const closed = await tx.posProductCogs.updateMany({
-        where: { id: olderOpen.id, tenantId: store.tenantId, storeId: store.id,
-          productId: product.id, updatedAt: olderOpen.updatedAt, endDate: null },
-        data: { endDate: new Date(today.getTime() - 86400000) },
-      });
-      if (closed.count !== 1) throw new ConflictException('COGS history changed; refresh before retrying');
-    }
-    const entry = await tx.posProductCogs.create({ data: {
-      tenantId: store.tenantId, teamId: product.teamId, productId: product.id,
-      storeId: store.id, cogs, startDate: today, endDate: null,
-    } });
-    return { entry, hadHistory: history.length > 0 };
+  private writeCurrentProductCogs(tx: Prisma.TransactionClient, product: LockedCogsProduct, store: { id: string; tenantId: string }, cogs: number, today: Date) {
+    return writeCurrentProductCogs(tx, product, store, cogs, today);
   }
 
   private productCogsRefreshRange(entry: Pick<PosProductCogs, 'productId' | 'startDate' | 'endDate'>) {
@@ -5798,6 +5711,7 @@ export class IntegrationService {
       if (!product) throw new NotFoundException(`Product with ID ${productId} not found in this store`);
       const today = await this.productCogsToday(tx);
       const result = await this.writeCurrentProductCogs(tx, product, store, cogs, today);
+      await this.wmsCogsSync.syncAfterErpWrites(tx, store, [productId], (this.cls.get('userId') as string | undefined) ?? null);
       // Publish while the parent lock is held; the worker barrier waits for
       // commit. A queue failure rolls back the cost edit instead of losing it.
       await this.productCogsRefresh.enqueue({ tenantId: store.tenantId, storeId: store.id,
@@ -5825,6 +5739,7 @@ export class IntegrationService {
       const updated = await tx.posProductCogs.update({
         where: { id: cogsId, tenantId: store.tenantId, storeId: store.id, productId, updatedAt: entry.updatedAt }, data: { cogs },
       });
+      await this.wmsCogsSync.syncAfterErpWrites(tx, store, [productId], (this.cls.get('userId') as string | undefined) ?? null);
       // Preserve both effective ranges if this entry editor later gains date editing.
       const changes = [...new Map([entry, updated].map(row => {
         const range = this.productCogsRefreshRange(row);
@@ -5846,6 +5761,7 @@ export class IntegrationService {
       const entry = await tx.posProductCogs.findFirst({ where: { id: cogsId, tenantId: store.tenantId, storeId: store.id, productId } });
       if (!entry) throw new NotFoundException('COGS entry not found');
       await tx.posProductCogs.delete({ where: { id: cogsId, tenantId: store.tenantId, storeId: store.id, productId, updatedAt: entry.updatedAt } });
+      await this.wmsCogsSync.syncAfterErpWrites(tx, store, [productId], (this.cls.get('userId') as string | undefined) ?? null);
       await this.productCogsRefresh.enqueue({ tenantId: store.tenantId, storeId: store.id,
         changes: [this.productCogsRefreshRange(entry)] });
     }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10000, timeout: 30000 });
