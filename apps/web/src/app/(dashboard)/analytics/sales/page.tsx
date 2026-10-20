@@ -1,5 +1,6 @@
 'use client';
 
+import { buildSalesMappingSelection, parseSalesTeamSelection } from '../_utils/sales-selection';
 import { ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 import { AlertBanner } from '@/components/ui/feedback';
 import { Button } from '@/components/ui/button';
@@ -132,6 +133,8 @@ export default function SalesAnalyticsPage() {
   const [error, setError] = useState<string | null>(null);
   const { beginRequest, cancelRequest } = useLatestAnalyticsRequest();
   const [selectedMappings, setSelectedMappings] = useState<string[]>([]);
+  const [isAllMappingsMode, setIsAllMappingsMode] = useState(true);
+  const [selectedTeamIds, setSelectedTeamIds] = useState<string[]>([]);
   const [mappingOptions, setMappingOptions] = useState<string[]>([]);
   const [mappingDisplayMap, setMappingDisplayMap] = useState<Record<string, string>>({});
   const mappingOptionsRef = useRef<string[]>([]);
@@ -193,14 +196,8 @@ export default function SalesAnalyticsPage() {
     startDate === endDate
       ? formatDateRangeButtonDate(startDate)
       : `${formatDateRangeButtonDate(startDate)} - ${formatDateRangeButtonDate(endDate)}`;
-  const mappingSelectionKey =
-    mappingOptions.length === 0 ||
-    selectedMappings.length === 0 ||
-    (selectedMappings.length === mappingOptions.length &&
-      mappingOptions.every((mapping) => selectedMappings.includes(mapping)))
-      ? '__all__'
-      : [...selectedMappings].sort().join('|');
-  const analyticsQueryKey = `${dimension}:` + buildAnalyticsQueryKey(
+  const mappingSelectionKey = buildSalesMappingSelection(isAllMappingsMode, selectedMappings).key;
+  const analyticsQueryKey = `${dimension}:${selectedTeamIds.join(',') || '__all_teams__'}:` + buildAnalyticsQueryKey(
     startDate,
     endDate,
     mappingSelectionKey,
@@ -212,6 +209,18 @@ export default function SalesAnalyticsPage() {
     includeTax12,
     includeTax1,
   );
+  useEffect(() => {
+    const readTeams = () => {
+      try {
+        const next = parseSalesTeamSelection(window.localStorage.getItem('current_team_ids'), window.localStorage.getItem('current_team_id'));
+        setSelectedTeamIds(prev => areArraysEqual(prev, next) ? prev : next);
+      } catch { setSelectedTeamIds([]); }
+    };
+    readTeams();
+    window.addEventListener('teamScopeChanged', readTeams);
+    return () => window.removeEventListener('teamScopeChanged', readTeams);
+  }, []);
+
   const [resolvedQueryKey, setResolvedQueryKey] = useState<string | null>(null);
   const isResultPending = isLoading || resolvedQueryKey !== analyticsQueryKey;
 
@@ -269,22 +278,16 @@ export default function SalesAnalyticsPage() {
     if (!opts?.silent) setIsLoading(true);
     setError(null);
     try {
-      const currentOptions = mappingOptionsRef.current;
       const currentSelected = selectedMappingsRef.current;
-      const normalizedOptions = currentOptions.map((m) => m.toLowerCase());
-      const allPreviouslySelected =
-        normalizedOptions.length === 0
-          ? currentSelected.length === 0
-          : currentSelected.length === 0 ||
-            (currentSelected.length === normalizedOptions.length &&
-              normalizedOptions.every((m) => currentSelected.includes(m)));
-      const effectiveSel = allPreviouslySelected ? normalizedOptions : currentSelected;
-      const sendAll = allPreviouslySelected || effectiveSel.length === normalizedOptions.length;
+      const sendAll = isAllMappingsMode;
+      const mappingSelection = buildSalesMappingSelection(sendAll, currentSelected);
       const params = new URLSearchParams();
       params.set('start_date', startDate);
       params.set('end_date', endDate);
-      if (!sendAll && effectiveSel.length > 0) {
-        effectiveSel.forEach((m) => params.append('mapping', m));
+      if (mappingSelection.mappings.length > 0) {
+        mappingSelection.mappings.forEach((m) => params.append('mapping', m));
+      } else if (mappingSelection.emptySelection) {
+        params.set('mapping_selection', 'none');
       }
       params.set('exclude_cancel', String(excludeCanceled));
       params.set('exclude_restocking', String(excludeRestocking));
@@ -304,7 +307,7 @@ export default function SalesAnalyticsPage() {
       setMappingOptions((prev) => (areArraysEqual(prev, normalized) ? prev : normalized));
       const nextDisplayMap = res.data.filters.mappingsDisplayMap || {};
       setMappingDisplayMap((prev) => (areRecordsEqual(prev, nextDisplayMap) ? prev : nextDisplayMap));
-      if (allPreviouslySelected) {
+      if (sendAll) {
         setSelectedMappings((prev) => (areArraysEqual(prev, normalized) ? prev : normalized));
       } else {
         const bounded = currentSelected.filter((m) => normalized.includes(m));
@@ -332,6 +335,7 @@ export default function SalesAnalyticsPage() {
     excludeRepurchase,
     includeTax1,
     includeTax12,
+    isAllMappingsMode,
     startDate,
     syncDateRangeFromApi,
   ]);
@@ -385,6 +389,7 @@ export default function SalesAnalyticsPage() {
     }
     setMappingOptions([]);
     setSelectedMappings([]);
+    setIsAllMappingsMode(true);
     setTableSelection('products');
     setProductPage(1);
     setDeliveryPage(1);
@@ -419,7 +424,7 @@ export default function SalesAnalyticsPage() {
     label: toTitleCase(mappingDisplay(mapping)),
   }));
   const selectedMappingLabel =
-    selectedMappings.length === mappingOptions.length
+    isAllMappingsMode
       ? (dimension === 'store' ? 'All stores' : 'All mappings')
       : `${selectedMappings.length} selected`;
   const isChecked = (norm: string) => selectedMappings.includes(norm);
@@ -576,12 +581,6 @@ export default function SalesAnalyticsPage() {
     : null;
   const cmRtsExportLabel = `CM (RTS ${rtsForecastSafe}%)`;
   const exportableProducts: SalesProductsExportRow[] = sortedProducts
-    .filter((item) => {
-      const adSpend = item.row.ad_spend ?? 0;
-      if (adSpend !== 0) return true;
-      const revenue = item.row.revenue ?? 0;
-      return revenue !== 0;
-    })
     .map((item) => ({
       product: toTitleCase(item.derived.display),
       grossRevenue: item.row.revenue ?? 0,
@@ -857,8 +856,11 @@ export default function SalesAnalyticsPage() {
     const excludedCogsCanceled = excludeCanceled ? kpis.cogs_canceled ?? 0 : 0;
     const excludedCogsRestocking = excludeRestocking ? kpis.cogs_restocking ?? 0 : 0;
     const cogsRaw = kpis.cogs ?? 0;
-    const cogsIncluded =
-      cogsRaw - excludedCogsCanceled - excludedCogsRestocking;
+    const excludedCogsAbandoned = excludeAbandoned ? kpis.cogs_abandoned ?? 0 : 0;
+    const excludedCogsRts = excludeRts ? kpis.cogs_rts ?? 0 : 0;
+    const cogsIncluded = kpis.cogs_adjusted ??
+      cogsRaw - excludedCogsCanceled - excludedCogsRestocking - excludedCogsAbandoned - excludedCogsRts;
+    const rtsCogsCredit = kpis.cogs_rts_credit ?? (excludeRts ? 0 : kpis.cogs_rts ?? 0);
     const filtersLabel = [
       `${startDate} → ${endDate}`,
       `${selectedMappings.length || 0}/${mappingOptions.length || 0} mappings`,
@@ -930,13 +932,21 @@ export default function SalesAnalyticsPage() {
           <span>- COGS Restocking</span>
           <span>{pos(excludedCogsRestocking)}</span>
         </div>
+        <div className="flex justify-between text-slate-700 text-[12px]">
+          <span>- COGS Abandoned</span>
+          <span>{pos(excludedCogsAbandoned)}</span>
+        </div>
+        <div className="flex justify-between text-slate-700 text-[12px]">
+          <span>- COGS RTS</span>
+          <span>{pos(excludedCogsRts)}</span>
+        </div>
         <div className="flex justify-between text-slate-800 border-t border-slate-100 pt-1">
           <span>COGS used in CM</span>
           <span>{neg(cogsIncluded)}</span>
         </div>
         <div className="flex justify-between text-slate-700 text-[12px]">
           <span>+ RTS COGS</span>
-          <span>{pos(kpis.cogs_rts ?? 0)}</span>
+          <span>{pos(rtsCogsCredit)}</span>
         </div>
         <div className="flex justify-between text-slate-900 border-t border-slate-200 pt-1 font-semibold">
           <span>Contribution Margin</span>
@@ -1182,15 +1192,14 @@ export default function SalesAnalyticsPage() {
                 selectedLabel={selectedMappingLabel}
                 selectTitle={dimension === 'store' ? 'Select stores' : 'Select mappings'}
                 options={mappingPickerOptions}
-                allChecked={
-                  mappingOptions.length > 0 &&
-                  selectedMappings.length === mappingOptions.length
-                }
+                allChecked={isAllMappingsMode || (mappingOptions.length > 0 && selectedMappings.length === mappingOptions.length)}
                 isChecked={isChecked}
                 onToggleAll={(checked) => {
+                  setIsAllMappingsMode(checked);
                   setSelectedMappings(checked ? mappingOptions : []);
                 }}
                 onToggle={(value) => {
+                  setIsAllMappingsMode(false);
                   setSelectedMappings((prev) =>
                     prev.includes(value)
                       ? prev.filter((entry) => entry !== value)
@@ -1198,9 +1207,10 @@ export default function SalesAnalyticsPage() {
                   );
                 }}
                 onOnly={(value) => {
+                  setIsAllMappingsMode(false);
                   setSelectedMappings([value]);
                 }}
-                onClear={() => setSelectedMappings([])}
+                onClear={() => { setIsAllMappingsMode(false); setSelectedMappings([]); }}
               />
               <div className="relative" ref={filterMenuContentRef}>
                 <button
@@ -1386,7 +1396,7 @@ export default function SalesAnalyticsPage() {
             message={[
               'Store revenue and COGS use saved POS orders for each shop.',
               data.coverage.zeroCogsOrderCount > 0
-                ? `${data.coverage.zeroCogsOrderCount} nonvoid, nondeleted orders have saved COGS of zero across all active tenant shops in the current and previous periods, including orders excluded by the current filters. A saved zero alone does not prove a missing catalog cost.` : '',
+                ? `${data.coverage.zeroCogsOrderCount} nonvoid, nondeleted orders have saved COGS of zero across the active shops in the selected team scope in the current and previous periods, including orders excluded by the current filters. A saved zero alone does not prove a missing catalog cost.` : '',
               data.coverage.ambiguousShopCount > 0
                 ? `Across the current and previous periods, ${data.coverage.ambiguousOrderCount} orders have conflicting store ownership and remain under Unattributed.` : '',
               data.coverage.unattributedAdRows > 0 || data.coverage.previousUnattributedAdRows > 0
@@ -1400,6 +1410,9 @@ export default function SalesAnalyticsPage() {
           />
         )}
 
+        <p className="text-xs text-slate-500 dark:text-slate-300">
+          Status cards keep every lifecycle status visible for comparison. Exclude Repurchase still applies; the other exclusions adjust revenue, orders and COGS.
+        </p>
         <div className="flex flex-col gap-3 xl:flex-row">
           {(
             <>
@@ -1495,6 +1508,9 @@ export default function SalesAnalyticsPage() {
           )}
         </div>
 
+        {tableSelection === 'delivery' && (
+          <p className="text-xs text-slate-500 dark:text-slate-300">Lifecycle breakdown includes every status and follows the selected repurchase scope.</p>
+        )}
         {tableSelection === 'products' ? (
           <AnalyticsSalesProductsTable
             isLoading={isResultPending}
