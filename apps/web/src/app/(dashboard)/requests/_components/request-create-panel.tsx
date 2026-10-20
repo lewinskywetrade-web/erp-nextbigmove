@@ -29,7 +29,7 @@ interface RequestCreatePanelProps {
   cartLines: CartLine[];
   cartTotals: {
     totalItems: number;
-    totalAmount: number;
+    totalAmount: number | null;
   };
   isSubmitting: boolean;
   isProductPickerOpen: boolean;
@@ -112,8 +112,8 @@ export function RequestCreatePanel({
     ? stores.find((store) => store.id === effectiveStoreId)?.label ?? 'Selected store'
     : 'All stores';
   const isSelfBuy = createRequestType === 'SELF_BUY';
-  const hasMissingSelfBuyUnitAmount =
-    isSelfBuy && cartLines.some((line) => line.unitAmount === null || line.unitAmount <= 0);
+  const hasMissingUnitAmount = cartLines.some((line) => line.unitAmount === null
+    || !Number.isFinite(line.unitAmount) || (isSelfBuy ? line.unitAmount <= 0 : line.unitAmount < 0));
 
   return (
     <DashboardSection
@@ -160,7 +160,7 @@ export function RequestCreatePanel({
                 <tr>
                   <th className="px-2.5 py-1.5">Product</th>
                   <th className="px-2.5 py-1.5">Store</th>
-                  <th className="px-2.5 py-1.5">{isSelfBuy ? 'Actual unit COGS' : 'Inhouse COGS'}</th>
+                  <th className="px-2.5 py-1.5">{isSelfBuy ? 'Actual unit COGS' : 'Partner Cost'}</th>
                   <th className="px-2.5 py-1.5">Qty</th>
                   <th className="px-2.5 py-1.5 text-right">Subtotal</th>
                   <th className="px-2.5 py-1.5 text-right">Action</th>
@@ -169,7 +169,8 @@ export function RequestCreatePanel({
               <tbody className="divide-y divide-slate-100 bg-white dark:divide-border dark:bg-surface">
                 {cartLines.map((line) => {
                   const unitAmount = line.unitAmount;
-                  const subtotal = (unitAmount ?? 0) * line.quantity;
+                  const subtotal = unitAmount !== null && Number.isFinite(unitAmount) && unitAmount >= 0
+                    ? unitAmount * line.quantity : null;
                   return (
                     <tr key={line.id} className="hover:bg-slate-50 dark:hover:bg-surface/80">
                       <td className="px-2.5 py-2">
@@ -197,7 +198,8 @@ export function RequestCreatePanel({
                             className="h-8 w-28 rounded-md border border-slate-200 bg-white px-2 text-sm font-semibold text-slate-800 outline-none focus:border-slate-300 dark:border-border dark:bg-transparent dark:text-foreground"
                           />
                         ) : (
-                          formatCurrency(unitAmount ?? 0)
+                          unitAmount !== null && Number.isFinite(unitAmount) && unitAmount >= 0
+                            ? formatCurrency(unitAmount) : 'Partner cost unavailable'
                         )}
                       </td>
                       <td className="px-2.5 py-2">
@@ -242,7 +244,7 @@ export function RequestCreatePanel({
                         />
                       </td>
                       <td className="px-2.5 py-2 text-right font-semibold text-slate-800 dark:text-foreground">
-                        {formatCurrency(subtotal)}
+                        {subtotal === null ? 'Unavailable' : formatCurrency(subtotal)}
                       </td>
                       <td className="px-2.5 py-2 text-right">
                         <button
@@ -258,9 +260,10 @@ export function RequestCreatePanel({
                 })}
               </tbody>
             </table>
-            {hasMissingSelfBuyUnitAmount ? (
+            {hasMissingUnitAmount ? (
               <div className="border-t border-amber-100 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800 dark:border-amber-400/20 dark:bg-amber-500/10 dark:text-amber-200">
-                Self-buy requires actual unit COGS for every line before submit.
+                {isSelfBuy ? 'Self-buy requires actual unit COGS for every line before submit.'
+                  : 'Partner cost unavailable. A valid partner price is required for every line before submit.'}
               </div>
             ) : null}
           </div>
@@ -332,14 +335,13 @@ export function RequestCreatePanel({
                           <p className="text-sm font-semibold text-slate-800 dark:text-foreground">
                             {isSelfBuy
                               ? 'Enter after adding'
-                              : formatCurrency(product.inhouseUnitCost ?? 0)}
+                              : typeof product.partnerUnitCost === 'number' && Number.isFinite(product.partnerUnitCost) && product.partnerUnitCost >= 0
+                                ? formatCurrency(product.partnerUnitCost) : 'Partner cost unavailable'}
                           </p>
                           <p className="text-[11px] text-slate-500 dark:text-slate-300">
                             {isSelfBuy
                               ? 'Actual unit COGS required'
-                              : product.inhouseUnitCost === null
-                                ? 'Inhouse COGS not set'
-                                : 'Inhouse COGS'}
+                              : 'Partner Cost'}
                           </p>
                         </div>
                       </button>
@@ -395,7 +397,7 @@ export function RequestCreatePanel({
             />
             <SummaryCard
               label="Total amount"
-              value={formatCurrency(cartTotals.totalAmount)}
+              value={cartTotals.totalAmount === null ? 'Unavailable' : formatCurrency(cartTotals.totalAmount)}
               valueClassName="text-slate-900 dark:text-foreground"
             />
           </div>
@@ -406,7 +408,7 @@ export function RequestCreatePanel({
             size="lg"
             onClick={() => void onSubmit()}
             loading={isSubmitting}
-            disabled={isSubmitting || cartLines.length === 0 || hasMissingSelfBuyUnitAmount}
+            disabled={isSubmitting || cartLines.length === 0 || hasMissingUnitAmount}
           >
             Submit request
           </Button>

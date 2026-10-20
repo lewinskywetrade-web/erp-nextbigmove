@@ -24,6 +24,7 @@ import { MediaAssetsService, type UploadedImageFile } from '../../common/service
 import { NotificationStateService } from '../../common/services/notification-state.service';
 import { WorkflowExecutionGateway } from '../workflows/gateways/workflow-execution.gateway';
 import { WmsCogsSyncService } from '../product-cogs/wms-cogs-sync.service';
+import { currentPartnerPrice } from './partner-price';
 import {
   CreateWmsPurchasingBatchDto,
   type CreateWmsPurchasingBatchLineInput,
@@ -1601,6 +1602,7 @@ export class WmsPurchasingService {
 
     const where: Prisma.WmsProductProfileWhereInput = {
       tenantId: scope.activeTenantId,
+      posProduct: { store: { tenantId: scope.activeTenantId } },
       status: {
         in: [WmsProductProfileStatus.DEFAULT, WmsProductProfileStatus.READY],
       },
@@ -1638,6 +1640,7 @@ export class WmsPurchasingService {
             store: {
               select: {
                 id: true,
+                tenantId: true,
                 name: true,
                 shopName: true,
               },
@@ -1651,10 +1654,16 @@ export class WmsPurchasingService {
     const profiles = profileCandidates.filter(
       (profile) =>
         this.isStockableVariation(profile.posProduct.productId, profile.posProduct.variationId)
-        && this.isStockableVariation(profile.productId, profile.variationId),
+        && this.isStockableVariation(profile.productId, profile.variationId)
+        && profile.storeId === profile.posProduct.store.id
+        && profile.productId === profile.posProduct.productId
+        && profile.variationId === profile.posProduct.variationId,
     );
     const total = profiles.length;
     const paginatedProfiles = profiles.slice((page - 1) * pageSize, page * pageSize);
+    const partnerPrices = await this.currentPartnerPrices(scope.activeTenantId, paginatedProfiles.map(profile => ({
+      id: profile.posProduct.id, storeId: profile.storeId,
+    })));
 
     return {
       tenantReady: true,
@@ -1701,6 +1710,7 @@ export class WmsPurchasingService {
           productCustomId: profile.posProduct.customId,
           name: profile.posProduct.name,
           retailPrice: this.toNumber(profile.posProduct.retailPrice),
+          partnerUnitCost: partnerPrices.get(profile.posProduct.id) ?? null,
           inhouseUnitCost: this.toNumber(profile.inhouseUnitCost),
           supplierUnitCost: this.toNumber(profile.supplierUnitCost),
           store: {
@@ -1869,7 +1879,7 @@ export class WmsPurchasingService {
     return this.mediaAssetsService.uploadPaymentProofImage(file, scope.activeTenantId);
   }
 
-  async createBatch(body: CreateWmsPurchasingBatchDto, requestedTenantId?: string) {
+  async createBatch(body: CreateWmsPurchasingBatchDto, requestedTenantId?: string, useCurrentPartnerPrices = false) {
     const scope = await this.resolveTenantScope(requestedTenantId);
     if (!scope.activeTenantId) {
       throw new ForbiddenException('Tenant context is required');
@@ -1911,6 +1921,7 @@ export class WmsPurchasingService {
       storeId: body.storeId,
       requestType: body.requestType,
       lines: body.lines,
+      useCurrentPartnerPrices,
     });
 
     if (this.requiresOperationalReadinessValidation(body.requestType, status)) {
@@ -3918,19 +3929,17 @@ export class WmsPurchasingService {
       partnerUnitCost: Prisma.Decimal | number | null;
     }>,
   ) {
-    const amount = lines.reduce((sum, line) => {
+    if (!lines.length) return null;
+    let amount = 0;
+    for (const line of lines) {
       const quantity = line.approvedQuantity ?? line.requestedQuantity;
-      const unitCost =
-        typeof line.partnerUnitCost === 'number'
-          ? line.partnerUnitCost
-          : line.partnerUnitCost
-            ? Number(line.partnerUnitCost)
-            : 0;
-
-      return sum + quantity * unitCost;
-    }, 0);
-
-    return amount > 0 ? amount : null;
+      if (!Number.isInteger(quantity) || quantity < 0 || line.partnerUnitCost === null || line.partnerUnitCost === undefined) return null;
+      const unitCost = new Prisma.Decimal(line.partnerUnitCost);
+      if (!unitCost.isFinite() || unitCost.lt(0) || unitCost.decimalPlaces() > 2) return null;
+      amount += quantity * unitCost.toNumber();
+    }
+    // Known free stock is a zero invoice; any unknown line keeps it unavailable.
+    return Number.isFinite(amount) ? amount : null;
   }
 
   private aggregateLineTotals(
@@ -3964,6 +3973,7 @@ export class WmsPurchasingService {
     storeId: string;
     requestType: WmsPurchasingRequestType;
     lines: CreateWmsPurchasingBatchLineInput[];
+    useCurrentPartnerPrices?: boolean;
   }) {
     const usedLineNos = new Set<number>();
     const normalized: Array<{
@@ -4065,7 +4075,19 @@ export class WmsPurchasingService {
         await this.validateStore(input.tenantId, lineStoreId);
       }
 
-      const partnerUnitCost = this.numberOrNull(line.partnerUnitCost);
+      let partnerUnitCost = this.numberOrNull(line.partnerUnitCost);
+      if (input.useCurrentPartnerPrices && input.requestType === WmsPurchasingRequestType.PROCUREMENT) {
+        const product = resolutionTargets.posProduct ?? resolutionTargets.profile?.posProduct;
+        const productId = resolutionTargets.posProduct?.id ?? resolutionTargets.profile?.posProductId;
+        if (!productId || !product || (line.productId && line.productId !== product.productId)
+          || canonicalVariationId !== product.variationId) {
+          throw new BadRequestException(`Line ${lineNo}: select a managed product with an exact store/variation mapping`);
+        }
+        partnerUnitCost = (await this.currentPartnerPrices(input.tenantId, [{ id: productId, storeId: lineStoreId }])).get(productId) ?? null;
+        if (partnerUnitCost === null) {
+          throw new BadRequestException(`Line ${lineNo}: current ERP partner cost is unavailable; configure it before requesting procurement`);
+        }
+      }
       const supplierUnitCost =
         input.requestType === WmsPurchasingRequestType.SELF_BUY
           ? null
@@ -4109,6 +4131,21 @@ export class WmsPurchasingService {
     }
 
     return normalized;
+  }
+
+  private async currentPartnerPrices(tenantId: string, products: Array<{ id: string; storeId: string }>) {
+    const prices = new Map<string, number | null>();
+    if (!products.length) return prices;
+    const [clock] = await this.prisma.$queryRawUnsafe<Array<{ businessDate: string }>>(
+      `SELECT to_char((statement_timestamp() AT TIME ZONE 'Asia/Manila')::date, 'YYYY-MM-DD') AS "businessDate"`,
+    );
+    const histories = await this.prisma.posProductCogs.findMany({ where: { productId: { in: products.map(product => product.id) } } });
+    for (const product of products) {
+      prices.set(product.id, currentPartnerPrice(histories.filter(row => row.productId === product.id), {
+        productId: product.id, storeId: product.storeId, tenantId,
+      }, clock?.businessDate ?? ''));
+    }
+    return prices;
   }
 
   private hasCommercialRevisionChanges(
@@ -4329,6 +4366,7 @@ export class WmsPurchasingService {
       | {
           id: string;
           posProductId: string;
+          productId: string;
           variationId: string;
           posProduct: {
             productId: string;
@@ -4343,10 +4381,12 @@ export class WmsPurchasingService {
           id: resolvedProfileId,
           tenantId,
           storeId,
+          posProduct: { storeId, store: { tenantId } },
         },
         select: {
           id: true,
           posProductId: true,
+          productId: true,
           variationId: true,
           posProduct: {
             select: {
@@ -4365,6 +4405,10 @@ export class WmsPurchasingService {
         throw new BadRequestException(
           'Resolved product profile does not match the selected POS product',
         );
+      }
+
+      if (profile.productId !== profile.posProduct.productId || profile.variationId !== profile.posProduct.variationId) {
+        throw new BadRequestException('Resolved product profile identity does not match its POS product');
       }
 
       if (!this.isStockableVariation(profile.posProduct.productId, profile.posProduct.variationId)) {

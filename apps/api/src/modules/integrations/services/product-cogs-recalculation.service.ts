@@ -21,7 +21,7 @@ export function isCogsCalendarDate(value: unknown): value is string {
     && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
 }
 function validCost(value: Decimal) {
-  return value.isFinite() && value.gt(0) && value.lte(MAX_AMOUNT) && value.decimalPlaces() <= 2;
+  return value.isFinite() && value.gte(0) && value.lte(MAX_AMOUNT) && value.decimalPlaces() <= 2;
 }
 
 /** Strict replay never guesses a sibling or interprets free-text order notes. */

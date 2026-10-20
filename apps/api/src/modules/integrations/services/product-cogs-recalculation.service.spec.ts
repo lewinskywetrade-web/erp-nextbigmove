@@ -40,6 +40,19 @@ describe('strict saved-order ERP catalog calculation', () => {
     expect(calculated.productIds).toEqual([productA.id]);
   });
 
+  it('uses the zero rate on its effective date rather than falling back to the paid default', () => {
+    const histories = [cost({ cogs: new Decimal(10) }), cost({ startDate: new Date('2026-10-19'), cogs: new Decimal(0) })];
+    expect(calculateSavedErpCogs(order({ dateLocal: '2026-10-18' }), [productA], histories, scope)!.amount.toFixed(2)).toBe('20.00');
+    expect(calculateSavedErpCogs(order(), [productA], histories, scope)!.amount.toFixed(2)).toBe('0.00');
+    expect(calculateSavedErpCogs(order(), [productA], [], scope)).toBeNull();
+  });
+
+  it('includes a verified zero-cost line in the full order quantity and sum', () => {
+    const saved = order({ totalQuantity: 3, snapshotItems: [itemA, { ...itemA, variation_id: 'variant-b', quantity: 1 }] });
+    const histories = [cost({ cogs: new Decimal(0) }), cost({ productId: productB.id, cogs: new Decimal('12.34') })];
+    expect(calculateSavedErpCogs(saved, [productA, productB], histories, scope)!.amount.toFixed(2)).toBe('12.34');
+  });
+
   it('does not use future/expired costs or note_product text to fill a catalog gap', () => {
     const saved = order({ snapshotItems: [{ ...itemA, note_product: 'SKU-A-999' }] });
     expect(calculateSavedErpCogs(saved, [productA], [cost({ startDate: new Date('2026-10-20') }),
@@ -55,7 +68,7 @@ describe('strict saved-order ERP catalog calculation', () => {
     ['zero quantity', order({ totalQuantity: 0, snapshotItems: [{ ...itemA, quantity: 0 }] }), [cost()]],
     ['wrong tenant cost', order(), [cost({ tenantId: 'another-tenant' })]],
     ['wrong store cost', order(), [cost({ storeId: 'another-store' })]],
-    ['nonpositive cost', order(), [cost({ cogs: new Decimal(0) })]],
+    ['negative cost', order(), [cost({ cogs: new Decimal(-1) })]],
     ['overlapping dated costs', order(), [cost({ startDate: new Date('2026-10-01') }), cost({ startDate: new Date('2026-10-19') })]],
     ['duplicate applicable defaults', order(), [cost(), cost({ id: 'second' })]],
     ['invalid range', order(), [cost({ startDate: new Date('2026-10-19'), endDate: new Date('2026-10-18') })]],
@@ -138,6 +151,14 @@ describe('bounded durable ERP order recalculation pages', () => {
     const { service, writes } = harness([order({ cogs: '20.00' })]);
     expect(await service.recalculateBatch(scope)).toMatchObject({ unchanged: 1, updated: 0, affectedDates: ['2026-10-19'] });
     expect(writes).toHaveLength(0);
+  });
+
+  it('can apply a verified zero rate to an order without treating missing history as zero', async () => {
+    const { service, setHistory, writes } = harness([order({ cogs: '20.00' })]);
+    setHistory([cost({ cogs: new Decimal(0) })]);
+    expect(await service.recalculateBatch(scope)).toMatchObject({ updated: 1, skipped: 0, affectedDates: ['2026-10-19'] });
+    expect(writes[0].where.cogs.toFixed(2)).toBe('20.00');
+    expect(writes[0].data.cogs.toFixed(2)).toBe('0.00');
   });
 
   it('preserves amounts when any line lacks an applicable ERP cost', async () => {

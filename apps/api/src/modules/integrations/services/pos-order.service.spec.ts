@@ -285,6 +285,19 @@ function createUpsertHarness(previous: any = null) {
 const rawOrder = { id: 'order-1', shop_id: 'shop-1', inserted_at: '2026-10-18T02:00:00Z', status: 4 };
 
 describe('POS webhook COGS persistence', () => {
+  it.each([false, true])('keeps a verified catalog zero despite an old note price (existing=%s)', async existing => {
+    const { service, completeSourceEdit, readCogs, prisma } = createUpsertHarness(
+      existing ? { cogs: new Decimal('123.45'), orderSnapshot: null } : null);
+    completeSourceEdit(0);
+    const result = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{
+      ...rawOrder, items: [{ product_id: 'parent', variation_id: 'variant-a', quantity: 2, note_product: 'SKU-999' }],
+    }], null);
+    expect(result.upserted).toBe(1);
+    expect(readCogs().toFixed(2)).toBe('0.00');
+    if (!existing) expect(prisma.posOrder.upsert.mock.calls[0][0].create.cogs.toFixed(2)).toBe('0.00');
+    expect(prisma.posOrder.updateMany.mock.calls[0][0].data.cogs.toFixed(2)).toBe('0.00');
+  });
+
   it.each([
     { productId: 'parent', variationId: 'variant-a' },
     { productId: 'parent' },

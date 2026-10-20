@@ -629,30 +629,6 @@ export class PosOrderService {
     return { cogs: totalCogs, totalQuantity };
   }
 
-  private legacyOrderCogsFallback(cogs: number, items: any[]): number {
-    // Fallback COGS: if DB cogs 0, sum per-item note_product numeric part * qty
-    let cogsFallback = 0;
-    if (cogs === 0) {
-      for (const item of items) {
-        const np = item?.note_product;
-        if (!np || typeof np !== 'string') continue;
-        const parts = np.split('-');
-        const numRaw = parts[1] ?? '';
-        const num = parseFloat((numRaw || '').toString().replace(/[^0-9.\\-]/g, ''));
-        if (isNaN(num)) continue;
-        const unit = num;
-        const qty = parseInt(item.quantity || '0', 10);
-        const qtySafe = Math.max(qty || 0, 1);
-        cogsFallback += unit * qtySafe;
-      }
-      if (cogsFallback > 0) {
-        cogs = cogsFallback;
-      }
-    }
-
-    return cogs;
-  }
-
   /** Re-read the ERP source and persist under the same source locks. */
   private async withLockedErpCogsSource<T>(tenantId: string, storeId: string, items: any[], order: PosOrderData,
     persist: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
@@ -676,7 +652,9 @@ export class PosOrderService {
         if (locked.length !== sortedIds.length) throw new ConflictException('ERP COGS catalog scope changed');
       }
       const fresh = await this.calculateCogs(tenantId, storeId, items, order.dateLocal, tx);
-      order.cogs = this.legacyOrderCogsFallback(fresh.cogs, items);
+      // Per-item fallback runs only when catalog evidence is missing.
+      // A verified catalog total of zero is intentional partner-supplied stock.
+      order.cogs = fresh.cogs;
       order.totalQuantity = fresh.totalQuantity;
       // Existing deletion/ownership transactions can lock an order before
       // changing stores. Retry rather than wait on them under catalog locks.
@@ -1020,8 +998,6 @@ export class PosOrderService {
     if (mapping) {
       mapping = mapping.trim().toLowerCase();
     }
-
-    cogs = this.legacyOrderCogsFallback(cogs, items);
 
     const partnerExtend = (rawOrder.partner && typeof rawOrder.partner === 'object')
       ? rawOrder.partner.extend_code || rawOrder.partner.extendCode || null

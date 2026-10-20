@@ -110,7 +110,6 @@ export type WmsPurchasingBatchDetail = WmsPurchasingBatchRow & {
     approvedQuantity: number | null;
     receivedQuantity: number;
     partnerUnitCost: number | null;
-    supplierUnitCost: number | null;
     needsProfiling: boolean;
     resolvedPosProduct: {
       id: string;
@@ -216,8 +215,7 @@ export type WmsPurchasingProductOption = {
   productCustomId: string | null;
   name: string;
   retailPrice: number | null;
-  inhouseUnitCost: number | null;
-  supplierUnitCost: number | null;
+  partnerUnitCost: number | null;
   store: {
     id: string;
     name: string;
@@ -261,7 +259,6 @@ export type CreateWmsPurchasingBatchLineInput = {
   requestedQuantity: number;
   approvedQuantity?: number;
   partnerUnitCost?: number;
-  supplierUnitCost?: number;
   needsProfiling?: boolean;
   resolvedPosProductId?: string;
   resolvedProfileId?: string;
