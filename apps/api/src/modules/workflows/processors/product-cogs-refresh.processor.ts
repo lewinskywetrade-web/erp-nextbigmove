@@ -13,6 +13,7 @@ import {
   ProductCogsRefreshJobData,
 } from '../../integrations/product-cogs-refresh.constants';
 import { ProductCogsRecalculationService } from '../../integrations/services/product-cogs-recalculation.service';
+import { isProductCogsRefreshDate, productCogsManilaDate } from '../../integrations/product-cogs-refresh-policy';
 
 @Processor(PANCAKE_WEBHOOK_RECONCILE_QUEUE)
 export class ProductCogsRefreshProcessor {
@@ -36,7 +37,11 @@ export class ProductCogsRefreshProcessor {
       cursor: data.cursor,
       pageSize: PRODUCT_COGS_REFRESH_PAGE_SIZE,
     });
-    const affectedDates = normalizeCogsRefreshDates([...data.affectedDates, ...result.affectedDates]);
+    // Also filter durable dates from jobs published before this policy, so an
+    // older continuation cannot rebuild archived 2025 report rows.
+    const today = productCogsManilaDate();
+    const affectedDates = normalizeCogsRefreshDates([...data.affectedDates, ...result.affectedDates])
+      .filter(date => isProductCogsRefreshDate(date, today));
     if (result.nextCursor) {
       if (result.nextCursor === data.cursor) throw new Error('COGS_REFRESH_CURSOR_DID_NOT_ADVANCE');
       const continuation = normalizeCogsRefreshJob({ ...data, cursor: result.nextCursor, affectedDates });

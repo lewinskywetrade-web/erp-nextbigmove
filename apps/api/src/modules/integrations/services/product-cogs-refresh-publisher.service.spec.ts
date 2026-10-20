@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, jest } from '@jest/globals';
+import { afterEach, beforeEach, describe, expect, it, jest } from '@jest/globals';
 import { ProductCogsRefreshPublisherService } from './product-cogs-refresh-publisher.service';
 import { PRODUCT_COGS_REFRESH_JOB } from '../product-cogs-refresh.constants';
 
@@ -13,9 +13,11 @@ describe('ProductCogsRefreshPublisherService', () => {
   let publisher: ProductCogsRefreshPublisherService;
 
   beforeEach(() => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-10-19T18:00:00Z'));
     queue = { add: jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({}) };
     publisher = new ProductCogsRefreshPublisherService(queue as any);
   });
+  afterEach(() => { jest.useRealTimers(); });
 
   it('gives newer edits unique durable identities even for the same product and date', async () => {
     await publisher.enqueue(scope);
@@ -23,7 +25,9 @@ describe('ProductCogsRefreshPublisherService', () => {
     const first = queue.add.mock.calls[0];
     const second = queue.add.mock.calls[1];
     expect(first[0]).toBe(PRODUCT_COGS_REFRESH_JOB);
-    expect(first[1]).toEqual(expect.objectContaining({ ...scope, affectedDates: [] }));
+    expect(first[1]).toEqual(expect.objectContaining({ tenantId: scope.tenantId, storeId: scope.storeId,
+      changes: [{ productId: scope.changes[0].productId, fromDate: '2026-01-01', toDate: '2026-10-20' }],
+      policy: 'ERP_COGS_2026_HISTORY_PROPAGATION_V1', affectedDates: [] }));
     expect(first[1].refreshId).not.toBe(second[1].refreshId);
     expect(first[2].jobId).not.toBe(second[2].jobId);
     expect(first[2]).toEqual(expect.objectContaining({ attempts: 8, removeOnFail: false,
@@ -35,10 +39,24 @@ describe('ProductCogsRefreshPublisherService', () => {
     await expect(publisher.enqueue(scope)).rejects.toThrow('Redis unavailable');
   });
 
-  it('preserves the before/after historical interval union and removes exact duplicate ranges', async () => {
+  it('refreshes each changed product across 2026 history without restricting replay to the newest cost date', async () => {
     const before = { productId: scope.changes[0].productId, fromDate: null, toDate: '2026-10-18' };
     await publisher.enqueue({ ...scope, changes: [before, scope.changes[0], before] });
-    expect(queue.add.mock.calls[0][1].changes).toEqual([before, scope.changes[0]]);
+    expect(queue.add.mock.calls[0][1].changes).toEqual([
+      { productId: scope.changes[0].productId, fromDate: '2026-01-01', toDate: '2026-10-20' },
+    ]);
+  });
+
+  it('keeps distinct product ownership and never publishes an unbounded/pre-2026 interval', async () => {
+    const second = '33333333-3333-4333-8333-333333333334';
+    await publisher.enqueue({ ...scope, changes: [
+      { productId: scope.changes[0].productId, fromDate: null, toDate: null },
+      { productId: second, fromDate: '2025-10-01', toDate: '2025-12-31' },
+    ] });
+    expect(queue.add.mock.calls[0][1].changes).toEqual([
+      { productId: scope.changes[0].productId, fromDate: '2026-01-01', toDate: '2026-10-20' },
+      { productId: second, fromDate: '2026-01-01', toDate: '2026-10-20' },
+    ]);
   });
 
   it.each([

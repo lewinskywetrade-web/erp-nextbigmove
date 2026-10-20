@@ -1,4 +1,4 @@
-import { describe, expect, it, jest } from '@jest/globals';
+import { afterEach, beforeEach, describe, expect, it, jest } from '@jest/globals';
 import { ConflictException } from '@nestjs/common';
 import { Decimal } from '@prisma/client/runtime/library';
 import { calculateSavedErpCogs, COGS_REFRESH_ORDER_LOCK_SQL, COGS_REFRESH_ORDERS_SQL,
@@ -15,6 +15,8 @@ const order = (overrides: any = {}) => ({ id: '40000000-0000-0000-0000-000000000
   snapshotItems: [itemA], dataItems: null, ...overrides });
 const cost = (overrides: any = {}) => ({ id: 'cost-1', productId: productA.id, tenantId, storeId,
   cogs: new Decimal('10.00'), startDate: null, endDate: null, ...overrides });
+beforeEach(() => { jest.useFakeTimers().setSystemTime(new Date('2026-10-19T18:00:00Z')); });
+afterEach(() => { jest.useRealTimers(); });
 
 describe('strict saved-order ERP catalog calculation', () => {
   it('resolves one exact variant and rejects conflicting parents or display codes', () => {
@@ -25,6 +27,16 @@ describe('strict saved-order ERP catalog calculation', () => {
     expect(resolveSavedCogsProduct({ ...itemA, variation_id: 'unknown' }, [productA])).toBeNull();
     expect(resolveSavedCogsProduct({ ...itemA, variationId: 'variant-b' }, [productA, productB])).toBeNull();
     expect(resolveSavedCogsProduct({ ...itemA, productId: 'different-parent' }, [productA])).toBeNull();
+  });
+
+  it('accepts exact variants with unknown provider barcode aliases but rejects every recognized conflicting alias', () => {
+    expect(resolveSavedCogsProduct({ ...itemA, product_display_id: 'provider-code',
+      variation_info: { barcode: 'unregistered-barcode' } }, [productA, productB])).toBe(productA);
+    expect(resolveSavedCogsProduct({ ...itemA, product_display_id: 'SKU-A',
+      variation_info: { barcode: 'SKU-B' } }, [productA, productB])).toBeNull();
+    expect(resolveSavedCogsProduct({ ...itemA, product_display_id: 'provider-code' },
+      [productA, { ...productB, customId: 'provider-code' }])).toBeNull();
+    expect(resolveSavedCogsProduct({ product_display_id: 'provider-code' }, [productA, productB])).toBeNull();
   });
 
   it('can replay a complete itemData snapshot only through a unique variant display code', () => {
@@ -212,7 +224,45 @@ describe('bounded durable ERP order recalculation pages', () => {
   it('limits current-baseline replay to its calendar window and exact tenant/shop', async () => {
     const { service, writes, prisma } = harness([order({ dateLocal: '2026-10-18' }), order({ id: 'other-order', tenantId: 'other-tenant' })]);
     expect(await service.recalculateBatch(scope)).toMatchObject({ skipped: 2, updated: 0, affectedDates: [] });
-    expect(prisma.$queryRawUnsafe.mock.calls[0].slice(3)).toEqual([null, '2026-10-19', null, 200]);
+    expect(prisma.$queryRawUnsafe.mock.calls[0].slice(3)).toEqual([null, '2026-10-19', '2026-10-20', 200]);
+    expect(writes).toHaveLength(0);
+  });
+
+  it('replays older months at their dated rates and preserves a missing earlier rate, not the latest value', async () => {
+    const rows = ['2026-01-05', '2026-03-05', '2026-09-05', '2026-10-05'].map((dateLocal, index) =>
+      order({ id: `40000000-0000-0000-0000-00000000000${index + 1}`, dateLocal,
+        snapshotItems: [{ ...itemA, product_display_id: 'unknown-provider-code' }] }));
+    const { service, setHistory, writes } = harness(rows);
+    setHistory([
+      cost({ startDate: new Date('2026-02-01'), endDate: new Date('2026-08-31'), cogs: new Decimal(5) }),
+      cost({ startDate: new Date('2026-09-01'), endDate: new Date('2026-09-30'), cogs: new Decimal(0) }),
+      cost({ startDate: new Date('2026-10-01'), cogs: new Decimal(12) }),
+    ]);
+    const result = await service.recalculateBatch({ ...scope,
+      changes: [{ productId: productA.id, fromDate: '2026-01-01', toDate: '2026-10-20' }] });
+    expect(result).toMatchObject({ examined: 4, updated: 2, unchanged: 1, skipped: 1 });
+    expect(writes.map(write => [write.where.dateLocal, write.data.cogs.toFixed(2)]))
+      .toEqual([['2026-03-05', '10.00'], ['2026-10-05', '24.00']]);
+  });
+
+  it('clamps legacy unbounded jobs to 2026 and the current Manila date in SQL and before every write', async () => {
+    const { service, writes, prisma } = harness([
+      order({ dateLocal: '2025-12-31' }),
+      order({ id: '40000000-0000-0000-0000-000000000002', dateLocal: '2026-10-21' }),
+    ]);
+    const result = await service.recalculateBatch({ ...scope,
+      changes: [{ productId: productA.id, fromDate: null, toDate: null }] });
+    expect(prisma.$queryRawUnsafe.mock.calls[0].slice(3)).toEqual([null, '2026-01-01', '2026-10-20', 200]);
+    expect(result).toMatchObject({ skipped: 2, updated: 0, affectedDates: [] });
+    expect(writes).toHaveLength(0);
+  });
+
+  it('does not scan orders or rebuild days for an entirely archived 2025 interval', async () => {
+    const { service, writes, prisma } = harness();
+    expect(await service.recalculateBatch({ ...scope,
+      changes: [{ productId: productA.id, fromDate: '2025-01-01', toDate: '2025-12-31' }] }))
+      .toMatchObject({ examined: 0, updated: 0, affectedDates: [], nextCursor: null });
+    expect(prisma.$queryRawUnsafe).not.toHaveBeenCalled();
     expect(writes).toHaveLength(0);
   });
 });

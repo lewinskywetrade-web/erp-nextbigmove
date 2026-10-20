@@ -2,6 +2,7 @@ import { BadRequestException, ConflictException, Injectable } from '@nestjs/comm
 import { Prisma } from '@prisma/client';
 import { Decimal } from '@prisma/client/runtime/library';
 import { PrismaService } from '../../../common/prisma/prisma.service';
+import { PRODUCT_COGS_REFRESH_FROM, isProductCogsRefreshDate, productCogsManilaDate } from '../product-cogs-refresh-policy';
 
 export type ProductCogsRefreshChange = { productId: string; fromDate: string | null; toDate: string | null };
 export type ProductCogsRefreshScope = { tenantId: string; storeId: string; changes: ProductCogsRefreshChange[] };
@@ -39,7 +40,11 @@ export function resolveSavedCogsProduct(item: any, products: CatalogProduct[]): 
   if (matches.length !== 1) return null;
   const product = matches[0];
   if (parents.length && !parents.some(parent => parent === product.productId || parent === product.customId)) return null;
-  if (displays.length && product.customId && !displays.includes(product.customId)) return null;
+  // Provider display/barcode aliases often differ from the ERP custom SKU.
+  // An unknown auxiliary value cannot veto an exact variant. A recognized
+  // alias pointing at another product remains a genuine identity conflict,
+  // including when the item also contains this product's own alias.
+  if (displays.some(display => products.some(other => other.id !== product.id && other.customId === display))) return null;
   return product;
 }
 
@@ -144,9 +149,13 @@ export class ProductCogsRecalculationService {
       select: { id: true, productId: true, variationId: true, customId: true } });
     const starts = scope.changes.map(change => change.fromDate);
     const ends = scope.changes.map(change => change.toDate);
-    const from = starts.includes(null) ? null : (starts as string[]).sort()[0];
+    const earliest = starts.includes(null) ? PRODUCT_COGS_REFRESH_FROM : (starts as string[]).sort()[0];
+    const from = earliest < PRODUCT_COGS_REFRESH_FROM ? PRODUCT_COGS_REFRESH_FROM : earliest;
     const sortedEnds = (ends.filter((date): date is string => date !== null)).sort();
-    const until = ends.includes(null) ? null : sortedEnds[sortedEnds.length - 1];
+    const today = productCogsManilaDate();
+    const latest = ends.includes(null) ? today : sortedEnds[sortedEnds.length - 1];
+    const until = latest > today ? today : latest;
+    if (until < from) return { nextCursor: null, affectedDates: [], examined: 0, updated: 0, unchanged: 0, skipped: 0 };
     const orders = await this.prisma.$queryRawUnsafe<SavedOrder[]>(COGS_REFRESH_ORDERS_SQL,
       scope.tenantId, store.shopId, scope.cursor ?? null, from, until, pageSize);
     const dates = new Set<string>();
@@ -155,7 +164,7 @@ export class ProductCogsRecalculationService {
     for (const order of orders) {
       // Include examined valid dates even on a retry where an earlier attempt
       // already wrote the amount. Aggregate refresh must not be lost.
-      const ranges = scope.changes.filter(change => isCogsCalendarDate(order.dateLocal)
+      const ranges = scope.changes.filter(change => isCogsCalendarDate(order.dateLocal) && isProductCogsRefreshDate(order.dateLocal, today)
         && (!change.fromDate || order.dateLocal >= change.fromDate) && (!change.toDate || order.dateLocal <= change.toDate));
       if (!ranges.length || order.tenantId !== scope.tenantId || order.shopId !== store.shopId) { result.skipped++; continue; }
       dates.add(order.dateLocal);
