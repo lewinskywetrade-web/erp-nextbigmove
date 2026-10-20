@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, Query, Headers, BadRequestException, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, Headers, BadRequestException, UseGuards, Request } from '@nestjs/common';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { TenantGuard } from '../../common/guards/tenant.guard';
 import { PermissionsGuard } from '../../common/guards/permissions.guard';
@@ -33,6 +33,7 @@ export class SalesAnalyticsController {
     @Query('include_tax_1') includeTax1?: string,
     @Query('mapping_selection') mappingSelection?: string,
     @Headers('x-team-id') teamHeader?: string,
+    @Request() request?: { user?: { role?: string } },
   ) {
     const mappings = Array.isArray(mapping)
       ? mapping
@@ -57,7 +58,7 @@ export class SalesAnalyticsController {
       excludeRepurchase: parseBool(excludeRepurchase, true),
       includeTax12: parseBool(includeTax12, false),
       includeTax1: parseBool(includeTax1, false),
-    });
+    }, request?.user);
   }
 
   @Get('store-overview')
@@ -75,6 +76,7 @@ export class SalesAnalyticsController {
     @Query('include_tax_1') includeTax1?: string,
     @Query('mapping_selection') mappingSelection?: string,
     @Headers('x-team-id') teamHeader?: string,
+    @Request() request?: { user?: { role?: string } },
   ) {
     const mappings = Array.isArray(mapping) ? mapping : mapping ? [mapping] : [];
     const parseBool = (val: string | undefined, defaultVal = true) => {
@@ -94,7 +96,7 @@ export class SalesAnalyticsController {
       excludeRepurchase: parseBool(excludeRepurchase, true),
       includeTax12: parseBool(includeTax12, false),
       includeTax1: parseBool(includeTax1, false),
-    });
+    }, request?.user);
   }
 
   @Get('executive-overview')

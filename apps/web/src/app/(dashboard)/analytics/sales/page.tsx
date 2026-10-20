@@ -71,6 +71,7 @@ import {
 import {
   forecastSalesKpis, forecastSalesProduct, forecastKpiValues, forecastProductValues, observedCodFeeRate,
 } from '../_utils/sales-report-forecast';
+import { actualDeliveredUnitsValue, canViewActualDeliveredUnits } from '../_utils/actual-delivered-units';
 
 const Datepicker = dynamic(() => import('react-tailwindcss-datepicker'), { ssr: false });
 
@@ -132,6 +133,11 @@ export default function SalesAnalyticsPage() {
   const { today, range, startDate, endDate, handleDateRangeChange, syncDateRangeFromApi } =
     useAnalyticsDateRange();
   const [data, setData] = useState<OverviewResponse | null>(null);
+  const [hasSuperAdminIdentity, setHasSuperAdminIdentity] = useState(false);
+  // The API independently omits this field for other roles. Require both its
+  // current response and the freshly verified identity, even during View As.
+  const showActualDeliveredUnits = hasSuperAdminIdentity
+    && Object.prototype.hasOwnProperty.call(data?.kpis ?? {}, 'actual_delivered_units');
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const { beginRequest, cancelRequest } = useLatestAnalyticsRequest();
@@ -192,6 +198,30 @@ export default function SalesAnalyticsPage() {
   const [deliverySortDir, setDeliverySortDir] = useState<'asc' | 'desc'>('desc');
   const [isExportingCsv, setIsExportingCsv] = useState(false);
   const [isExportingXlsx, setIsExportingXlsx] = useState(false);
+  useEffect(() => {
+    let disposed = false;
+    let requestVersion = 0;
+    const verifyIdentity = async () => {
+      const version = ++requestVersion;
+      try {
+        const { data: identity } = await apiClient.get('/auth/me');
+        if (!disposed && version === requestVersion) {
+          setHasSuperAdminIdentity(canViewActualDeliveredUnits(identity?.user));
+        }
+      } catch {
+        if (!disposed && version === requestVersion) setHasSuperAdminIdentity(false);
+      }
+    };
+    void verifyIdentity();
+    window.addEventListener('focus', verifyIdentity);
+    return () => {
+      disposed = true;
+      window.removeEventListener('focus', verifyIdentity);
+    };
+  }, []);
+  useEffect(() => {
+    if (!showActualDeliveredUnits && sortKey === 'actual_delivered_units') setSortKey(null);
+  }, [showActualDeliveredUnits, sortKey]);
   const salesDateRangeIsToday = startDate === today && endDate === today;
   const formatDateRangeButtonDate = (dateStr: string) => {
     const [year, month, day] = dateStr.split('-');
@@ -535,6 +565,8 @@ export default function SalesAnalyticsPage() {
               return r.gross_sales ?? 0;
             case 'cogs':
               return r.cogs ?? 0;
+            case 'actual_delivered_units':
+              return actualDeliveredUnitsValue(r.actual_delivered_units) ?? Number.NaN;
             case 'aov':
               return r.aov ?? 0;
             case 'cpp':
@@ -588,6 +620,7 @@ export default function SalesAnalyticsPage() {
         cogs: isForecastView
           ? sortableProducts.reduce((total, item) => total + item.row.cogs, 0)
           : products.reduce((total, row) => total + (row.cogs ?? 0), 0),
+        ...(showActualDeliveredUnits ? { actualDeliveredUnits: actualDeliveredUnitsValue(data?.kpis.actual_delivered_units) } : {}),
         aov: computedKpis.aov ?? 0,
         cpp: computedKpis.cpp ?? 0,
         processedCpp: computedKpis.processed_cpp ?? 0,
@@ -607,6 +640,7 @@ export default function SalesAnalyticsPage() {
       grossRevenue: item.row.revenue ?? 0,
       grossSales: item.row.gross_sales ?? 0,
       cogs: item.row.cogs ?? 0,
+      ...(showActualDeliveredUnits ? { actualDeliveredUnits: actualDeliveredUnitsValue(item.row.actual_delivered_units) } : {}),
       aov: item.row.aov ?? 0,
       cpp: item.row.cpp ?? 0,
       processedCpp: item.row.processed_cpp ?? 0,
@@ -630,6 +664,7 @@ export default function SalesAnalyticsPage() {
         rows: exportableProducts,
         view: reportView,
         entityLabel: dimension === 'store' ? 'Store' : 'Product',
+        includeActualDeliveredUnits: showActualDeliveredUnits,
       });
       addToast('success', 'CSV export generated.');
     } catch (err) {
@@ -651,6 +686,7 @@ export default function SalesAnalyticsPage() {
         rows: exportableProducts,
         view: reportView,
         entityLabel: dimension === 'store' ? 'Store' : 'Product',
+        includeActualDeliveredUnits: showActualDeliveredUnits,
       });
       addToast('success', 'XLSX export generated.');
     } catch (err) {
@@ -1621,6 +1657,7 @@ export default function SalesAnalyticsPage() {
             totalProductPages={totalProductPages}
             rtsForecastSafe={rtsForecastSafe}
             reportView={reportView}
+            showActualDeliveredUnits={showActualDeliveredUnits}
             rows={pagedProducts}
             sourceCount={products.length}
             totals={productTotals}

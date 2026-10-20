@@ -18,6 +18,7 @@ import { ReconcileSalesService } from '../workflows/services/reconcile-sales.ser
 import { ReconcileSalesAttributionService } from '../workflows/services/reconcile-sales-attribution.service';
 import { AnalyticsRequestCoordinatorService } from './analytics-request-coordinator.service';
 import { readCurrentAbandonedCosts, attachCurrentAbandonedCosts } from './utils/current-abandoned-cogs';
+import { enrichActualDeliveredUnits } from './utils/actual-delivered-units';
 import { loadSalesStoreAttribution, partitionTeamAdSpend } from './utils/team-ad-spend';
 import {
   UNATTRIBUTED_STORE_KEY,
@@ -790,7 +791,7 @@ export class SalesAnalyticsService {
     };
   }
 
-  async getOverview(params: SalesOverviewParams) {
+  async getOverview(params: SalesOverviewParams, requestingUser?: { role?: string }) {
     params = { ...params, teamIds: this.normalizeTeamIds(params.teamIds) };
     const tenantId = this.teamContext.getTenantId();
     const requestKey = `sales-overview:${tenantId}:${this.analyticsCache.hashObject({
@@ -800,11 +801,34 @@ export class SalesAnalyticsService {
       mappings: [...(params.mappings || [])].map((value) => this.normalize(value)).sort(),
     })}`;
 
-    return this.analyticsRequestCoordinator.run(
+    const response = await this.analyticsRequestCoordinator.run(
       tenantId,
       requestKey,
       () => this.calculateOverview(params),
     );
+    return this.attachDeliveredUnits(response, params, requestingUser, 'product', tenantId);
+  }
+
+  private async attachDeliveredUnits(
+    response: any, params: SalesOverviewParams, requestingUser: { role?: string } | undefined,
+    mode: 'product' | 'store', tenantId: string,
+  ) {
+    // Authorization is the current authenticated identity, including View As.
+    // This decoration runs AFTER both caches and never mutates their public
+    // response. No original-actor role or client include flag grants access.
+    if (requestingUser?.role !== 'SUPER_ADMIN') return response;
+    const scope = {
+      tenantId, start: response.selected.start_date, end: response.selected.end_date,
+      teamIds: params.teamIds ?? [], excludeRepurchase: params.excludeRepurchase !== false,
+      emptySelection: params.emptySelection === true,
+      allSelected: !(params.mappings ?? []).some(value => this.normalize(value).length > 0),
+    };
+    // The public operation has finished, so this does not hold a coordinator
+    // slot while waiting for another one. Bound/coalesce protected SQL reads
+    // too; include the base response so concurrent snapshots cannot cross.
+    const key = `sales-actual-delivered-units:${tenantId}:${this.analyticsCache.hashObject({ scope, mode, response })}`;
+    return this.analyticsRequestCoordinator.run(tenantId, key,
+      () => enrichActualDeliveredUnits(this.prisma, response, scope, mode));
   }
 
   private async calculateOverview(params: SalesOverviewParams) {
@@ -1557,7 +1581,7 @@ export class SalesAnalyticsService {
   /** Store POS components belong to their real shop, independently of the
    * owner of the ad that produced the visit. No row or cost is split by a ratio.
    */
-  async getStoreOverview(params: SalesOverviewParams) {
+  async getStoreOverview(params: SalesOverviewParams, requestingUser?: { role?: string }) {
     params = { ...params, teamIds: this.normalizeTeamIds(params.teamIds) };
     const tenantId = this.teamContext.getTenantId();
     const requestKey = `sales-store-overview:${tenantId}:${this.analyticsCache.hashObject({
@@ -1565,7 +1589,8 @@ export class SalesAnalyticsService {
       sourceRevision: 'EXACT_SHOP_POS_COMPONENTS_V1',
       mappings: [...(params.mappings || [])].map(value => this.normalize(value)).sort(),
     })}`;
-    return this.analyticsRequestCoordinator.run(tenantId, requestKey, () => this.calculateStoreOverview(params));
+    const response = await this.analyticsRequestCoordinator.run(tenantId, requestKey, () => this.calculateStoreOverview(params));
+    return this.attachDeliveredUnits(response, params, requestingUser, 'store', tenantId);
   }
 
   private async calculateStoreOverview(params: SalesOverviewParams) {
