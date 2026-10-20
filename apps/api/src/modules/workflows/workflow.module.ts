@@ -19,6 +19,8 @@ import { ReconcileSalesService } from './services/reconcile-sales.service';
 import { ReconcileSalesAttributionService } from './services/reconcile-sales-attribution.service';
 import { PancakeWebhookReconcileProcessor } from './processors/pancake-webhook-reconcile.processor';
 import { ProductCogsRefreshProcessor } from './processors/product-cogs-refresh.processor';
+import { WmsErpCogsAlignmentProcessor } from './processors/wms-erp-cogs-alignment.processor';
+import { ProductCogsModule } from '../product-cogs/product-cogs.module';
 import { PANCAKE_WEBHOOK_RECONCILE_QUEUE } from '../integrations/pancake-webhook.constants';
 import { ManualMetaUploadProcessor } from './processors/manual-meta-upload.processor';
 import {
@@ -30,6 +32,7 @@ import {
   imports: [
     PrismaModule,
     IntegrationModule,
+    ProductCogsModule,
     ScheduleModule.forRoot(),
     BullModule.registerQueue({
       name: WORKFLOW_QUEUE,
@@ -60,7 +63,7 @@ import {
           ManualMetaUploadProcessor,
         ]
       : []),
-    ...(shouldRunPancakeWorkers() ? [PancakeWebhookReconcileProcessor, ProductCogsRefreshProcessor] : []),
+    ...(shouldRunPancakeWorkers() ? [PancakeWebhookReconcileProcessor, ProductCogsRefreshProcessor, WmsErpCogsAlignmentProcessor] : []),
   ],
   exports: [WorkflowService, WorkflowExecutionGateway],
 })

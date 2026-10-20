@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
@@ -22,6 +23,7 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { MediaAssetsService, type UploadedImageFile } from '../../common/services/media-assets.service';
 import { NotificationStateService } from '../../common/services/notification-state.service';
 import { WorkflowExecutionGateway } from '../workflows/gateways/workflow-execution.gateway';
+import { WmsCogsSyncService } from '../product-cogs/wms-cogs-sync.service';
 import {
   CreateWmsPurchasingBatchDto,
   type CreateWmsPurchasingBatchLineInput,
@@ -355,6 +357,7 @@ export class WmsPurchasingService {
     private readonly mediaAssetsService: MediaAssetsService,
     private readonly notificationStateService: NotificationStateService,
     private readonly workflowExecutionGateway: WorkflowExecutionGateway,
+    private readonly wmsCogsSync: WmsCogsSyncService,
   ) {}
 
   async getOverview(query: GetWmsPurchasingOverviewDto) {
@@ -2281,28 +2284,7 @@ export class WmsPurchasingService {
     }
 
     const actorId = (this.cls.get('userId') as string | undefined) ?? null;
-    const current = await this.prisma.wmsPurchasingBatch.findUnique({
-      where: { id },
-      include: {
-        paymentProofAsset: {
-          select: {
-            id: true,
-          },
-        },
-        lines: {
-          select: {
-            lineNo: true,
-            sourceSnapshot: true,
-            requestedQuantity: true,
-            approvedQuantity: true,
-            partnerUnitCost: true,
-            supplierUnitCost: true,
-            needsProfiling: true,
-            resolvedProfileId: true,
-          },
-        },
-      },
-    });
+    const current = await this.readPurchasingStatusSource(this.prisma, id);
 
     if (!current) {
       throw new NotFoundException('Purchasing batch was not found');
@@ -2433,6 +2415,23 @@ export class WmsPurchasingService {
       );
 
     await this.prisma.$transaction(async (tx) => {
+      // Take cost parents/profile locks before any batch/line mutation. Reject a
+      // stale accepted-price snapshot rather than publishing an earlier value.
+      const prepared = shouldSyncAcceptedLineProfileCosts
+        ? await this.wmsCogsSync.prepare(tx, current.tenantId,
+          current.lines.flatMap(line => line.resolvedProfileId ? [line.resolvedProfileId] : []))
+        : null;
+      let costLines = current.lines;
+      let costProfileProducts = new Map<string, string>();
+      if (prepared) {
+        await this.lockPurchasingCogsSource(tx, current.tenantId, current.id);
+        const fresh = await this.readPurchasingStatusSource(tx, current.id);
+        if (!fresh || this.purchasingSourceVersion(fresh) !== this.purchasingSourceVersion(current)) {
+          throw new ConflictException('Purchasing prices changed; refresh before accepting this request');
+        }
+        costLines = fresh.lines;
+        costProfileProducts = await this.assertPurchasingCostProfiles(tx, current.tenantId, costLines);
+      }
       await tx.wmsPurchasingBatch.update({
         where: { id: current.id },
         data: {
@@ -2544,8 +2543,11 @@ export class WmsPurchasingService {
       }
 
       const productProfileCostsSynced = shouldSyncAcceptedLineProfileCosts
-        ? await this.syncAcceptedLineProfileCosts(tx, current.lines)
+        ? await this.syncAcceptedLineProfileCosts(tx, current.tenantId, costLines, costProfileProducts)
         : false;
+      if (prepared) await this.wmsCogsSync.syncAfter(tx, prepared, {
+        source: 'WMS_PROCUREMENT_ACCEPTED', sourceRef: current.id, actorId,
+      });
 
       const event = await tx.wmsPurchasingEvent.create({
         data: {
@@ -2571,7 +2573,7 @@ export class WmsPurchasingService {
       });
 
       await this.syncPurchasingNotificationEvent(tx, event);
-    });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10000, timeout: 30000 });
 
     this.emitStockRequestUpdate({
       tenantId: current.tenantId,
@@ -2652,6 +2654,10 @@ export class WmsPurchasingService {
       && line.batch.requestType === WmsPurchasingRequestType.PROCUREMENT
       && line.batch.status !== WmsPurchasingBatchStatus.UNDER_REVIEW
       && line.batch.status !== WmsPurchasingBatchStatus.REVISION;
+    // A supplier-only edit must not copy a stale purchasing partner price over
+    // a newer WMS inhouse price. Explicit partner/resolution edits still do.
+    const shouldSyncInhouseCost = shouldSyncLineProfileCosts
+      && (body.partnerUnitCost !== undefined || body.resolvedProfileId !== undefined);
     const didChangeCommercialTerms =
       nextEffectiveApprovedQuantity !== currentEffectiveApprovedQuantity
       || nextPartnerUnitCost !== this.toNumber(line.partnerUnitCost)
@@ -2683,6 +2689,21 @@ export class WmsPurchasingService {
     };
 
     await this.prisma.$transaction(async (tx) => {
+      const prepared = shouldSyncInhouseCost && nextResolvedProfileId
+        ? await this.wmsCogsSync.prepare(tx, line.batch.tenantId, [nextResolvedProfileId]) : null;
+      await this.lockPurchasingCogsSource(tx, line.batch.tenantId, line.batchId, line.id);
+      const fresh = await tx.wmsPurchasingBatchLine.findUnique({
+        where: { id: line.id },
+        include: { batch: { select: { id: true, tenantId: true, storeId: true, requestType: true, status: true } } },
+      });
+      if (!fresh || this.purchasingSourceVersion(fresh) !== this.purchasingSourceVersion(line)) {
+        throw new ConflictException('Purchasing line changed; refresh before applying this edit');
+      }
+      const profileProducts = shouldSyncLineProfileCosts && nextResolvedProfileId
+        ? await this.assertPurchasingCostProfiles(tx, line.batch.tenantId, [{ ...fresh,
+          resolvedProfileId: nextResolvedProfileId,
+          resolvedPosProductId: body.resolvedPosProductId === undefined ? fresh.resolvedPosProductId : body.resolvedPosProductId || null,
+        }]) : new Map<string, string>();
       await tx.wmsPurchasingBatchLine.update({
         where: { id: line.id },
         data: {
@@ -2720,13 +2741,16 @@ export class WmsPurchasingService {
 
       if (shouldSyncLineProfileCosts && nextResolvedProfileId) {
         await tx.wmsProductProfile.update({
-          where: { id: nextResolvedProfileId },
+          where: { id: nextResolvedProfileId, tenantId: line.batch.tenantId, posProductId: profileProducts.get(nextResolvedProfileId)! },
           data: {
             ...(nextSupplierUnitCost !== null ? { supplierUnitCost: nextSupplierUnitCost } : {}),
-            ...(nextPartnerUnitCost !== null ? { inhouseUnitCost: nextPartnerUnitCost } : {}),
+            ...(shouldSyncInhouseCost && nextPartnerUnitCost !== null ? { inhouseUnitCost: nextPartnerUnitCost } : {}),
           },
         });
       }
+      if (prepared) await this.wmsCogsSync.syncAfter(tx, prepared, {
+        source: 'WMS_PURCHASING_LINE', sourceRef: line.id, actorId,
+      });
 
       await tx.wmsPurchasingBatch.update({
         where: { id: line.batchId },
@@ -2782,7 +2806,7 @@ export class WmsPurchasingService {
           },
         },
       });
-    });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10000, timeout: 30000 });
 
     this.emitStockRequestUpdate({
       tenantId: line.batch.tenantId,
@@ -2795,13 +2819,88 @@ export class WmsPurchasingService {
     return this.getBatchById(batchId, scope.activeTenantId);
   }
 
+  private readPurchasingStatusSource(client: Pick<Prisma.TransactionClient, 'wmsPurchasingBatch'>, id: string) {
+    return client.wmsPurchasingBatch.findUnique({ where: { id }, include: {
+      paymentProofAsset: { select: { id: true } },
+      lines: { orderBy: { lineNo: 'asc' }, select: {
+        id: true, lineNo: true, tenantId: true, storeId: true, productId: true, variationId: true,
+        sourceSnapshot: true, requestedQuantity: true, approvedQuantity: true,
+        partnerUnitCost: true, supplierUnitCost: true, needsProfiling: true, resolvedProfileId: true, resolvedPosProductId: true, updatedAt: true,
+      } },
+    } });
+  }
+
+  private purchasingSourceVersion(value: unknown): string {
+    const sort = (row: any): any => Array.isArray(row) ? row.map(sort)
+      : row && typeof row === 'object' ? Object.fromEntries(Object.keys(row).sort().map(key => [key, sort(row[key])])) : row;
+    return JSON.stringify(sort(JSON.parse(JSON.stringify(value))));
+  }
+
+  private async lockPurchasingCogsSource(tx: Prisma.TransactionClient, tenantId: string, batchId: string, lineId?: string) {
+    const batches = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+      'SELECT id FROM wms_purchasing_batches WHERE id=$1::uuid AND "tenantId"=$2::uuid FOR UPDATE NOWAIT', batchId, tenantId);
+    if (batches.length !== 1) throw new ConflictException('Purchasing scope changed; refresh before retrying');
+    const lines = lineId
+      ? await tx.$queryRawUnsafe<Array<{ id: string }>>('SELECT id FROM wms_purchasing_batch_lines WHERE "batchId"=$1::uuid AND id=$2::uuid ORDER BY id FOR UPDATE NOWAIT', batchId, lineId)
+      : await tx.$queryRawUnsafe<Array<{ id: string }>>('SELECT id FROM wms_purchasing_batch_lines WHERE "batchId"=$1::uuid ORDER BY id FOR UPDATE NOWAIT', batchId);
+    if (lineId && lines.length !== 1) throw new ConflictException('Purchasing line changed; refresh before retrying');
+  }
+
+  private async assertPurchasingCostProfiles(tx: Prisma.TransactionClient, tenantId: string, lines: Array<{
+    tenantId: string; storeId: string; productId: string | null; variationId: string | null;
+    resolvedProfileId: string | null; resolvedPosProductId: string | null;
+  }>): Promise<Map<string, string>> {
+    const selected = lines.filter(line => line.resolvedProfileId);
+    const ids = [...new Set(selected.map(line => line.resolvedProfileId!))].sort();
+    if (!ids.length) return new Map();
+    const read = () => tx.wmsProductProfile.findMany({ where: { id: { in: ids } }, include: {
+      posProduct: { select: { id: true, storeId: true, productId: true, variationId: true, store: { select: { tenantId: true } } } },
+    } });
+    const assertRows = (profiles: Awaited<ReturnType<typeof read>>) => {
+      const byId = new Map(profiles.map(profile => [profile.id, profile]));
+      if (byId.size !== ids.length) throw new ConflictException('Purchasing product resolution requires review');
+      for (const line of selected) {
+        const profile = byId.get(line.resolvedProfileId!)!;
+        const product = profile.posProduct;
+        if (line.tenantId !== tenantId || profile.tenantId !== tenantId || product.store.tenantId !== tenantId
+          || profile.storeId !== line.storeId || product.storeId !== line.storeId || product.id !== profile.posProductId
+          || (line.resolvedPosProductId !== null && line.resolvedPosProductId !== profile.posProductId)
+          || profile.productId !== product.productId || profile.variationId !== product.variationId
+          || !product.productId.trim() || !product.variationId?.trim() || product.variationId === product.productId
+          || (line.productId !== null && line.productId !== product.productId)
+          || (line.variationId !== null && line.variationId !== product.variationId)) {
+          throw new ConflictException('Purchasing product resolution changed; refresh before updating costs');
+        }
+      }
+      return byId;
+    };
+    // Reject foreign pointers before locking their parents. Repeat the identity
+    // read under sorted parent/profile locks, even when synchronization is off.
+    const before = assertRows(await read());
+    const productIds = [...new Set([...before.values()].map(profile => profile.posProductId))].sort();
+    const parents = await tx.$queryRawUnsafe<Array<{ id: string }>>(`
+      SELECT p.id FROM pos_products p JOIN pos_stores s ON s.id=p."storeId"
+      WHERE p.id=ANY($1::uuid[]) AND s."tenantId"=$2::uuid ORDER BY p.id FOR SHARE OF p,s NOWAIT`, productIds, tenantId);
+    if (parents.length !== productIds.length) throw new ConflictException('Purchasing product scope changed; refresh before retrying');
+    const locked = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+      'SELECT id FROM wms_product_profiles WHERE id=ANY($1::uuid[]) AND "tenantId"=$2::uuid ORDER BY id FOR UPDATE NOWAIT', ids, tenantId);
+    if (locked.length !== ids.length) throw new ConflictException('Purchasing profile scope changed; refresh before retrying');
+    const after = assertRows(await read());
+    if ([...after.values()].some(profile => profile.posProductId !== before.get(profile.id)?.posProductId)) {
+      throw new ConflictException('Purchasing product resolution changed; refresh before updating costs');
+    }
+    return new Map([...after.values()].map(profile => [profile.id, profile.posProductId]));
+  }
+
   private async syncAcceptedLineProfileCosts(
     client: Prisma.TransactionClient,
+    tenantId: string,
     lines: Array<{
       resolvedProfileId: string | null;
       partnerUnitCost: Prisma.Decimal | number | null;
       supplierUnitCost: Prisma.Decimal | number | null;
     }>,
+    profileProducts: Map<string, string>,
   ) {
     const costsByProfileId = new Map<string, {
       inhouseUnitCost?: number;
@@ -2827,7 +2926,7 @@ export class WmsPurchasingService {
 
     for (const [profileId, costs] of costsByProfileId) {
       await client.wmsProductProfile.update({
-        where: { id: profileId },
+        where: { id: profileId, tenantId, posProductId: profileProducts.get(profileId)! },
         data: costs,
       });
     }
