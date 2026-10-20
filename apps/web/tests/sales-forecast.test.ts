@@ -122,3 +122,20 @@ test('RTS scenario retains the existing 0–100 bounds and invalid-input default
   assert.equal(getSafeRtsForecastPct(Number.NaN), 20);
   assert.equal(getSafeRtsForecastPct(Number.POSITIVE_INFINITY), 20);
 });
+
+
+test('live RTS exclusions change displayed COGS but not the separately quoted RTS scenario', () => {
+  for (const excludeRts of [false, true]) {
+    const selected = { ...options, excludeRts };
+    const current = { ...product, cogs: excludeRts ? 1300 : 1380, cogs_forecast_basis: 1380,
+      cogs_abandoned: 70, cogs_rts_credit: excludeRts ? 0 : 80 };
+    const total = { ...kpis, cogs_adjusted: current.cogs, cogs_forecast_basis: 1380, cogs_abandoned: 70 };
+    const row = buildSalesProductForecast(current, selected, 20);
+    const kpi = buildSalesKpiForecast(total, counts, selected, 20);
+    assert.equal(row.cogsAdjusted, 1380);
+    assert.equal(kpi.cogsAdjusted, 1380);
+    assert.equal(row.cmForecast, 3630);
+    assert.equal(kpi.cmForecast, 3630);
+    assert.equal(buildSalesProductForecast({ ...current, cm_rts_forecast: 3630 }, selected, 30).cmForecast, 2930);
+  }
+});

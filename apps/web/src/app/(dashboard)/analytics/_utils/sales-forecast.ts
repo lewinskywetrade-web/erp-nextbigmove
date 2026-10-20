@@ -11,7 +11,9 @@ export type SalesForecastOptions = {
 
 type ForecastAmounts = {
   cogs?: number;
+  cogs_forecast_basis?: number;
   cogs_canceled?: number;
+  cogs_abandoned?: number | null;
   cogs_restocking?: number;
   cogs_rts?: number;
   canceled_cod?: number;
@@ -87,7 +89,8 @@ export function buildSalesKpiForecast(
     adjustedCod: adjustedCod(kpis.gross_cod ?? 0, kpis, opts),
     purchases: (counts.purchases ?? 0) + (opts.excludeRts ? counts.rts ?? 0 : 0),
     cogsTotal, cogsCanceled, cogsRestocking,
-    cogsAdjusted: cogsTotal - cogsCanceled - cogsRestocking,
+    cogsAdjusted: kpis.cogs_forecast_basis ?? cogsTotal - cogsCanceled - cogsRestocking
+      - (opts.excludeAbandoned ? kpis.cogs_abandoned ?? 0 : 0),
     sf: kpis.sf_fees ?? 0,
     ff: kpis.ff_fees ?? 0,
     iF: kpis.if_fees ?? 0,
@@ -118,9 +121,9 @@ export function buildSalesProductForecast(
     cogsTotal: row.cogs_raw ?? row.cogs ?? 0,
     cogsCanceled: opts.excludeCancel ? row.cogs_canceled ?? 0 : 0,
     cogsRestocking: opts.excludeRestocking ? row.cogs_restocking ?? 0 : 0,
-    // Product cogs is already cancel/restock-adjusted by the API. Never subtract
-    // those components again or infer them from cogs minus legacy cogs_ec.
-    cogsAdjusted: row.cogs ?? 0,
+    // The scenario retains RTS in its own cost basis even when the live table
+    // excludes RTS. Older endpoints still return the original adjusted COGS.
+    cogsAdjusted: row.cogs_forecast_basis ?? row.cogs ?? 0,
     sf: row.sf_raw ?? row.sf_fees ?? 0,
     ff: row.ff_raw ?? row.ff_fees ?? 0,
     iF: row.if_raw ?? row.if_fees ?? 0,

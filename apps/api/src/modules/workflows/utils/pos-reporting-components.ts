@@ -28,6 +28,8 @@ export type PosAggregateBucket = {
   processedPurchasesPos: number;
   codPos: number;
   cogsPos: number;
+  cogsCurrentAbandonedPos: number;
+  repurchaseCogsCurrentAbandonedPos: number;
   cogsCanceledPos: number;
   cogsRestockingPos: number;
   cogsRtsPos: number;
@@ -93,6 +95,8 @@ export function createEmptyPosAggregateBucket(): PosAggregateBucket {
     processedPurchasesPos: 0,
     codPos: 0,
     cogsPos: 0,
+    cogsCurrentAbandonedPos: 0,
+    repurchaseCogsCurrentAbandonedPos: 0,
     cogsCanceledPos: 0,
     cogsRestockingPos: 0,
     cogsRtsPos: 0,
@@ -210,9 +214,11 @@ export function accumulatePosOrder(bucket: PosAggregateBucket, order: PosOrderLi
     }
   }
   if (isCurrentlyAbandoned) {
+    bucket.cogsCurrentAbandonedPos += cogsVal;
     bucket.currentAbandonedCount += 1;
     bucket.currentAbandonedCodPos += codVal;
     if (isRepurchase) {
+      bucket.repurchaseCogsCurrentAbandonedPos += cogsVal;
       bucket.repurchaseCurrentAbandonedCount += 1;
       bucket.repurchaseCurrentAbandonedCodPos += codVal;
     }

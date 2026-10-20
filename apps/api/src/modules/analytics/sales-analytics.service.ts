@@ -17,6 +17,7 @@ import {
 import { ReconcileSalesService } from '../workflows/services/reconcile-sales.service';
 import { ReconcileSalesAttributionService } from '../workflows/services/reconcile-sales-attribution.service';
 import { AnalyticsRequestCoordinatorService } from './analytics-request-coordinator.service';
+import { readCurrentAbandonedCosts, attachCurrentAbandonedCosts } from './utils/current-abandoned-cogs';
 import {
   creativeCodeParts,
   resolveStoreAttribution,
@@ -31,7 +32,7 @@ const TIMEZONE = 'Asia/Manila';
 const PROCESSED_SALES_STATUSES = [1, 2, 3, 9, 12, 13] as const;
 // Separate calculation revisions from data-cache versions and response shapes:
 // persisted responses from earlier math must not survive a calculation deploy.
-const SALES_CALCULATION_VERSION = 2;
+const SALES_CALCULATION_VERSION = 3;
 
 type SalesKpis = {
   revenue: number;
@@ -54,6 +55,10 @@ type SalesKpis = {
   conversion_rate: number;
   profit_efficiency: number;
   cogs: number;
+  cogs_adjusted: number;
+  cogs_abandoned: number | null;
+  cogs_rts_credit: number;
+  cogs_forecast_basis: number;
   cogs_canceled: number;
   cogs_restocking: number;
   cogs_rts: number;
@@ -105,6 +110,9 @@ type ProductRow = {
   revenue: number;
   gross_sales: number;
   cogs: number;
+  cogs_rts_credit: number;
+  cogs_forecast_basis: number;
+  cogs_abandoned: number | null;
   cogs_raw: number;
   cogs_canceled: number;
   aov: number;
@@ -152,6 +160,8 @@ type SalesOverviewParams = {
   startDate?: string;
   endDate?: string;
   mappings?: string[];
+  emptySelection?: boolean;
+  teamIds?: string[];
   excludeCancel?: boolean;
   excludeRestocking?: boolean;
   excludeAbandoned?: boolean;
@@ -193,6 +203,22 @@ export class SalesAnalyticsService {
     return Number.isFinite(n) ? n : 0;
   }
 
+  private normalizeTeamIds(values: string[] = []): string[] {
+    if (!Array.isArray(values) || values.length > 100 || values.some(id => typeof id !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id))) {
+      throw new BadRequestException('Select valid tenant teams.');
+    }
+    return [...new Set(values.map(id => id.toLowerCase()))].sort();
+  }
+
+  private async analyticsTeamWhere(db: any, tenantId: string, teamIds: string[]) {
+    if (!teamIds.length) return {};
+    const rows = await db.team.findMany({ where: { tenantId, id: { in: teamIds }, status: 'ACTIVE' }, select: { id: true } });
+    if (rows.length !== teamIds.length || rows.some((row: any) => !teamIds.includes(row.id))) {
+      throw new BadRequestException('Selected teams must be active teams in this tenant.');
+    }
+    return { teamId: { in: teamIds } };
+  }
+
   private shiftDate(dateStr: string, days: number): string {
     return dayjs(dateStr, 'YYYY-MM-DD').add(days, 'day').format('YYYY-MM-DD');
   }
@@ -223,6 +249,7 @@ export class SalesAnalyticsService {
         cogsRaw: 0,
         cogsCanceled: 0,
         cogsRestocking: 0,
+        cogsAbandoned: 0,
         cogsDelivered: 0,
         cogsRts: 0,
         deliveredCod: 0,
@@ -276,10 +303,12 @@ export class SalesAnalyticsService {
       cogsVisible:
         repurchaseCogs -
         (opts.excludeCancel ? this.toNumber(sum?._sum?.repurchaseCogsCanceledPos) : 0) -
-        (opts.excludeRestocking ? this.toNumber(sum?._sum?.repurchaseCogsRestockingPos) : 0),
+        (opts.excludeRestocking ? this.toNumber(sum?._sum?.repurchaseCogsRestockingPos) : 0) -
+        (opts.excludeAbandoned ? this.toNumber(sum?._sum?.repurchaseCogsCurrentAbandonedPos) : 0),
       cogsRaw: repurchaseCogs,
       cogsCanceled: this.toNumber(sum?._sum?.repurchaseCogsCanceledPos),
       cogsRestocking: this.toNumber(sum?._sum?.repurchaseCogsRestockingPos),
+      cogsAbandoned: this.toNumber(sum?._sum?.repurchaseCogsCurrentAbandonedPos),
       cogsDelivered: this.toNumber(sum?._sum?.repurchaseCogsDeliveredPos),
       cogsRts: this.toNumber(sum?._sum?.repurchaseCogsRtsPos),
       deliveredCod: this.toNumber(sum?._sum?.repurchaseDeliveredCodPos),
@@ -369,6 +398,7 @@ export class SalesAnalyticsService {
     const cogs = this.toNumber(sum?._sum?.cogsPos);
     const cogsCanceled = this.toNumber(sum?._sum?.cogsCanceledPos);
     const cogsRestocking = this.toNumber(sum?._sum?.cogsRestockingPos);
+    const cogsAbandoned = this.toNumber(sum?._sum?.cogsCurrentAbandonedPos);
     const cogsRts = this.toNumber(sum?._sum?.cogsRtsPos);
     const cogsDelivered = this.toNumber(sum?._sum?.cogsDeliveredPos);
     const sf = this.toNumber(sum?._sum?.sfPos);
@@ -378,11 +408,17 @@ export class SalesAnalyticsService {
     const ffSdr = this.toNumber(sum?._sum?.ffSdrPos);
     const ifSdr = this.toNumber(sum?._sum?.ifSdrPos);
     // COGS after optional exclusions (remove excluded portions from the total once)
-    const cogsAdjusted =
+    const cogsBeforeRts =
       cogs
       - (opts.excludeCancel ? cogsCanceled : 0)
       - (opts.excludeRestocking ? cogsRestocking : 0)
+      - (opts.excludeAbandoned ? cogsAbandoned : 0)
       - repurchaseAdj.cogsVisible;
+    const selectedRtsCogs = cogsRts - repurchaseAdj.cogsRts;
+    const cogsAdjusted = cogsBeforeRts - (opts.excludeRts ? selectedRtsCogs : 0);
+    // A returned item's cost is credited only while it is still in COGS.
+    // Excluding it above and crediting it again would inflate contribution.
+    const cogsRtsCredit = opts.excludeRts ? 0 : selectedRtsCogs;
     const cogsDeliveredAdj = cogsDelivered - repurchaseAdj.cogsDelivered;
     const cogsRtsAdj = cogsRts - repurchaseAdj.cogsRts;
     const sfAdj = sf - repurchaseAdj.sf;
@@ -404,7 +440,7 @@ export class SalesAnalyticsService {
       - ifAdj
       - spend
       - codFeeAdj
-      + cogsRtsAdj;
+      + cogsRtsCredit;
     const delivered =
       this.toNumber(sum?._sum?.deliveredCodPos) - repurchaseAdj.deliveredCod;
     const net =
@@ -452,6 +488,7 @@ export class SalesAnalyticsService {
       cogs
       - (opts.excludeCancel ? cogsCanceled : 0)
       - (opts.excludeRestocking ? cogsRestocking : 0)
+      - (opts.excludeAbandoned ? cogsAbandoned : 0)
       - repurchaseAdj.cogsVisible;
     const purchasesAdjForCmRts = Math.max(
       0,
@@ -496,6 +533,10 @@ export class SalesAnalyticsService {
       contribution_margin: cm,
       net_margin: net,
       cogs: cogs - repurchaseAdj.cogsRaw,
+      cogs_adjusted: cogsAdjusted,
+      cogs_abandoned: sum?._sum?.cogsCurrentAbandonedPos === undefined ? null : cogsAbandoned - repurchaseAdj.cogsAbandoned,
+      cogs_rts_credit: cogsRtsCredit,
+      cogs_forecast_basis: cogsBeforeRts,
       cogs_canceled: cogsCanceled - repurchaseAdj.cogsCanceled,
       cogs_restocking: cogsRestocking - repurchaseAdj.cogsRestocking,
       cogs_rts: cogsRtsAdj,
@@ -552,12 +593,12 @@ export class SalesAnalyticsService {
     };
   }
 
-  private computeStatusDistribution(sum: any): SalesStatusDistribution {
+  private computeStatusDistribution(sum: any, excludeRepurchase = true): SalesStatusDistribution {
     const withoutRepurchase = (countKey: string, repurchaseCountKey: string) =>
       Math.max(
         0,
         this.toNumber(sum?._sum?.[countKey]) -
-          this.toNumber(sum?._sum?.[repurchaseCountKey]),
+          (excludeRepurchase ? this.toNumber(sum?._sum?.[repurchaseCountKey]) : 0),
       );
 
     return {
@@ -573,6 +614,25 @@ export class SalesAnalyticsService {
       confirmed: withoutRepurchase('confirmedCount', 'repurchaseConfirmedCount'),
       unconfirmed: withoutRepurchase('unconfirmedCount', 'repurchaseUnconfirmedCount'),
       canceled: withoutRepurchase('canceledCount', 'repurchaseCanceledCount'),
+    };
+  }
+
+  private computeDeliveryRow(sum: any, mapping: string | null, excludeRepurchase: boolean): DeliveryStatusRow {
+    const value = (field: string, repeat: string) => this.toNumber(sum?.[field])
+      - (excludeRepurchase ? this.toNumber(sum?.[repeat]) : 0);
+    return {
+      mapping,
+      total_orders: value('purchasesPos', 'repurchaseCount'),
+      new_orders: value('unconfirmedCount', 'repurchaseUnconfirmedCount'),
+      restocking: value('restockingCount', 'repurchaseRestockingCount'),
+      confirmed: value('confirmedCount', 'repurchaseConfirmedCount'),
+      printed: value('printedCount', 'repurchasePrintedCount'),
+      waiting_pickup: value('waitingPickupCount', 'repurchaseWaitingPickupCount'),
+      shipped: value('shippedCount', 'repurchaseShippedCount'),
+      delivered: value('deliveredCount', 'repurchaseDeliveredCount'),
+      rts: value('rtsCount', 'repurchaseRtsCount'),
+      canceled: value('canceledCount', 'repurchaseCanceledCount'),
+      deleted: value('deletedCount', 'repurchaseDeletedCount'),
     };
   }
 
@@ -614,12 +674,19 @@ export class SalesAnalyticsService {
     const cogs = this.toNumber(sum?._sum?.cogsPos);
     const cogsCanceled = this.toNumber(sum?._sum?.cogsCanceledPos);
     const cogsRestocking = this.toNumber(sum?._sum?.cogsRestockingPos);
+    const cogsAbandoned = this.toNumber(sum?._sum?.cogsCurrentAbandonedPos);
     const cogsRts = this.toNumber(sum?._sum?.cogsRtsPos);
-    const cogsAdjusted =
+    const cogsBeforeRts =
       cogs
       - (opts.excludeCancel ? cogsCanceled : 0)
       - (opts.excludeRestocking ? cogsRestocking : 0)
+      - (opts.excludeAbandoned ? cogsAbandoned : 0)
       - repurchaseAdj.cogsVisible;
+    const selectedRtsCogs = cogsRts - repurchaseAdj.cogsRts;
+    const cogsAdjusted = cogsBeforeRts - (opts.excludeRts ? selectedRtsCogs : 0);
+    // A returned item's cost is credited only while it is still in COGS.
+    // Excluding it above and crediting it again would inflate contribution.
+    const cogsRtsCredit = opts.excludeRts ? 0 : selectedRtsCogs;
 
     const sf = this.toNumber(sum?._sum?.sfPos);
     const ff = this.toNumber(sum?._sum?.ffPos);
@@ -634,7 +701,7 @@ export class SalesAnalyticsService {
       - (inf - repurchaseAdj.inf)
       - spend
       - (codFee - repurchaseAdj.codFee)
-      + (cogsRts - repurchaseAdj.cogsRts);
+      + cogsRtsCredit;
 
     const delivered = this.toNumber(sum?._sum?.deliveredCodPos) - repurchaseAdj.deliveredCod;
     const sfSdr = this.toNumber(sum?._sum?.sfSdrPos);
@@ -679,7 +746,7 @@ export class SalesAnalyticsService {
       (ff - repurchaseAdj.ff) -
       (inf - repurchaseAdj.inf) -
       (codFeeDelivered - repurchaseAdj.codFeeDelivered) -
-      cogsAdjusted +
+      cogsBeforeRts +
       (cogsRts - repurchaseAdj.cogsRts);
 
     return {
@@ -687,6 +754,9 @@ export class SalesAnalyticsService {
       revenue,
       gross_sales: purchasesAdj,
       cogs: cogsAdjusted,
+      cogs_abandoned: sum?._sum?.cogsCurrentAbandonedPos === undefined ? null : cogsAbandoned - repurchaseAdj.cogsAbandoned,
+      cogs_rts_credit: cogsRtsCredit,
+      cogs_forecast_basis: cogsBeforeRts,
       cogs_raw: cogs - repurchaseAdj.cogsRaw,
       cogs_canceled: cogsCanceled - repurchaseAdj.cogsCanceled,
       aov,
@@ -722,6 +792,7 @@ export class SalesAnalyticsService {
   }
 
   async getOverview(params: SalesOverviewParams) {
+    params = { ...params, teamIds: this.normalizeTeamIds(params.teamIds) };
     const tenantId = this.teamContext.getTenantId();
     const requestKey = `sales-overview:${tenantId}:${this.analyticsCache.hashObject({
       ...params,
@@ -774,6 +845,8 @@ export class SalesAnalyticsService {
     const includeNull = normalizedMappings.includes(this.normalize('__null__'));
 
     const tenantId = this.teamContext.getTenantId();
+    const teamIds = params.teamIds || [];
+    const teamWhere = await this.analyticsTeamWhere(db, tenantId, teamIds);
     const activeStores = await db.posStore.findMany({
       where: {
         tenantId,
@@ -785,7 +858,7 @@ export class SalesAnalyticsService {
     const activeShopIds = Array.from(new Set(activeStores.map((store) => store.shopId)));
 
     const mappingFilter =
-      normalizedMappings.length > 0
+      params.emptySelection ? { id: { in: [] as string[] } } : normalizedMappings.length > 0
         ? {
             OR: [
               ...normalizedMappings
@@ -799,6 +872,7 @@ export class SalesAnalyticsService {
         : {};
 
     const baseWhere = this.teamContext.buildTenantWhereClause({
+      ...teamWhere,
       date: { gte: startDate_dt, lte: endDate_dt },
     });
 
@@ -807,6 +881,7 @@ export class SalesAnalyticsService {
       ...mappingFilter,
     };
     const processedSalesWhere = this.teamContext.buildTenantWhereClause({
+      ...teamWhere,
       dateLocal: { gte: startStr, lte: endStr },
       isVoid: false,
       shopId: { in: activeShopIds },
@@ -815,6 +890,7 @@ export class SalesAnalyticsService {
       ...mappingFilter,
     });
     const prevProcessedSalesWhere = this.teamContext.buildTenantWhereClause({
+      ...teamWhere,
       dateLocal: { gte: prevStartStr, lte: prevEndStr },
       isVoid: false,
       shopId: { in: activeShopIds },
@@ -823,6 +899,7 @@ export class SalesAnalyticsService {
       ...mappingFilter,
     });
     const cancellationRateWhere = this.teamContext.buildTenantWhereClause({
+      ...teamWhere,
       dateLocal: { gte: startStr, lte: endStr },
       isVoid: false,
       shopId: { in: activeShopIds },
@@ -830,6 +907,7 @@ export class SalesAnalyticsService {
       ...mappingFilter,
     });
     const prevCancellationRateWhere = this.teamContext.buildTenantWhereClause({
+      ...teamWhere,
       dateLocal: { gte: prevStartStr, lte: prevEndStr },
       isVoid: false,
       shopId: { in: activeShopIds },
@@ -839,12 +917,14 @@ export class SalesAnalyticsService {
 
     const cacheVersion = await this.analyticsCache.getVersion(tenantId);
     const cacheKeyPayload = {
-      responseShapeVersion: 8,
+      responseShapeVersion: 9,
+      emptySelection: params.emptySelection === true,
       sourceRevision: 'PER_AD_MAPPING_V1',
       readConsistency: 'READ_ONLY_REPEATABLE_READ',
       calculationVersion: SALES_CALCULATION_VERSION,
       tenantId,
       analyticsScope: 'tenant',
+      teamIds,
       activeShopIds: [...activeShopIds].sort(),
       start: startStr,
       end: endStr,
@@ -865,10 +945,13 @@ export class SalesAnalyticsService {
     const volumeGrowthWhere: Prisma.Sql[] = [
       Prisma.sql`"tenantId" = ${tenantId}::uuid`,
       Prisma.sql`"status" IS DISTINCT FROM 7`,
+      Prisma.sql`"isVoid" = false`,
       activeShopIds.length > 0
         ? Prisma.sql`"shopId" IN (${Prisma.join(activeShopIds)})`
         : Prisma.sql`FALSE`,
     ];
+    if (teamIds.length) volumeGrowthWhere.push(Prisma.sql`"teamId" IN (${Prisma.join(teamIds.map(id => Prisma.sql`${id}::uuid`))})`);
+    if (params.emptySelection) volumeGrowthWhere.push(Prisma.sql`FALSE`);
     if (normalizedMappings.length > 0) {
       const mappingConditions = normalizedMappings
         .filter((m) => m !== this.normalize('__null__'))
@@ -986,6 +1069,7 @@ export class SalesAnalyticsService {
           ...baseWhere,
           ...mappingFilter,
           date: { gte: prevStartDate_dt, lte: prevEndDate_dt },
+          ...teamWhere,
         },
         _sum: {
           spend: true,
@@ -1289,6 +1373,21 @@ export class SalesAnalyticsService {
       }),
     ]);
 
+    // Only the nonzero abandoned buckets need an exact live cost lookup.
+    // Match their persisted per-ad memberships, not the unrelated order mapping.
+    if (excludeAbandoned) {
+      const hasAbandonedBucket = [agg._sum, prevAgg._sum].some(sum =>
+        this.toNumber(sum.currentAbandonedCount) !== 0 || this.toNumber(sum.repurchaseCurrentAbandonedCount) !== 0);
+      const groups = hasAbandonedBucket ? await readCurrentAbandonedCosts(db, {
+        tenantId, previousStart: prevStartStr, currentStart: startStr, end: endStr,
+        activeShopIds, mappings: normalizedMappings, includeNull, emptySelection: params.emptySelection, teamIds,
+      }) : [];
+      attachCurrentAbandonedCosts(agg._sum, groups.filter(row => row.period === 'current'));
+      attachCurrentAbandonedCosts(prevAgg._sum, groups.filter(row => row.period === 'previous'));
+      for (const group of productGroups) attachCurrentAbandonedCosts(group._sum,
+        groups.filter(row => row.period === 'current' && row.mapping === group.mapping));
+    }
+
     const mappingOptions: string[] = [];
     const mappingDisplayMap: Record<string, string> = {};
     mappingRows.forEach((r) => {
@@ -1332,20 +1431,7 @@ export class SalesAnalyticsService {
       };
     });
 
-    const deliveryStatuses: DeliveryStatusRow[] = productGroups.map((g) => ({
-      mapping: g.mapping,
-      total_orders: this.toNumber(g._sum?.purchasesPos),
-      new_orders: this.toNumber(g._sum?.unconfirmedCount),
-      restocking: this.toNumber(g._sum?.restockingCount),
-      confirmed: this.toNumber(g._sum?.confirmedCount),
-      printed: this.toNumber(g._sum?.printedCount),
-      waiting_pickup: this.toNumber(g._sum?.waitingPickupCount),
-      shipped: this.toNumber(g._sum?.shippedCount),
-      delivered: this.toNumber(g._sum?.deliveredCount),
-      rts: this.toNumber(g._sum?.rtsCount),
-      canceled: this.toNumber(g._sum?.canceledCount),
-      deleted: this.toNumber(g._sum?.deletedCount),
-    }));
+    const deliveryStatuses = productGroups.map(g => this.computeDeliveryRow(g._sum, g.mapping, excludeRepurchase));
 
     const kpis = {
       ...this.computeKpis(agg, {
@@ -1387,7 +1473,7 @@ export class SalesAnalyticsService {
         returned: returnedOrdersCount,
       },
     );
-    const statusDistribution = this.computeStatusDistribution(agg);
+    const statusDistribution = this.computeStatusDistribution(agg, excludeRepurchase);
     const prevCounts = this.computeCounts(
       prevAgg,
       { excludeCancel, excludeRestocking, excludeAbandoned, excludeRts, excludeRepurchase },
@@ -1416,6 +1502,7 @@ export class SalesAnalyticsService {
         start_date: startStr,
         end_date: endStr,
         mappings: normalizedMappings,
+        team_ids: teamIds,
       },
       rangeDays,
       lastUpdatedAt: lastUpdatedAgg?._max?.updatedAt || null,
@@ -1433,6 +1520,7 @@ export class SalesAnalyticsService {
    * owner of the ad that produced the visit. No row or cost is split by a ratio.
    */
   async getStoreOverview(params: SalesOverviewParams) {
+    params = { ...params, teamIds: this.normalizeTeamIds(params.teamIds) };
     const tenantId = this.teamContext.getTenantId();
     const requestKey = `sales-store-overview:${tenantId}:${this.analyticsCache.hashObject({
       ...params,
@@ -1464,13 +1552,18 @@ export class SalesAnalyticsService {
     const selectedStoreIds = mappings.map((m) => this.normalize(m)).filter((v) => v.length > 0);
     const tenantId = this.teamContext.getTenantId();
 
+    const teamIds = params.teamIds || [];
+    const teamWhere = await this.analyticsTeamWhere(this.prisma, tenantId, teamIds);
     const activeStoreWhere = { tenantId, status: 'ACTIVE' as const, OR: [{ enabled: true }, { enabled: null }] };
-    const scopeStores = await this.prisma.posStore.findMany({ where: activeStoreWhere, select: { id: true, shopId: true, name: true } });
-    const scopeKey = (stores: typeof scopeStores) => stores.map(store => `${store.id}:${store.shopId}:${store.name}`).sort();
+    // Keep all tenant shops as negative ownership witnesses even in one team.
+    const scopeStores = await this.prisma.posStore.findMany({ where: activeStoreWhere, select: { id: true, shopId: true, name: true, teamId: true } });
+    const scopeKey = (stores: typeof scopeStores) => stores.map(store => `${store.id}:${store.shopId}:${store.name}:${store.teamId ?? ''}`).sort();
     const cacheVersion = await this.analyticsCache.getVersion(tenantId);
     const cacheKeyPayload = {
-      responseShapeVersion: 2,
+      responseShapeVersion: 3,
+      emptySelection: params.emptySelection === true,
       sourceRevision: 'EXACT_SHOP_POS_COMPONENTS_V1',
+      teamIds,
       activeStores: scopeKey(scopeStores),
       calculationVersion: SALES_CALCULATION_VERSION,
       start: startStr,
@@ -1502,8 +1595,8 @@ export class SalesAnalyticsService {
       'repurchaseSfSdrPos', 'repurchaseFfSdrPos', 'repurchaseIfSdrPos',
     ] as const;
 
-    const allSelected = selectedStoreIds.length === 0;
-    const isSelected = (key: string) => allSelected || selectedStoreIds.includes(key);
+    const allSelected = params.emptySelection !== true && selectedStoreIds.length === 0;
+    const isSelected = (key: string) => params.emptySelection !== true && (allSelected || selectedStoreIds.includes(key));
     const add = (target: Record<string, number>, source: Record<string, any>) => {
       for (const [key, value] of Object.entries(source)) {
         if (typeof value === 'number') target[key] = (target[key] || 0) + value;
@@ -1517,16 +1610,19 @@ export class SalesAnalyticsService {
       await tx.$executeRaw`SET TRANSACTION READ ONLY`;
       const [rows, tenantStores] = await Promise.all([
         tx.reconcileMarketing.findMany({
-          where: { tenantId, date: { gte: prevStartDate_dt, lte: endDate_dt } },
+          where: { tenantId, ...teamWhere, date: { gte: prevStartDate_dt, lte: endDate_dt } },
           select: Object.fromEntries([
             'adId', 'adName', 'mapping', 'shops', 'date', 'updatedAt', ...metricFields,
           ].map(key => [key, true])) as any,
         }) as Promise<Array<Record<string, any>>>,
         tx.posStore.findMany({
           where: activeStoreWhere,
-          select: { id: true, shopId: true, name: true },
+          select: { id: true, shopId: true, name: true, teamId: true },
         }),
       ]);
+      await this.analyticsTeamWhere(tx, tenantId, teamIds);
+      // Team membership belongs to each historical RM/order record. A later
+      // store reassignment must not erase earlier team-owned activity.
       const validStoreIds = new Set(tenantStores.map(store => store.id.toLowerCase()));
       const storeByShopId = new Map<string, string | null>();
       const insertUnique = (map: Map<string, string | null>, key: string, store: string | null | undefined) => {
@@ -1577,10 +1673,10 @@ export class SalesAnalyticsService {
       let zeroCogsOrderCount = 0;
       let orderCount = 0;
       let sourceUpdatedAt: Date | null = null;
-      const shopIds = [...storeByShopId.keys()];
+      const shopIds = [...new Set(tenantStores.map(store => store.shopId))];
       while (shopIds.length) {
         const orders = await tx.posOrder.findMany({
-          where: { tenantId, shopId: { in: shopIds }, dateLocal: { gte: prevStartStr, lte: endStr }, ...(cursor ? { id: { gt: cursor } } : {}) },
+          where: { tenantId, ...teamWhere, shopId: { in: shopIds }, dateLocal: { gte: prevStartStr, lte: endStr }, ...(cursor ? { id: { gt: cursor } } : {}) },
           select: { id: true, shopId: true, posOrderId: true, dateLocal: true, status: true, isVoid: true,
             cod: true, cogs: true, isRepurchase: true, isAbandoned: true, wasAbandonedCart: true, tracking: true, updatedAt: true },
           orderBy: { id: 'asc' }, take: 2000,
@@ -1611,7 +1707,7 @@ export class SalesAnalyticsService {
         if (orders.length < 2000) break;
         cursor = orders[orders.length - 1].id;
       }
-      return { rows, tenantStores, index, dayBuckets, ambiguousOrderCount, zeroCogsOrderCount, orderCount, sourceUpdatedAt };
+      return { rows, tenantStores, index, dayBuckets, scopedShopIds: shopIds, ambiguousOrderCount, zeroCogsOrderCount, orderCount, sourceUpdatedAt };
     }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead, maxWait: 5000, timeout: 60000 });
 
     const { rows, tenantStores, index } = snapshot;
@@ -1677,8 +1773,9 @@ export class SalesAnalyticsService {
     const previousDifferences = differences(sourcePrevious, canonicalPrevious);
     const coverage = {
       basis: 'SAVED_ERP_POS_ORDER_COMPONENTS', adOwnership: 'EXPLICIT_LINK_THEN_UNAMBIGUOUS_HINTS',
-      feeBasis: 'EXISTING_RATES_PER_SHOP_DAY', comparisonScope: 'ACTIVE_TENANT_SHOPS_CURRENT_AND_PREVIOUS',
-      ambiguousShopCount: [...index.storeByShopId.values()].filter(value => !value).length,
+      feeBasis: 'EXISTING_RATES_PER_SHOP_DAY', comparisonScope: teamIds.length ? 'SELECTED_TEAM_RECORDS_CURRENT_AND_PREVIOUS' : 'ACTIVE_TENANT_SHOPS_CURRENT_AND_PREVIOUS',
+      teamIds,
+      ambiguousShopCount: snapshot.scopedShopIds.filter(shop => !index.storeByShopId.get(shop)).length,
       ambiguousOrderCount: snapshot.ambiguousOrderCount, examinedOrderCount: snapshot.orderCount,
       zeroCogsOrderCount: snapshot.zeroCogsOrderCount,
       unattributedAdRows, unattributedAdSpend: money(unattributedAdSpend),
@@ -1716,7 +1813,7 @@ export class SalesAnalyticsService {
     const toggleOpts = { excludeCancel, excludeRestocking, excludeAbandoned, excludeRts, excludeRepurchase };
     const counts = this.computeCounts(agg, toggleOpts, { undelivered: undeliveredOrdersCount, returned: returnedOrdersCount });
     const prevCounts = this.computeCounts(prevAgg, toggleOpts, { undelivered: prevUndeliveredOrdersCount, returned: prevReturnedOrdersCount });
-    const statusDistribution = this.computeStatusDistribution(agg);
+    const statusDistribution = this.computeStatusDistribution(agg, excludeRepurchase);
 
     const storeName = (key: string) =>
       key === UNATTRIBUTED ? 'Unattributed' : storeNameById.get(key) ?? 'Unknown store';
@@ -1733,20 +1830,8 @@ export class SalesAnalyticsService {
         return (b.revenue ?? 0) - (a.revenue ?? 0);
       });
 
-    const deliveryStatuses = [...storeBuckets.entries()].map(([storeKey, sums]) => ({
-      mapping: storeName(storeKey),
-      total_orders: sums.purchasesPos,
-      new_orders: sums.unconfirmedCount,
-      restocking: sums.restockingCount,
-      confirmed: sums.confirmedCount,
-      printed: sums.printedCount,
-      waiting_pickup: sums.waitingPickupCount,
-      shipped: sums.shippedCount,
-      delivered: sums.deliveredCount,
-      rts: sums.rtsCount,
-      canceled: sums.canceledCount,
-      deleted: sums.deletedCount,
-    }));
+    const deliveryStatuses = [...storeBuckets.entries()].map(([storeKey, sums]) =>
+      this.computeDeliveryRow(sums, storeName(storeKey), excludeRepurchase));
 
     // Filter options mirror the product overview's mappings contract so the
     // web picker works unchanged: values are store ids, labels are store names.
@@ -1762,7 +1847,7 @@ export class SalesAnalyticsService {
       prevCounts,
       prevKpis,
       filters: { mappings: optionKeys, mappingsDisplayMap },
-      selected: { start_date: startStr, end_date: endStr, mappings: selectedStoreIds },
+      selected: { start_date: startStr, end_date: endStr, mappings: selectedStoreIds, team_ids: teamIds },
       rangeDays,
       lastUpdatedAt,
       products,

@@ -81,6 +81,43 @@ function calculator() {
 }
 
 describe('Sales analytics product/KPI reporting basis', () => {
+  it.each([true, false])('RTS on/off adjusts COGS once and preserves the independent forecast, repurchase excluded=%s', excludeRepurchase => {
+    const service = calculator();
+    const input = persistedAggregate([
+      { status: 3, cod: 1000, cogs: 300, tracking: true },
+      { status: 4, cod: 700, cogs: 210, tracking: true },
+      { status: 5, cod: 350, cogs: 105, tracking: true, repurchase: true },
+    ], 100);
+    const off = service.computeProductRow(input, { ...defaults, excludeRts: false, excludeRepurchase });
+    const on = service.computeProductRow(input, { ...defaults, excludeRts: true, excludeRepurchase });
+    const kpisOn = service.computeKpis(input, { ...defaults, excludeRts: true, excludeRepurchase });
+    const kpisOff = service.computeKpis(input, { ...defaults, excludeRts: false, excludeRepurchase });
+    expect(on.cogs).toBe(300);
+    expect(off.cogs).toBe(excludeRepurchase ? 510 : 615);
+    expect(kpisOn.cogs_adjusted).toBe(on.cogs);
+    expect(kpisOff.cogs_adjusted).toBe(off.cogs);
+    expect(on.cogs_rts_credit).toBe(0);
+    expect(off.cogs_rts_credit).toBe(excludeRepurchase ? 210 : 315);
+    expect(on.contribution_margin).toBeCloseTo(excludeRepurchase ? 397.6 : 307.6, 8);
+    expect(off.contribution_margin - on.contribution_margin).toBeCloseTo(excludeRepurchase ? 700 : 1050, 8);
+    expect(on.cm_rts_forecast).toBeCloseTo(off.cm_rts_forecast, 8);
+    expect(kpisOn.cm_rts_forecast).toBeCloseTo(on.cm_rts_forecast, 8);
+    expect(on.net_margin).toBe(off.net_margin);
+  });
+
+  it.each([true, false])('status distribution follows the repurchase toggle consistently with its period counts: %s', excludeRepurchase => {
+    const service = calculator(), input = persistedAggregate(orders, 200);
+    const distribution = service.computeStatusDistribution(input, excludeRepurchase);
+    const counts = service.computeCounts(input, { ...defaults, excludeRepurchase });
+    expect(distribution.delivered).toBe(counts.delivered);
+    expect(distribution.rts).toBe(counts.rts);
+    expect(distribution.total).toBe(excludeRepurchase ? 6 : 12);
+    const delivery = service.computeDeliveryRow(input._sum, 'product-a', excludeRepurchase);
+    expect(delivery.total_orders).toBe(distribution.total);
+    expect(delivery.delivered).toBe(distribution.delivered);
+    expect(delivery.rts).toBe(distribution.rts);
+  });
+
   it('excludes repeat delivered revenue together with its costs, rather than keeping a phantom profit', () => {
     const service = calculator();
     const input = persistedAggregate(orders, 200);
@@ -92,9 +129,9 @@ describe('Sales analytics product/KPI reporting basis', () => {
   });
 
   const flagCases = [true, false].flatMap(excludeRepurchase => [true, false].flatMap(excludeCancel =>
-    [true, false].flatMap(excludeRestocking => [true, false].map(excludeRts => ({
-      excludeRepurchase, excludeCancel, excludeRestocking, excludeRts,
-    })))));
+    [true, false].flatMap(excludeRestocking => [true, false].flatMap(excludeAbandoned => [true, false].map(excludeRts => ({
+      excludeRepurchase, excludeCancel, excludeRestocking, excludeAbandoned, excludeRts,
+    }))))));
 
   it.each(flagCases)('keeps additive money and component populations coherent for %j', flags => {
     const service = calculator();
@@ -105,9 +142,10 @@ describe('Sales analytics product/KPI reporting basis', () => {
     const basis = orders.filter(row => !options.excludeRepurchase || !row.repurchase);
     const canceled = basis.filter(row => row.status === 6);
     const restocking = basis.filter(row => row.status === 11);
-    const goodsBasis = basis.filter(row => !(options.excludeCancel && row.status === 6)
-      && !(options.excludeRestocking && row.status === 11));
-    const revenueBasis = goodsBasis.filter(row => !row.abandoned && !(options.excludeRts && rts(row)));
+    const forecastGoodsBasis = basis.filter(row => !(options.excludeCancel && row.status === 6)
+      && !(options.excludeRestocking && row.status === 11) && !(options.excludeAbandoned && row.abandoned));
+    const goodsBasis = forecastGoodsBasis.filter(row => !(options.excludeRts && rts(row)));
+    const revenueBasis = goodsBasis;
 
     expect(product.revenue).toBe(total(revenueBasis, 'cod'));
     expect(product.cogs).toBe(total(goodsBasis, 'cogs'));
@@ -122,7 +160,13 @@ describe('Sales analytics product/KPI reporting basis', () => {
     expect(kpis.cogs_canceled).toBe(product.cogs_canceled);
     expect(kpis.cogs_restocking).toBe(product.cogs_restocking);
     expect(kpis.cogs - (options.excludeCancel ? kpis.cogs_canceled : 0)
-      - (options.excludeRestocking ? kpis.cogs_restocking : 0)).toBe(product.cogs);
+      - (options.excludeRestocking ? kpis.cogs_restocking : 0)
+      - (options.excludeAbandoned ? kpis.cogs_abandoned : 0)
+      - (options.excludeRts ? kpis.cogs_rts : 0)).toBe(product.cogs);
+    expect(kpis.cogs_adjusted).toBe(product.cogs);
+    expect(kpis.cogs_rts_credit).toBe(options.excludeRts ? 0 : total(basis.filter(rts), 'cogs'));
+    expect(product.cogs_rts_credit).toBe(kpis.cogs_rts_credit);
+    expect(product.cogs_forecast_basis).toBe(total(forecastGoodsBasis, 'cogs'));
 
     const products = [
       service.computeProductRow(persistedAggregate(orders.filter(row => !row.repurchase), 120, 'new'), options),
@@ -133,24 +177,29 @@ describe('Sales analytics product/KPI reporting basis', () => {
       expect(product[key]).toBeCloseTo(kpis[key], 8);
     }
     expect(products.reduce((sum, row) => sum + row.cogs_raw, 0)).toBe(kpis.cogs);
+    expect(products.reduce((sum, row) => sum + row.cogs, 0)).toBe(kpis.cogs_adjusted);
 
     // A scenario includes RTS value before applying its forecast percentage,
     // but never includes repeat RTS when repeats have been excluded.
-    const forecastRevenue = total(goodsBasis.filter(row => !row.abandoned), 'cod');
+    const forecastRevenue = total(forecastGoodsBasis, 'cod');
     const fees = basis.filter(row => row.status !== 6).length * 90;
     const deliveredCodFee = total(basis.filter(row => row.status === 3), 'cod') * 0.0224;
     const expectedForecast = forecastRevenue * 0.8 - 200 - fees - deliveredCodFee
-      - total(goodsBasis, 'cogs') + total(basis.filter(rts), 'cogs');
+      - total(forecastGoodsBasis, 'cogs') + total(basis.filter(rts), 'cogs');
+    const selectedCodFee = total(basis.filter(row => row.status !== 6 && !rts(row)), 'cod') * 0.0224;
+    const expectedCm = total(revenueBasis, 'cod') - total(goodsBasis, 'cogs') - fees - 200 - selectedCodFee
+      + (options.excludeRts ? 0 : total(basis.filter(rts), 'cogs'));
+    expect(product.contribution_margin).toBeCloseTo(expectedCm, 8);
     expect(kpis.cm_rts_forecast).toBeCloseTo(expectedForecast, 8);
   });
 
   it('does not let the live RTS-exclusion toggle reintroduce repeat RTS into the scenario', () => {
     const service = calculator();
     const input = persistedAggregate(orders, 200);
-    // Forecast: 80%×2500 − ads200 − fees450 − deliveredCODfee22.40 − COGS825 + RTS210.
-    expect(service.computeKpis(input, defaults).cm_rts_forecast).toBeCloseTo(712.6, 8);
-    expect(service.computeProductRow(input, defaults).cm_rts_forecast).toBeCloseTo(712.6, 8);
-    expect(service.computeKpis(input, { ...defaults, excludeRts: false }).cm_rts_forecast).toBeCloseTo(712.6, 8);
+    // Forecast: 80%×2500 − ads200 − fees450 − deliveredCODfee22.40 − COGS750 + RTS210.
+    expect(service.computeKpis(input, defaults).cm_rts_forecast).toBeCloseTo(787.6, 8);
+    expect(service.computeProductRow(input, defaults).cm_rts_forecast).toBeCloseTo(787.6, 8);
+    expect(service.computeKpis(input, { ...defaults, excludeRts: false }).cm_rts_forecast).toBeCloseTo(787.6, 8);
   });
 
   it('retains entered ERP costs without inferring a higher cost from the sales amount', () => {
@@ -209,7 +258,7 @@ function responseFixture() {
     return row[key] === value;
   });
   const projections: Array<{ kind: string; where: any }> = [];
-  const sums = persistedAggregate(orders, 200)._sum;
+  const sums: Record<string, number> = persistedAggregate(orders, 200)._sum;
   let aggregateQueries = 0;
   const prisma = {
     posStore: { findMany: async () => [{ id: storeId, shopId, name: 'Fixture Store' }] },
@@ -225,18 +274,28 @@ function responseFixture() {
       count: async ({ where }: any) => { projections.push({ kind: 'count', where }); return posRows.filter(row => matches(row, where)).length; },
     },
     reconcileSales: {
-      aggregate: async (args: any) => { aggregateQueries++; return args._max ? { _max: { updatedAt: null } } : { _sum: sums }; },
+      aggregate: async (args: any) => { aggregateQueries++; return args._max ? { _max: { updatedAt: null } } : { _sum: args.where?.id?.in?.length === 0 ? {} : sums }; },
       findMany: async () => [], count: async () => 0,
       groupBy: async () => [{ mapping: 'product-a', _sum: sums }],
     },
     reconcileMarketing: {
-      aggregate: async (args: any) => { aggregateQueries++; return args._max ? { _max: { updatedAt: null } } : { _sum: sums }; },
-      count: async () => 0, groupBy: async () => [{ mapping: 'product-a', _sum: sums }],
+      aggregate: async (args: any) => { aggregateQueries++; return args._max ? { _max: { updatedAt: null } } : { _sum: args.where?.id?.in?.length === 0 ? {} : sums }; },
+      count: async () => 0, groupBy: async (args: any) => args.where?.id?.in?.length === 0 ? [] : [{ mapping: 'product-a', _sum: sums }],
       findMany: async () => {
       aggregateQueries++;
       return ['2026-10-09', '2026-10-10'].map(date => ({ ...sums, adId: 'ad-a', shops: [shopId], date: new Date(`${date}T00:00:00Z`), mapping: 'product-a' }));
     } },
-    $queryRaw: async () => [],
+    $queryRaw: async (query: any) => {
+      if (query.sql.includes('AS "targetRows"') && query.sql.includes('AND FALSE')) return [{ targetRows: '0', witnessRows: '0', members: '0', payloadBytes: '0' }];
+      if (query.sql.includes('AS "targetRows"')) return [{ targetRows: '2', witnessRows: '2', members: '12', payloadBytes: '1000' }];
+      if (query.sql.includes('sum(abandoned_cost)')) return ['current', 'previous'].map(period => ({
+        period, mapping: 'product-a', invalidRows: '0',
+        currentAbandonedCount: String(sums.currentAbandonedCount), repurchaseCurrentAbandonedCount: String(sums.repurchaseCurrentAbandonedCount),
+        currentAbandonedCodPos: String(sums.currentAbandonedCodPos), repurchaseCurrentAbandonedCodPos: String(sums.repurchaseCurrentAbandonedCodPos),
+        cogsCurrentAbandonedPos: String(sums.cogsCurrentAbandonedPos), repurchaseCogsCurrentAbandonedPos: String(sums.repurchaseCogsCurrentAbandonedPos),
+      }));
+      return [];
+    },
     $executeRaw: async () => 0,
     $transaction: async (operation: any) => operation(prisma),
   };
@@ -307,7 +366,7 @@ describe('Sales analytics response source scopes and calculation cache revision'
     expect(response.products[0].cogs_raw).toBe(1095);
     expect(response.products[0].cogs_canceled).toBe(120);
     expect(response.products[0].abandoned_cod).toBe(250);
-    expect(response.products[0].cm_rts_forecast).toBeCloseTo(712.6, 8);
+    expect(response.products[0].cm_rts_forecast).toBeCloseTo(787.6, 8);
     } else {
       expect(response.products[0].cogs_raw).toBe(0);
       expect(response.coverage.basis).toBe('SAVED_ERP_POS_ORDER_COMPONENTS');
@@ -318,5 +377,18 @@ describe('Sales analytics response source scopes and calculation cache revision'
     expect(await read()).toBe(response);
     expect(fixture.aggregateQueries()).toBe(queries);
     expect(fixture.projections).toHaveLength(projections);
+  });
+});
+
+
+describe('Business Performance explicit empty selection', () => {
+  it.each(['getOverview', 'getStoreOverview'])('%s returns no selected rows or monetary totals even with a contradictory mapping', async method => {
+    const f = responseFixture();
+    const response = await (f.service as any)[method]({ startDate: '2026-10-10', endDate: '2026-10-10',
+      emptySelection: true, mappings: method === 'getStoreOverview' ? [f.storeId] : ['product-a'] });
+    expect(response.products).toEqual([]);
+    expect(response.kpis.revenue).toBe(0);
+    expect(response.kpis.cogs_adjusted).toBe(0);
+    expect(response.counts.purchases).toBe(0);
   });
 });

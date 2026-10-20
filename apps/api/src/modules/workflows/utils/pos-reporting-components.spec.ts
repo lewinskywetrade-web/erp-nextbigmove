@@ -23,6 +23,8 @@ describe('Canonical saved ERP POS components', () => {
     expect(bucket.cogsRtsPos).toBe(82);
     expect(bucket.deletedCount).toBe(2);
     expect(bucket.currentAbandonedCount).toBe(2);
+    expect(bucket.cogsCurrentAbandonedPos).toBe(41);
+    expect(bucket.repurchaseCogsCurrentAbandonedPos).toBe(20.5);
     expect(bucket.abandonedCount).toBe(4);
     expect(calculatePosFees(bucket)).toMatchObject({ sf: 1200, ff: 500, inf: 100,
       sfSdr: 480, repurchaseSfSdr: 240, codFee: 35.9296, repurchaseCodFee: 17.9648 });

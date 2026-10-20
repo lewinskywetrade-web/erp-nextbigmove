@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, Headers, BadRequestException, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { TenantGuard } from '../../common/guards/tenant.guard';
 import { PermissionsGuard } from '../../common/guards/permissions.guard';
@@ -9,6 +9,14 @@ import { SalesAnalyticsService } from './sales-analytics.service';
 @UseGuards(JwtAuthGuard, TenantGuard, PermissionsGuard)
 export class SalesAnalyticsController {
   constructor(private readonly salesAnalyticsService: SalesAnalyticsService) {}
+
+  private requestedTeams(value?: string): string[] {
+    if (value === undefined || value === '') return [];
+    if (typeof value !== 'string' || value.length > 4096) throw new BadRequestException('Select valid tenant teams.');
+    const ids = value.split(',').map(id => id.trim()).filter(Boolean);
+    if (!ids.length) throw new BadRequestException('Select valid tenant teams.');
+    return ids;
+  }
 
   @Get('overview')
   @Permissions('analytics.sales')
@@ -23,6 +31,8 @@ export class SalesAnalyticsController {
     @Query('exclude_repurchase') excludeRepurchase?: string,
     @Query('include_tax_12') includeTax12?: string,
     @Query('include_tax_1') includeTax1?: string,
+    @Query('mapping_selection') mappingSelection?: string,
+    @Headers('x-team-id') teamHeader?: string,
   ) {
     const mappings = Array.isArray(mapping)
       ? mapping
@@ -38,6 +48,8 @@ export class SalesAnalyticsController {
       startDate,
       endDate,
       mappings,
+      emptySelection: mappingSelection === 'none',
+      teamIds: this.requestedTeams(teamHeader),
       excludeCancel: parseBool(excludeCancel, true),
       excludeRestocking: parseBool(excludeRestocking, true),
       excludeAbandoned: parseBool(excludeAbandoned, true),
@@ -61,6 +73,8 @@ export class SalesAnalyticsController {
     @Query('exclude_repurchase') excludeRepurchase?: string,
     @Query('include_tax_12') includeTax12?: string,
     @Query('include_tax_1') includeTax1?: string,
+    @Query('mapping_selection') mappingSelection?: string,
+    @Headers('x-team-id') teamHeader?: string,
   ) {
     const mappings = Array.isArray(mapping) ? mapping : mapping ? [mapping] : [];
     const parseBool = (val: string | undefined, defaultVal = true) => {
@@ -71,6 +85,8 @@ export class SalesAnalyticsController {
       startDate,
       endDate,
       mappings,
+      emptySelection: mappingSelection === 'none',
+      teamIds: this.requestedTeams(teamHeader),
       excludeCancel: parseBool(excludeCancel, true),
       excludeRestocking: parseBool(excludeRestocking, true),
       excludeAbandoned: parseBool(excludeAbandoned, true),

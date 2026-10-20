@@ -6,6 +6,8 @@ import { AnalyticsRequestCoordinatorService } from './analytics-request-coordina
 const tenantId = 'tenant-a';
 const current = '2026-10-10';
 const previous = '2026-10-09';
+const teamA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const teamB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const stores = [
   { id: 'store-a', shopId: 'shop-a', name: 'A', tenantId, status: 'ACTIVE', enabled: true },
   { id: 'store-b', shopId: 'shop-b', name: 'B', tenantId, status: 'ACTIVE', enabled: null },
@@ -50,17 +52,19 @@ function fixture(options: { orders?: any[]; rows?: any[]; links?: any[]; extraSt
     order('14', 'shop-a', 3, 800, 80, { dateLocal: previous }),
     order('15', 'shop-b', 5, 400, 40, { dateLocal: previous }),
   ];
-  const rows = options.rows || [
+  const rows: any[] = options.rows || [
     { tenantId, date: new Date(current), adId: 'shared-ad', adName: '', mapping: 'one-label', shops: ['shop-b', 'shop-a'],
       spend: 150, leads: 30, codPos: 4500, cogsPos: 1260, updatedAt: new Date('2026-10-10T12:00:00Z') },
     { tenantId, date: new Date(previous), adId: 'shared-ad', adName: '', mapping: 'one-label', shops: ['shop-a', 'shop-b'], spend: 50, leads: 10 },
   ];
   const links = options.links || [{ adId: 'shared-ad', creative: { tenantId, storeConfig: { tenantId, storeId: 'store-a' } } }];
-  const allStores = [...stores.map(store => ({ ...store })), ...(options.extraStores || [])];
+  const allStores: any[] = [...stores.map(store => ({ ...store })), ...(options.extraStores || [])];
+  const allTeams = [{ id: teamA, tenantId, status: 'ACTIVE' }, { id: teamB, tenantId, status: 'ACTIVE' }];
   const queries: any[] = [];
   const sums = (values: any[], fields: any) => Object.fromEntries(Object.keys(fields).map(field => [field,
     values.reduce((sum, row) => sum + Number(row[field] || 0), 0)]));
   const prisma: any = {
+    team: { findMany: jest.fn(async ({ where }: any) => allTeams.filter(row => matches(row, where))) },
     posStore: { findMany: jest.fn(async ({ where }: any) => allStores.filter(row => matches(row, where))) },
     posProduct: { findMany: async () => [] },
     creativeMetaAdLink: { findMany: async () => links }, creative: { findMany: async () => [] },
@@ -103,10 +107,10 @@ function fixture(options: { orders?: any[]; rows?: any[]; links?: any[]; extraSt
     getVersion: async () => 1,
     hashObject: (payload: any) => {
       payloads.push(payload);
-      if (payload.responseShapeVersion === 8 || payload.responseShapeVersion === 2) {
+      if (payload.responseShapeVersion === 9 || payload.responseShapeVersion === 3) {
         const { sourceRevision: _source, readConsistency: _consistency, activeStores: _stores, ...old } = payload;
-        old.responseShapeVersion = payload.responseShapeVersion === 8 ? 7 : 1;
-        const namespace = payload.responseShapeVersion === 8 ? 'sales' : 'sales-stores';
+        old.responseShapeVersion = payload.responseShapeVersion === 9 ? 8 : 2;
+        const namespace = payload.responseShapeVersion === 9 ? 'sales' : 'sales-stores';
         const key = `analytics:${tenantId}:1:${namespace}:${hash(old)}`;
         legacyKeys.add(key);
         entries.set(key, { kpis: { cogs: 999999 } });
@@ -119,7 +123,7 @@ function fixture(options: { orders?: any[]; rows?: any[]; links?: any[]; extraSt
   const service = new SalesAnalyticsService(prisma, { getTenantId: () => tenantId,
     buildTenantWhereClause: (where: any) => ({ ...where, tenantId }) } as any, cache as any,
   (options.coordinator || { run: async (_tenant: string, _key: string, operation: any) => operation() }) as any, {} as any, {} as any, {} as any);
-  return { service, prisma, queries, entries, payloads, requestKeys, legacyKeys, allStores, orders, rows };
+  return { service, prisma, queries, entries, payloads, requestKeys, legacyKeys, allStores, allTeams, orders, rows };
 }
 
 const params = { startDate: current, endDate: current };
@@ -130,8 +134,8 @@ describe('Exact Store POS components with independent ad ownership', () => {
     const response = await f.service.getStoreOverview(params);
     const a = response.products.find(row => row.store_id === 'store-a')!;
     const b = response.products.find(row => row.store_id === 'store-b')!;
-    expect([a.revenue, a.cogs_raw, a.cogs, a.ad_spend]).toEqual([1000, 150, 130, 150]);
-    expect([b.revenue, b.cogs_raw, b.cogs, b.ad_spend]).toEqual([2000, 1050, 970, 0]);
+    expect([a.revenue, a.cogs_raw, a.cogs, a.ad_spend]).toEqual([1000, 150, 100, 150]);
+    expect([b.revenue, b.cogs_raw, b.cogs, b.ad_spend]).toEqual([2000, 1050, 900, 0]);
     expect(response.kpis.revenue).toBe(3000);
     expect(response.kpis.cogs).toBe(1200); // raw non-repeat; lifecycle components stay explicit
     expect(response.kpis.cogs_canceled).toBe(20);
@@ -167,7 +171,7 @@ describe('Exact Store POS components with independent ad ownership', () => {
       excludeAbandoned: exclude, excludeRts: exclude, excludeRepurchase: false });
     expect(response.kpis.revenue).toBe(exclude ? 3300 : 4500);
     const sourceCogs = response.products.reduce((sum, row) => sum + row.cogs, 0);
-    expect(sourceCogs).toBe(exclude ? 1160 : 1260);
+    expect(sourceCogs).toBe(exclude ? 1060 : 1260);
     expect(response.counts.delivered).toBe(3);
     expect(response.counts.undelivered).toBe(1);
   });
@@ -234,12 +238,57 @@ describe('Exact Store POS components with independent ad ownership', () => {
     const f = fixture();
     const first = await f.service.getStoreOverview(params);
     expect(await f.service.getStoreOverview(params)).toBe(first);
-    expect(f.payloads.find(payload => payload.responseShapeVersion === 2)).toMatchObject({ sourceRevision: 'EXACT_SHOP_POS_COMPONENTS_V1' });
+    expect(f.payloads.find(payload => payload.responseShapeVersion === 3)).toMatchObject({ sourceRevision: 'EXACT_SHOP_POS_COMPONENTS_V1' });
     expect(f.requestKeys.every(key => !f.legacyKeys.has(key))).toBe(true);
     f.allStores.find(store => store.id === 'store-b')!.enabled = false;
     const revised = await f.service.getStoreOverview(params);
     expect(revised.products.some(row => row.store_id === 'store-b')).toBe(false);
     expect(f.requestKeys[0]).not.toBe(f.requestKeys[f.requestKeys.length - 1]);
+  });
+
+  it('uses the recorded order/ad team after a store moves, and includes unassigned records only in All', async () => {
+    const base = { tenantId, shopId: 'shop-a', dateLocal: current, status: 3, isVoid: false, isRepurchase: false,
+      isAbandoned: false, wasAbandonedCart: false, updatedAt: new Date('2026-10-11T01:00:00Z') };
+    const f = fixture({ orders: [
+      { ...base, id: '01', posOrderId: '01', teamId: teamA, cod: 1000, cogs: 100 },
+      { ...base, id: '02', posOrderId: '02', teamId: teamB, cod: 700, cogs: 70 },
+      { ...base, id: '03', posOrderId: '03', teamId: null, cod: 300, cogs: 30 },
+    ], rows: [{ tenantId, teamId: teamA, date: new Date(current), adId: 'shared-ad', mapping: 'old-team-ad',
+      shops: ['shop-a'], spend: 50, purchasesPos: 1, codPos: 1000, cogsPos: 100, deliveredCount: 1,
+      deliveredCodPos: 1000, cogsDeliveredPos: 100 }] });
+    f.allStores.find(store => store.id === 'store-a')!.teamId = teamB;
+    const a = await f.service.getStoreOverview({ ...params, teamIds: [teamA] });
+    expect(a.products.find(row => row.store_id === 'store-a')).toMatchObject({ revenue: 1000, cogs: 100, ad_spend: 50 });
+    expect(a.kpis.revenue).toBe(1000);
+    expect(f.queries[0].where.teamId).toEqual({ in: [teamA] });
+    expect(a.coverage.comparisonScope).toBe('SELECTED_TEAM_RECORDS_CURRENT_AND_PREVIOUS');
+    const b = await f.service.getStoreOverview({ ...params, teamIds: [teamB] });
+    expect(b.kpis.revenue).toBe(700);
+    expect(b.kpis.ad_spend).toBe(0);
+    expect((await f.service.getStoreOverview(params)).kpis.revenue).toBe(2000);
+    const product = await f.service.getOverview({ ...params, teamIds: [teamA] });
+    expect(product.kpis.revenue).toBe(1000);
+    expect(product.kpis.processed).toBe(1000);
+    expect(product.products[0].mapping).toBe('old-team-ad');
+  });
+
+  it('keeps a conflicting other-team shop as a negative ownership witness', async () => {
+    const f = fixture({ extraStores: [{ ...stores[0], id: 'duplicate-store', teamId: teamB }] });
+    f.orders.forEach(order => { order.teamId = teamA; });
+    f.rows.forEach(row => { row.teamId = teamA; });
+    const response = await f.service.getStoreOverview({ ...params, teamIds: [teamA] });
+    expect(response.coverage.ambiguousShopCount).toBe(1);
+    expect(response.products.find(row => row.store_id === null)!.revenue).toBe(1000);
+    expect(response.products.find(row => row.store_id === 'store-a')!.revenue).toBe(0);
+  });
+
+  it.each(['getOverview', 'getStoreOverview'])('%s validates active tenant teams even if a previously valid scope is cached', async method => {
+    const f = fixture();
+    await (f.service as any)[method]({ ...params, teamIds: [teamA] });
+    f.allTeams[0].status = 'INACTIVE';
+    await expect((f.service as any)[method]({ ...params, teamIds: [teamA] })).rejects.toThrow('Selected teams must be active teams in this tenant.');
+    await expect((f.service as any)[method]({ ...params, teamIds: ['cccccccc-cccc-4ccc-8ccc-cccccccccccc'] })).rejects.toThrow('Selected teams must be active teams in this tenant.');
+    await expect((f.service as any)[method]({ ...params, teamIds: ['not-a-uuid'] })).rejects.toThrow('Select valid tenant teams.');
   });
 
   it('coalesces identical Store requests and bounds different selections through the existing tenant coordinator', async () => {
@@ -291,7 +340,7 @@ describe('Product mapping reporting reads per-ad evidence, not lossy campaign ro
     expect([response.prevKpis.revenue, response.prevKpis.cogs, response.prevKpis.ad_spend]).toEqual([1300, 330, 65]);
     expect(response.products.reduce((sum, row) => sum + row.revenue, 0)).toBe(response.kpis.revenue);
     expect(response.products.reduce((sum, row) => sum + row.net_margin, 0)).toBe(response.kpis.net_margin);
-    expect(f.payloads.some(payload => payload.responseShapeVersion === 8 && payload.sourceRevision === 'PER_AD_MAPPING_V1')).toBe(true);
+    expect(f.payloads.some(payload => payload.responseShapeVersion === 9 && payload.sourceRevision === 'PER_AD_MAPPING_V1')).toBe(true);
   });
 
   it('applies the selected mapping to both periods and cannot reuse the former campaign cache', async () => {
