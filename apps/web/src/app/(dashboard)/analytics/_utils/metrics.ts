@@ -23,7 +23,7 @@ export function formatMetricValue(
 }
 
 export function formatDeltaPercent(current: number, previous: number) {
-  if (!Number.isFinite(previous) || previous === 0) {
+  if (!Number.isFinite(current) || !Number.isFinite(previous) || previous === 0) {
     return null;
   }
   return ((current - previous) / Math.abs(previous)) * 100;

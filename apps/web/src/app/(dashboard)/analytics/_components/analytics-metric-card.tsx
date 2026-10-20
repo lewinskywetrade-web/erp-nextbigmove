@@ -11,6 +11,7 @@ export type AnalyticsMetricFormat = 'currency' | 'number' | 'percent';
 
 type MetricCount = {
   value: number;
+  precision?: number;
   delta?: number | null;
   percentage?: number | null;
   label?: string;
@@ -32,8 +33,8 @@ type AnalyticsMetricCardProps = {
   loading?: boolean;
 };
 
-const formatCountValue = (value: number) =>
-  new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(value || 0);
+const formatCountValue = (value: number, precision = 0) =>
+  Number.isFinite(value) ? new Intl.NumberFormat('en-US', { maximumFractionDigits: precision }).format(value) : '—';
 
 const formatDeltaLabel = (value: number | null | undefined) => {
   if (value === null || value === undefined) return '--';
@@ -142,7 +143,7 @@ export function AnalyticsMetricCard({
         <div className="mt-1 flex items-center justify-between">
           <span className="text-sm text-slate-700">
             <span className="font-normal text-foreground/80">{count.label ?? 'ord'}:</span>{' '}
-            {loading ? <Spinner className="h-3 w-3 text-foreground/40" /> : <span className="font-semibold text-foreground">{formatCountValue(count.value)}</span>}
+            {loading ? <Spinner className="h-3 w-3 text-foreground/40" /> : <span className="font-semibold text-foreground">{formatCountValue(count.value, count.precision)}</span>}
           </span>
           {count.percentage !== undefined ? (
             <span className="text-xs font-medium text-muted">

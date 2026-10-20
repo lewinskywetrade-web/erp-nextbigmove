@@ -60,6 +60,7 @@ type AnalyticsSalesProductsTableProps = {
   isLoading: boolean;
   /** First-column header: 'Product' on the product tab, 'Store' on the store tab. */
   entityLabel?: string;
+  reportView?: 'actual' | 'forecast';
   productStart: number;
   productEnd: number;
   totalProducts: number;
@@ -112,6 +113,7 @@ function AnalyticsSalesProductsTableEmptyRow({ colSpan, message }: { colSpan: nu
 export function AnalyticsSalesProductsTable({
   isLoading,
   entityLabel = 'Product',
+  reportView = 'actual',
   productStart,
   productEnd,
   totalProducts,
@@ -128,6 +130,8 @@ export function AnalyticsSalesProductsTable({
   totals,
   renderSortLabel,
 }: AnalyticsSalesProductsTableProps) {
+  const isForecast = reportView === 'forecast';
+  const colCount = isForecast ? 13 : 15;
   return (
     <AnalyticsTableShell
       summaryLabel={`Showing ${productStart}-${productEnd} of ${totalProducts}`}
@@ -149,13 +153,13 @@ export function AnalyticsSalesProductsTable({
                 {renderSortLabel(entityLabel, 'product')}
               </th>
               <th className="px-3 py-3 text-center text-xs font-semibold uppercase whitespace-nowrap text-slate-500 dark:text-slate-300 sm:px-4 lg:px-6">
-                {renderSortLabel('Gross Revenue', 'revenue')}
+                {renderSortLabel(isForecast ? 'Forecast Revenue' : 'Gross Revenue', 'revenue')}
               </th>
               <th className="px-3 py-3 text-center text-xs font-semibold uppercase whitespace-nowrap text-slate-500 dark:text-slate-300 sm:px-4 lg:px-6">
-                {renderSortLabel('Gross Sales', 'gross_sales')}
+                {renderSortLabel(isForecast ? 'Expected Deliveries' : 'Gross Sales', 'gross_sales')}
               </th>
               <th className="px-3 py-3 text-center text-xs font-semibold uppercase whitespace-nowrap text-slate-500 dark:text-slate-300 sm:px-4 lg:px-6">
-                {renderSortLabel('COGS', 'cogs')}
+                {renderSortLabel(isForecast ? 'Forecast COGS' : 'COGS', 'cogs')}
               </th>
               <th className="px-3 py-3 text-center text-xs font-semibold uppercase whitespace-nowrap text-slate-500 dark:text-slate-300 sm:px-4 lg:px-6">
                 {renderSortLabel('AOV', 'aov')}
@@ -163,9 +167,9 @@ export function AnalyticsSalesProductsTable({
               <th className="px-3 py-3 text-center text-xs font-semibold uppercase whitespace-nowrap text-slate-500 dark:text-slate-300 sm:px-4 lg:px-6">
                 {renderSortLabel('CPP', 'cpp')}
               </th>
-              <th className="px-3 py-3 text-center text-xs font-semibold uppercase whitespace-nowrap text-slate-500 dark:text-slate-300 sm:px-4 lg:px-6">
+              {!isForecast && <th className="px-3 py-3 text-center text-xs font-semibold uppercase whitespace-nowrap text-slate-500 dark:text-slate-300 sm:px-4 lg:px-6">
                 {renderSortLabel('Processed CPP', 'processed_cpp')}
-              </th>
+              </th>}
               <th className="px-3 py-3 text-center text-xs font-semibold uppercase whitespace-nowrap text-slate-500 dark:text-slate-300 sm:px-4 lg:px-6">
                 {renderSortLabel('Ad Spend', 'ad_spend')}
               </th>
@@ -173,25 +177,25 @@ export function AnalyticsSalesProductsTable({
                 {renderSortLabel('AR %', 'ar_pct')}
               </th>
               <th className="px-3 py-3 text-center text-xs font-semibold uppercase whitespace-nowrap text-slate-500 dark:text-slate-300 sm:px-4 lg:px-6">
-                {renderSortLabel('RTS %', 'rts_pct')}
+                {renderSortLabel(isForecast ? 'Assumed RTS %' : 'RTS %', 'rts_pct')}
               </th>
               <th className="px-3 py-3 text-center text-xs font-semibold uppercase whitespace-nowrap text-slate-500 dark:text-slate-300 sm:px-4 lg:px-6">
                 {renderSortLabel('P.E %', 'profit_efficiency')}
               </th>
               <th className="px-3 py-3 text-center text-xs font-semibold uppercase whitespace-nowrap text-slate-500 dark:text-slate-300 sm:px-4 lg:px-6">
-                {renderSortLabel('Contribution Margin', 'contribution_margin')}
+                {renderSortLabel(isForecast ? 'Forecast CM' : 'Contribution Margin', 'contribution_margin')}
               </th>
-              <th className="px-3 py-3 text-center text-xs font-semibold uppercase whitespace-nowrap text-slate-500 dark:text-slate-300 sm:px-4 lg:px-6">
+              {!isForecast && <th className="px-3 py-3 text-center text-xs font-semibold uppercase whitespace-nowrap text-slate-500 dark:text-slate-300 sm:px-4 lg:px-6">
                 {renderSortLabel(`CM (RTS ${rtsForecastSafe}% )`, 'cm_rts_forecast')}
-              </th>
+              </th>}
               <th className="px-3 py-3 text-center text-xs font-semibold uppercase whitespace-nowrap text-slate-500 dark:text-slate-300 sm:px-4 lg:px-6">
-                {renderSortLabel('Net Margin', 'net_margin')}
+                {renderSortLabel(isForecast ? 'Forecast Net (before overhead)' : 'Net Margin', 'net_margin')}
               </th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100 bg-white dark:divide-border dark:bg-surface">
             {isLoading ? (
-              <AnalyticsSalesProductsTableLoadingRows colCount={15} />
+              <AnalyticsSalesProductsTableLoadingRows colCount={colCount} />
             ) : (
               rows.map((item, idx) => {
                 const { row, derived } = item;
@@ -216,30 +220,30 @@ export function AnalyticsSalesProductsTable({
                       {toTitleCase(display)}
                     </td>
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.revenue, 'currency')}</td>
-                    <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.gross_sales, 'number', 0)}</td>
+                    <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.gross_sales, 'number', isForecast ? 2 : 0)}</td>
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.cogs, 'currency')}</td>
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.aov, 'currency')}</td>
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.cpp, 'currency')}</td>
-                    <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.processed_cpp, 'currency')}</td>
+                    {!isForecast && <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.processed_cpp, 'currency')}</td>}
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.ad_spend, 'currency')}</td>
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.ar_pct, 'percent', 1)}</td>
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(rtsPct, 'percent', 1)}</td>
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.profit_efficiency, 'percent', 1)}</td>
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.contribution_margin, 'currency')}</td>
-                    <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">
+                    {!isForecast && <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">
                       <span
                         title={`CM (RTS ${rtsForecastSafe}%): ${(formatMetricValue(forecast.revenueAfterRts,'currency'))} - ${(formatMetricValue(row.ad_spend ?? 0,'currency'))} - ${(formatMetricValue(sf,'currency'))} - ${(formatMetricValue(ff,'currency'))} - ${(formatMetricValue(iF,'currency'))} - ${(formatMetricValue(codFeeDelivered,'currency'))} - ${(formatMetricValue(cogsAdjusted,'currency'))} + ${(formatMetricValue(cogsRts,'currency'))} = ${(formatMetricValue(forecast.cmForecast,'currency'))}`}
                       >
                         {formatMetricValue(forecast.cmForecast, 'currency')}
                       </span>
-                    </td>
+                    </td>}
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.net_margin, 'currency')}</td>
                   </tr>
                 );
               })
             )}
             {!isLoading && sourceCount === 0 ? (
-              <AnalyticsSalesProductsTableEmptyRow colSpan={15} message="No products found for this range." />
+              <AnalyticsSalesProductsTableEmptyRow colSpan={colCount} message="No products found for this range." />
             ) : null}
           </tbody>
           {!isLoading && sourceCount > 0 && totals ? (
@@ -250,17 +254,17 @@ export function AnalyticsSalesProductsTable({
                   Total
                 </td>
                 <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.revenue, 'currency')}</td>
-                <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.grossSales, 'number', 0)}</td>
+                <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.grossSales, 'number', isForecast ? 2 : 0)}</td>
                 <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.cogs, 'currency')}</td>
                 <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.aov, 'currency')}</td>
                 <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.cpp, 'currency')}</td>
-                <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.processedCpp, 'currency')}</td>
+                {!isForecast && <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.processedCpp, 'currency')}</td>}
                 <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.adSpend, 'currency')}</td>
                 <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.arPct, 'percent', 1)}</td>
                 <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.rtsPct, 'percent', 1)}</td>
                 <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.profitEfficiency, 'percent', 1)}</td>
                 <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.contributionMargin, 'currency')}</td>
-                <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.cmRtsForecast, 'currency')}</td>
+                {!isForecast && <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.cmRtsForecast, 'currency')}</td>}
                 <td className="px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6">{formatMetricValue(totals.netMargin, 'currency')}</td>
               </tr>
             </tfoot>

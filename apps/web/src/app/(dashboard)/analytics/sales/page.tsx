@@ -68,6 +68,9 @@ import {
   buildSalesProductForecast,
   getSafeRtsForecastPct,
 } from '../_utils/sales-forecast';
+import {
+  forecastSalesKpis, forecastSalesProduct, forecastKpiValues, forecastProductValues, observedCodFeeRate,
+} from '../_utils/sales-report-forecast';
 
 const Datepicker = dynamic(() => import('react-tailwindcss-datepicker'), { ssr: false });
 
@@ -147,6 +150,9 @@ export default function SalesAnalyticsPage() {
   const [includeTax12, setIncludeTax12] = useState(true);
   const [includeTax1, setIncludeTax1] = useState(true);
   const [rtsForecastPct, setRtsForecastPct] = useState<number>(20);
+  const [rtsForecastInput, setRtsForecastInput] = useState('20');
+  const [reportView, setReportView] = useState<'actual' | 'forecast'>('actual');
+  const isForecastView = reportView === 'forecast';
   const filterMenuRef = useRef<HTMLDivElement | null>(null);
   const filterMenuContentRef = useRef<HTMLDivElement | null>(null);
   const fetchDataRef = useRef<((opts?: { silent?: boolean }) => Promise<void>) | null>(null);
@@ -460,8 +466,10 @@ export default function SalesAnalyticsPage() {
     excludeAbandoned: excludeAbandoned,
     excludeRts,
   };
+  const currentProjection = data ? forecastSalesKpis(data.kpis, data.counts, forecastOptions, rtsForecastSafe) : null;
+  const previousProjection = data ? forecastSalesKpis(data.prevKpis, data.prevCounts, forecastOptions, rtsForecastSafe) : null;
   const computedKpis = data
-    ? {
+    ? isForecastView && currentProjection ? forecastKpiValues(data.kpis, currentProjection) : {
         ...data.kpis,
         rts_pct: computeRtsPctFromCounts(data.counts),
         cm_rts_forecast: buildSalesKpiForecast(
@@ -470,7 +478,7 @@ export default function SalesAnalyticsPage() {
       }
     : null;
   const computedPrevKpis = data
-    ? {
+    ? isForecastView && previousProjection ? forecastKpiValues(data.prevKpis, previousProjection) : {
         ...data.prevKpis,
         rts_pct: computeRtsPctFromCounts(data.prevCounts),
         cm_rts_forecast: buildSalesKpiForecast(
@@ -480,14 +488,21 @@ export default function SalesAnalyticsPage() {
     : null;
 
   const products = data?.products || [];
-  const sortableProducts: SalesProductRowItem[] = products.map((row, index) => {
+  const selectedCodFeeRate = data ? observedCodFeeRate(data.kpis) : Number.NaN;
+  const sortableProducts: SalesProductRowItem[] = products.map((actualRow, index) => {
+    const projection = isForecastView ? forecastSalesProduct(actualRow, forecastOptions, rtsForecastSafe, selectedCodFeeRate) : null;
+    const row = projection ? forecastProductValues(actualRow, projection) : actualRow;
     const norm = (row.mapping || '__null__').toLowerCase();
     const display = row.mapping ? (mappingDisplayMap[norm] || row.mapping) : 'Unassigned';
-    const forecast = buildSalesProductForecast(row, forecastOptions, rtsForecastSafe);
+    const forecast = projection ? {
+      revenueAfterRts: projection.revenue, cmForecast: projection.margin,
+      sf: projection.shipping, ff: projection.fulfillment, iF: projection.ifFees,
+      codFeeDelivered: projection.codFees, cogsAdjusted: projection.cogs, cogsRts: 0,
+    } : buildSalesProductForecast(row, forecastOptions, rtsForecastSafe);
     const { sf, ff, iF, codFeeDelivered, cogsAdjusted, cogsRts } = forecast;
     const deliveredCount = row.delivered_count ?? 0;
     const rtsCount = row.rts_count ?? 0;
-    const rtsPct = deliveredCount + rtsCount > 0 ? (rtsCount / (deliveredCount + rtsCount)) * 100 : 0;
+    const rtsPct = isForecastView ? rtsForecastSafe : deliveredCount + rtsCount > 0 ? (rtsCount / (deliveredCount + rtsCount)) * 100 : 0;
     return {
       row,
       index,
@@ -551,6 +566,10 @@ export default function SalesAnalyticsPage() {
           const bStr = String(bv);
           return (sortDir === 'asc' ? 1 : -1) * aStr.localeCompare(bStr);
         }
+        if (!Number.isFinite(av) || !Number.isFinite(bv)) {
+          if (!Number.isFinite(av) && !Number.isFinite(bv)) return 0;
+          return Number.isFinite(av) ? -1 : 1;
+        }
         return (sortDir === 'asc' ? 1 : -1) * (Number(av) - Number(bv));
       })
     : sortableProducts;
@@ -565,8 +584,10 @@ export default function SalesAnalyticsPage() {
   const productTotals = computedKpis
     ? {
         revenue: computedKpis.revenue ?? 0,
-        grossSales: data?.counts.purchases ?? 0,
-        cogs: products.reduce((total, row) => total + (row.cogs ?? 0), 0),
+        grossSales: isForecastView ? currentProjection?.orders ?? Number.NaN : data?.counts.purchases ?? 0,
+        cogs: isForecastView
+          ? sortableProducts.reduce((total, item) => total + item.row.cogs, 0)
+          : products.reduce((total, row) => total + (row.cogs ?? 0), 0),
         aov: computedKpis.aov ?? 0,
         cpp: computedKpis.cpp ?? 0,
         processedCpp: computedKpis.processed_cpp ?? 0,
@@ -607,6 +628,8 @@ export default function SalesAnalyticsPage() {
         endDate,
         cmRtsLabel: cmRtsExportLabel,
         rows: exportableProducts,
+        view: reportView,
+        entityLabel: dimension === 'store' ? 'Store' : 'Product',
       });
       addToast('success', 'CSV export generated.');
     } catch (err) {
@@ -626,6 +649,8 @@ export default function SalesAnalyticsPage() {
         endDate,
         cmRtsLabel: cmRtsExportLabel,
         rows: exportableProducts,
+        view: reportView,
+        entityLabel: dimension === 'store' ? 'Store' : 'Product',
       });
       addToast('success', 'XLSX export generated.');
     } catch (err) {
@@ -698,19 +723,34 @@ export default function SalesAnalyticsPage() {
   const deliveryCanPrev = deliveryPage > 1;
   const deliveryCanNext = deliveryPage < totalDeliveryPages;
 
+  const reportMetricDefinitions = isForecastView ? [
+    { key: 'revenue', label: 'Forecast Revenue (₱)', format: 'currency', countKey: 'purchases', countLabel: 'Expected orders' },
+    { key: 'cogs', label: 'Forecast COGS (₱)', format: 'currency' },
+    { key: 'rts', label: 'Forecast RTS (₱)', format: 'currency', countKey: 'rts', countLabel: 'Expected returns' },
+    { key: 'delivered', label: 'Forecast Delivered (₱)', format: 'currency', countKey: 'delivered', countLabel: 'Expected deliveries' },
+  ] as typeof metricDefinitions : metricDefinitions;
+  const forecastCounts = (projection: typeof currentProjection) => ({
+    purchases: projection?.orders ?? Number.NaN,
+    delivered: projection?.orders ?? Number.NaN,
+    rts: projection?.rtsOrders ?? Number.NaN,
+  });
   const metricValues = data
-    ? metricDefinitions.map((def) => {
+    ? reportMetricDefinitions.map((def) => {
         const current = computedKpis?.[def.key] ?? 0;
         const previous = computedPrevKpis?.[def.key] ?? 0;
         const delta = formatDeltaPercent(current, previous);
-        const countCurrent = def.countKey ? data.counts?.[def.countKey] ?? 0 : null;
-        const countPrev = def.countKey ? data.prevCounts?.[def.countKey] ?? 0 : null;
+        const countCurrent = def.countKey ? isForecastView
+          ? forecastCounts(currentProjection)[def.countKey as 'purchases' | 'delivered' | 'rts']
+          : data.counts?.[def.countKey] ?? 0 : null;
+        const countPrev = def.countKey ? isForecastView
+          ? forecastCounts(previousProjection)[def.countKey as 'purchases' | 'delivered' | 'rts']
+          : data.prevCounts?.[def.countKey] ?? 0 : null;
         const countDelta = def.countKey ? formatDeltaPercent(countCurrent ?? 0, countPrev ?? 0) : null;
         const statusCountKey =
           def.countKey && def.countKey !== 'purchases' ? def.countKey : null;
-        const isStatusMetric = statusCountKey !== null;
+        const isStatusMetric = !isForecastView && statusCountKey !== null;
         const statusCount =
-          statusCountKey
+          !isForecastView && statusCountKey
             ? data.statusDistribution?.[statusCountKey] ?? countCurrent ?? 0
             : countCurrent;
         const statusShare =
@@ -731,7 +771,7 @@ export default function SalesAnalyticsPage() {
           statusShare,
         };
       })
-    : metricDefinitions.map((def) => ({
+    : reportMetricDefinitions.map((def) => ({
         ...def,
         current: 0,
         previous: 0,
@@ -743,12 +783,12 @@ export default function SalesAnalyticsPage() {
         statusShare: null as number | null,
       }));
   const visibleMetricValues = metricValues.filter((metric) =>
-    visibleKpiKeys.includes(String(metric.key)),
+    isForecastView || visibleKpiKeys.includes(String(metric.key)),
   );
 
   const tableOptions: AnalyticsTableSelectorOption<'products' | 'delivery'>[] = [
-    { key: 'products', label: dimension === 'store' ? 'Revenue per Store' : 'Revenue per Product' },
-    { key: 'delivery', label: 'Delivery Status' },
+    { key: 'products', label: `${isForecastView ? 'Forecast' : 'Revenue'} per ${dimension === 'store' ? 'Store' : 'Product'}` },
+    { key: 'delivery', label: isForecastView ? 'Delivery Status (Actual)' : 'Delivery Status' },
   ];
 
   const leftCard = visibleMetricValues.find((m) => m.key === 'revenue');
@@ -759,12 +799,17 @@ export default function SalesAnalyticsPage() {
 
   const secondaryCards =
     data
-      ? secondaryMetricDefinitions.map((def) => {
+      ? secondaryMetricDefinitions.filter(def => !isForecastView || ![
+          'cm_rts_forecast', 'cancellation_rate_pct', 'processed_cpp', 'conversion_rate',
+        ].includes(def.key)).map((def) => {
           const current = computedKpis?.[def.key] ?? 0;
           const previous = computedPrevKpis?.[def.key] ?? 0;
           const delta = formatDeltaPercent(current, previous);
           const label =
-            def.key === 'cm_rts_forecast'
+            isForecastView && def.key === 'net_margin' ? 'Forecast Net (before overhead)'
+              : isForecastView && def.key === 'ad_spend' ? 'Observed Ad Spend (₱)'
+              : isForecastView ? `Forecast ${def.label}`
+              : def.key === 'cm_rts_forecast'
               ? `CM (RTS ${rtsForecastSafe}% )`
               : def.label;
           return {
@@ -783,7 +828,7 @@ export default function SalesAnalyticsPage() {
         })
       : [];
   const visibleSecondaryCards = secondaryCards.filter((metric) =>
-    visibleKpiKeys.includes(String(metric.key)),
+    isForecastView || visibleKpiKeys.includes(String(metric.key)),
   );
   const leftSecondary = visibleSecondaryCards.find((m) => m.key === 'cm_rts_forecast');
   const fixedRightSecondary = visibleSecondaryCards.filter(
@@ -1104,7 +1149,14 @@ export default function SalesAnalyticsPage() {
   const renderCard = (m: (typeof metricValues)[number]) => {
     const cardLoading = isResultPending;
     const tooltip =
-      m.key === 'cm_rts_forecast'
+      isForecastView ? (
+        <div className="space-y-1">
+          <p>Completed-cohort forecast at {rtsForecastSafe}% RTS.</p>
+          <p>Revenue and goods cost use {100 - rtsForecastSafe}% successful deliveries. Returned goods are assumed fully recoverable.</p>
+          <p>Observed advertising and the existing shipping, fulfillment and IF fee estimates stay fixed. COD fees use the selected cohort&apos;s observed delivered fee/revenue rate.</p>
+          <p>Net before overhead equals contribution margin on this expense basis. Missing evidence is shown as —.</p>
+        </div>
+      ) : m.key === 'cm_rts_forecast'
         ? buildCmRtsTooltip(data?.kpis)
         : m.key === 'contribution_margin'
           ? buildCmTooltip(data?.kpis)
@@ -1128,8 +1180,9 @@ export default function SalesAnalyticsPage() {
         count={
           m.countKey
             ? {
-                label: 'ord',
+                label: isForecastView ? 'expected' : 'ord',
                 value: m.countCurrent ?? 0,
+                precision: isForecastView ? 2 : 0,
                 delta: m.countDelta ?? null,
                 percentage: m.isStatusMetric ? m.statusShare : undefined,
               }
@@ -1178,8 +1231,38 @@ export default function SalesAnalyticsPage() {
         </div>
       </header>
 
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="inline-flex rounded-lg border border-slate-200 p-1 dark:border-border" aria-label="Report view">
+          {(['actual', 'forecast'] as const).map(view => (
+            <button key={view} type="button" aria-pressed={reportView === view}
+              onClick={() => {
+                setReportView(view); setProductPage(1); setTableSelection('products');
+                if (view === 'forecast' && (sortKey === 'processed_cpp' || sortKey === 'cm_rts_forecast')) {
+                  setSortKey('contribution_margin');
+                }
+              }}
+              className={`rounded-md px-4 py-2 text-sm font-medium ${reportView === view ? 'bg-primary text-white' : 'text-foreground'}`}>
+              {view === 'actual' ? 'Actual' : 'Forecast'}
+            </button>
+          ))}
+        </div>
+        {isForecastView && (
+          <p className="text-sm text-slate-600 dark:text-slate-300" aria-live="polite">
+            Forecast at {rtsForecastSafe}% RTS · {100 - rtsForecastSafe}% expected successful deliveries
+          </p>
+        )}
+      </div>
+      {isForecastView && (
+        <div className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-slate-700 dark:border-amber-800 dark:bg-amber-950 dark:text-slate-200">
+          <p>This projects the selected cohort after the canceled, restocking, abandoned and repurchase exclusions. The RTS assumption replaces its recorded RTS outcome; the Exclude RTS toggle applies to Actual view.</p>
+          <p className="mt-1">Returned goods are assumed fully recoverable. Advertising and the existing shipping, fulfillment and IF fee estimates stay fixed. COD fees use the selected cohort&apos;s blended delivered fee/revenue rate. Net before overhead equals contribution margin because both include these same costs.</p>
+          {!Number.isFinite(selectedCodFeeRate) && <p className="mt-1 font-medium">No usable delivered COD-fee rate is available for this selection. Margins for positive forecast sales are unavailable (—).</p>}
+          <p className="mt-1">Forecasts use the saved cost evidence and do not correct missing source costs. Delivery Status remains the recorded lifecycle breakdown.</p>
+        </div>
+      )}
+
       <DashboardSection
-        title="Sales Monitoring"
+        title={isForecastView ? 'Sales Forecast' : 'Sales Monitoring'}
         icon={<ShoppingBag className="panel-icon" />}
         meta={`Last updated: ${data?.lastUpdatedAt ? new Date(data.lastUpdatedAt).toLocaleString() : '-'}`}
         className=""
@@ -1255,9 +1338,10 @@ export default function SalesAnalyticsPage() {
                         type="checkbox"
                         className="h-4 w-4 rounded border-slate-300 accent-primary checked:border-primary checked:bg-primary focus:ring-2 focus:ring-orange-200"
                         checked={excludeRts}
+                        disabled={isForecastView}
                         onChange={(e) => setExcludeRts(e.target.checked)}
                       />
-                      <span className="text-sm text-foreground">Exclude RTS</span>
+                      <span className="text-sm text-foreground">Exclude RTS{isForecastView ? ' (Actual only)' : ''}</span>
                     </label>
                     <label className="flex items-center gap-2 cursor-pointer select-none">
                       <input
@@ -1271,24 +1355,24 @@ export default function SalesAnalyticsPage() {
                     <div className="my-1 h-px bg-slate-100 dark:bg-border" />
                     <div className="space-y-1">
                       <label className="flex items-center justify-between text-sm text-foreground">
-                        <span>RTS %</span>
+                        <span>Forecast RTS %</span>
                         <input
                           type="number"
                           min={0}
                           max={100}
-                          value={Number.isFinite(rtsForecastPct) ? rtsForecastPct : 20}
+                          value={rtsForecastInput}
                           onChange={(e) => {
+                            setRtsForecastInput(e.target.value);
                             const val = parseFloat(e.target.value);
-                            if (Number.isNaN(val)) {
-                              setRtsForecastPct(20);
-                              return;
-                            }
-                            setRtsForecastPct(Math.min(100, Math.max(0, val)));
+                            if (Number.isFinite(val)) setRtsForecastPct(Math.min(100, Math.max(0, val)));
                           }}
+                          onBlur={() => setRtsForecastInput(String(rtsForecastSafe))}
                           className="w-20 rounded border border-slate-200 px-2 py-1 text-sm text-foreground focus:border-indigo-300 focus:outline-none dark:border-border dark:bg-surface"
                         />
                       </label>
-                      <p className="text-xs text-slate-500 dark:text-slate-300">Used for CM (RTS %) forecast column</p>
+                      <p className="text-xs text-slate-500 dark:text-slate-300">
+                        {isForecastView ? 'Updates projected revenue, COGS and margins throughout this view.' : 'Updates the CM (RTS %) scenario. Select Forecast to project the full report.'}
+                      </p>
                     </div>
                     <div className="my-1 h-px bg-slate-100 dark:bg-border" />
                     <label className="flex items-center gap-2 cursor-pointer select-none">
@@ -1361,7 +1445,7 @@ export default function SalesAnalyticsPage() {
                 >
                   <RefreshCw className={`h-4 w-4 ${isReconciling ? 'animate-spin' : ''}`} />
                 </button>
-                <button
+                {!isForecastView && <button
                   type="button"
                   onClick={() => setShowKpiVisibilityModal(true)}
                   className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-surface text-slate-600 dark:text-foreground dark:border-border hover:border-slate-300"
@@ -1369,7 +1453,7 @@ export default function SalesAnalyticsPage() {
                   title="Show or hide KPI boxes"
                 >
                   <Columns className="h-4 w-4" />
-                </button>
+                </button>}
                 {canShare && (
                   <button
                     type="button"
@@ -1386,6 +1470,14 @@ export default function SalesAnalyticsPage() {
 
         {error && (
           <AlertBanner tone="error" message={error} className="mt-4" />
+        )}
+        {selectedTeamIds.length > 0 && data?.teamSpendCoverage &&
+          (data.teamSpendCoverage.current.unassignedSpend > 0 || data.teamSpendCoverage.previous.unassignedSpend > 0) && (
+          <AlertBanner
+            tone="warning"
+            message="Some ad spend has no confirmed team and appears in All teams only. Selected-team margins exclude that unassigned spend."
+            className="mt-4"
+          />
         )}
         {dimension === 'store' && data?.coverage && (
           data.coverage.ambiguousShopCount > 0 || data.coverage.unattributedAdRows > 0 || data.coverage.previousUnattributedAdRows > 0 ||
@@ -1411,7 +1503,9 @@ export default function SalesAnalyticsPage() {
         )}
 
         <p className="text-xs text-slate-500 dark:text-slate-300">
-          Status cards keep every lifecycle status visible for comparison. Exclude Repurchase still applies; the other exclusions adjust revenue, orders and COGS.
+          {isForecastView
+            ? 'Projected deliveries and RTS complete the filtered order cohort. Expected order counts may be fractional.'
+            : 'Status cards keep every lifecycle status visible for comparison. Exclude Repurchase still applies; the other exclusions adjust revenue, orders and COGS.'}
         </p>
         <div className="flex flex-col gap-3 xl:flex-row">
           {(
@@ -1465,7 +1559,7 @@ export default function SalesAnalyticsPage() {
 
       {/* Revenue per Product / Delivery Status */}
       <DashboardSection
-        title="Sales Breakdown"
+        title={tableSelection === 'delivery' && isForecastView ? 'Recorded Delivery Status' : isForecastView ? 'Forecast Breakdown' : 'Sales Breakdown'}
         icon={<BarChart3 className="panel-icon" />}
         contentClassName="space-y-3"
       >
@@ -1526,6 +1620,7 @@ export default function SalesAnalyticsPage() {
             productPage={productPage}
             totalProductPages={totalProductPages}
             rtsForecastSafe={rtsForecastSafe}
+            reportView={reportView}
             rows={pagedProducts}
             sourceCount={products.length}
             totals={productTotals}

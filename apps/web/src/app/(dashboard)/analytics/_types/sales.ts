@@ -1,4 +1,16 @@
 export type SalesOverviewResponse = {
+  teamSpendCoverage?: {
+    basis: 'EXPLICIT_REPORT_TEAM_THEN_EXACT_STORE_TEAM';
+    currencyBasis: 'BASE_AD_SPEND_BEFORE_SELECTED_TAXES';
+    current: {
+      tenantSpend: number; selectedSpend: number; unassignedSpend: number;
+      fallbackAssignedSpend: number; byTeam: Array<{ teamId: string; spend: number }>;
+    };
+    previous: {
+      tenantSpend: number; selectedSpend: number; unassignedSpend: number;
+      fallbackAssignedSpend: number; byTeam: Array<{ teamId: string; spend: number }>;
+    };
+  };
   coverage?: {
     basis: string;
     feeBasis: string;

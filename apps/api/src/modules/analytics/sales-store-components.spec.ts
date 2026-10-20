@@ -128,6 +128,97 @@ function fixture(options: { orders?: any[]; rows?: any[]; links?: any[]; extraSt
 
 const params = { startDate: current, endDate: current };
 
+describe('Selected-team ad spend preserves exact ownership and missing-team spend', () => {
+  function teamFixture() {
+    const pos = (teamId: string, shopId: string, mapping: string, cod: number) => ({
+      tenantId, teamId, id: `order-${mapping}`, posOrderId: `order-${mapping}`, shopId, mapping,
+      dateLocal: current, status: 3, cod, cogs: 100, isVoid: false, isRepurchase: false,
+    });
+    const marketing = (teamId: string, shopId: string, mapping: string, cod: number) => ({
+      tenantId, teamId, date: new Date(current), adId: `pos-${mapping}`, mapping, shops: [shopId],
+      codPos: cod, deliveredCodPos: cod, cogsPos: 100, cogsDeliveredPos: 100, purchasesPos: 1, deliveredCount: 1,
+      spend: 0, leads: 0,
+    });
+    const ad = (id: string, shops: string[], spend: number, date = current, extra = {}) => ({
+      tenantId, teamId: null, adId: id, date: new Date(date), mapping: `ad-${id}`, shops, spend, leads: 1, ...extra,
+    });
+    const f = fixture({ links: [], orders: [pos(teamA, 'shop-a', 'sales-a', 1000), pos(teamB, 'shop-b', 'sales-b', 2000)],
+      rows: [
+        marketing(teamA, 'shop-a', 'sales-a', 1000), marketing(teamB, 'shop-b', 'sales-b', 2000),
+        ad('a', ['shop-a'], 200), ad('b', ['shop-b'], 100),
+        ad('ambiguous', ['shop-a', 'shop-b'], 40), ad('unowned', [], 10, current, { mapping: null }),
+        ad('historical', ['shop-b'], 25, current, { teamId: teamA }),
+        ad('a-prior', ['shop-a'], 60, previous), ad('b-prior', ['shop-b'], 30, previous),
+        ad('unknown-prior', [], 5, previous),
+      ] });
+    f.allStores.find(store => store.id === 'store-a')!.teamId = teamA;
+    f.allStores.find(store => store.id === 'store-b')!.teamId = teamB;
+    return f;
+  }
+
+  it.each(['getOverview', 'getStoreOverview'])('%s keeps null-team ad costs, historical team ownership, taxes and period totals', async method => {
+    const f = teamFixture();
+    const call = (p: any) => (f.service as any)[method]({ ...params, ...p });
+    const all = await call({});
+    const a = await call({ teamIds: [teamA] });
+    const b = await call({ teamIds: [teamB] });
+    expect([a.kpis.revenue, b.kpis.revenue, all.kpis.revenue]).toEqual([1000, 2000, 3000]);
+    expect([a.kpis.cogs, b.kpis.cogs, all.kpis.cogs]).toEqual([100, 100, 200]);
+    expect([a.kpis.ad_spend, b.kpis.ad_spend, all.kpis.ad_spend]).toEqual([225, 100, 375]);
+    expect([a.prevKpis.ad_spend, b.prevKpis.ad_spend, all.prevKpis.ad_spend]).toEqual([60, 30, 95]);
+    expect(a.teamSpendCoverage.current).toMatchObject({
+      tenantSpend: 375, selectedSpend: 225, unassignedSpend: 50, fallbackAssignedSpend: 300,
+      byTeam: [{ teamId: teamA, spend: 225 }, { teamId: teamB, spend: 100 }],
+    });
+    expect(a.kpis.ad_spend + b.kpis.ad_spend + a.teamSpendCoverage.current.unassignedSpend).toBe(all.kpis.ad_spend);
+    expect(a.products.reduce((total: number, row: any) => total + row.ad_spend, 0)).toBe(a.kpis.ad_spend);
+    const taxed = await call({ teamIds: [teamA], includeTax12: true, includeTax1: true });
+    expect(taxed.kpis.ad_spend).toBeCloseTo(254.25, 8);
+    expect(taxed.prevKpis.ad_spend).toBeCloseTo(67.8, 8);
+    expect(a.kpis.net_margin - taxed.kpis.net_margin).toBeCloseTo(29.25, 8);
+    expect(f.payloads.filter(payload => payload.responseShapeVersion).every(payload => payload.calculationVersion === 4)).toBe(true);
+  });
+
+  it('adds a spend-only product mapping, respects explicit product/empty filters and refreshes cache after ownership changes', async () => {
+    const f = teamFixture();
+    const a = await f.service.getOverview({ ...params, teamIds: [teamA] });
+    expect(a.products.find(row => row.mapping === 'ad-a')).toMatchObject({ revenue: 0, cogs: 0, ad_spend: 200 });
+    expect(a.filters.mappings).toContain('ad-a');
+    const only = await f.service.getOverview({ ...params, teamIds: [teamA], mappings: ['ad-a'] });
+    expect(only.kpis.ad_spend).toBe(200);
+    expect(only.products.map(row => row.mapping)).toEqual(['ad-a']);
+    const empty = await f.service.getOverview({ ...params, teamIds: [teamA], emptySelection: true });
+    expect(empty.kpis.ad_spend).toBe(0);
+    expect(empty.products).toEqual([]);
+    f.allStores.find(store => store.id === 'store-a')!.teamId = teamB;
+    const moved = await f.service.getOverview({ ...params, teamIds: [teamA] });
+    expect(moved.kpis.revenue).toBe(1000); // historical POS team remains A
+    expect(moved.kpis.ad_spend).toBe(25); // explicit historical ad remains A
+    expect(moved).not.toBe(a);
+  });
+
+  it('separates unresolved ads from owned null mappings and preserves tenant scope in combined-team filters', async () => {
+    const f = teamFixture();
+    f.rows.push(
+      { tenantId, teamId: null, date: new Date(current), adId: 'known-null', mapping: null, shops: ['shop-a'], spend: 2.77, leads: 2 },
+      { tenantId, teamId: null, date: new Date(current), adId: 'known-shared-label', mapping: 'sales-a', shops: ['shop-a'], spend: 17.23, leads: 3 },
+      { tenantId: 'foreign-tenant', teamId: teamA, date: new Date(current), adId: 'foreign-ad', mapping: null, shops: ['shop-a'], spend: 999999, leads: 999 },
+    );
+    const a = await f.service.getOverview({ ...params, teamIds: [teamA] });
+    expect(a.kpis.ad_spend).toBeCloseTo(245, 8);
+    expect(a.products.find(row => row.mapping === null)?.ad_spend).toBe(2.77);
+    expect(a.products.find(row => row.mapping === 'sales-a')?.ad_spend).toBe(17.23);
+    expect(a.filters.mappings).toContain('__null__');
+    const nullOnly = await f.service.getOverview({ ...params, teamIds: [teamA], mappings: ['__null__'] });
+    expect(nullOnly.kpis.ad_spend).toBe(2.77);
+    expect(nullOnly.teamSpendCoverage?.current.unassignedSpend).toBe(10);
+    const both = await f.service.getOverview({ ...params, teamIds: [teamA, teamB] });
+    expect(both.kpis.ad_spend).toBeCloseTo(345, 8);
+    expect(both.teamSpendCoverage?.current).toMatchObject({ tenantSpend: 395, unassignedSpend: 50 });
+    expect(both.kpis.revenue).toBe(3000);
+  });
+});
+
 describe('Exact Store POS components with independent ad ownership', () => {
   it('keeps asymmetric actual-shop revenue/COGS while one explicitly owned ad receives all its spend once', async () => {
     const f = fixture();
