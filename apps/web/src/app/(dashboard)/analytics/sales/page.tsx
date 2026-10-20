@@ -72,6 +72,7 @@ import {
   forecastSalesKpis, forecastSalesProduct, forecastKpiValues, forecastProductValues, observedCodFeeRate,
 } from '../_utils/sales-report-forecast';
 import { cogsUnitsValue, canViewCogsUnits } from '../_utils/actual-cogs-units';
+import { applySuperAdminCogsReview, zeroCogsReviewPriority } from '../_utils/zero-cogs-review';
 
 const Datepicker = dynamic(() => import('react-tailwindcss-datepicker'), { ssr: false });
 
@@ -536,6 +537,7 @@ export default function SalesAnalyticsPage() {
     return {
       row,
       index,
+      zeroCogsPriority: zeroCogsReviewPriority(row, actualRow.delivered_count, showUnits),
       derived: {
         display,
         forecast,
@@ -550,7 +552,7 @@ export default function SalesAnalyticsPage() {
     };
   });
 
-  const sortedProducts = sortKey
+  const userSortedProducts = sortKey
     ? [...sortableProducts].sort((a, b) => {
         const getValue = (item: typeof a) => {
           const r = item.row;
@@ -606,8 +608,14 @@ export default function SalesAnalyticsPage() {
       })
     : sortableProducts;
 
+  const sortedProducts = applySuperAdminCogsReview(userSortedProducts, showUnits);
+  const zeroCogsReviewCount = showUnits
+    ? sortedProducts.filter(item => (item.zeroCogsPriority ?? 0) > 0).length : 0;
   const totalProducts = sortedProducts.length;
   const totalProductPages = Math.max(1, Math.ceil(totalProducts / pageSize));
+  useEffect(() => {
+    setProductPage(page => Math.min(page, totalProductPages));
+  }, [totalProductPages]);
   const pagedProducts = sortedProducts.slice((productPage - 1) * pageSize, productPage * pageSize);
   const productStart = totalProducts === 0 ? 0 : (productPage - 1) * pageSize + 1;
   const productEnd = Math.min(productPage * pageSize, totalProducts);
@@ -1641,6 +1649,12 @@ export default function SalesAnalyticsPage() {
         {tableSelection === 'delivery' && (
           <p className="text-xs text-slate-500 dark:text-slate-300">Lifecycle breakdown includes every status and follows the selected repurchase scope.</p>
         )}
+        {tableSelection === 'products' && showUnits && !isResultPending && (
+          <p className="text-xs text-slate-600 dark:text-slate-300">
+            Super Admin review: zero-order rows are hidden. {zeroCogsReviewCount} rows with orders and zero COGS are highlighted,
+            with delivered orders first. Recorded zero cost may be valid. Totals still include hidden rows.
+          </p>
+        )}
         {tableSelection === 'products' ? (
           <AnalyticsSalesProductsTable
             isLoading={isResultPending}
@@ -1658,6 +1672,7 @@ export default function SalesAnalyticsPage() {
             rtsForecastSafe={rtsForecastSafe}
             reportView={reportView}
             showUnits={showUnits}
+            showZeroCogsReview={showUnits}
             rows={pagedProducts}
             sourceCount={products.length}
             totals={productTotals}
