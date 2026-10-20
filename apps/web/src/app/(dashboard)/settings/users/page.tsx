@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import apiClient from '@/lib/api-client';
 import { startImpersonation } from '@/lib/impersonation';
+import { viewAsCapabilities, viewAsDisabledReason } from '@/lib/view-as';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { AlertBanner, LoadingCard } from '@/components/ui/feedback';
@@ -20,6 +21,7 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
+  DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog';
 import {
@@ -28,7 +30,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from '@/components/ui/dropdown-menu';
-import { MoreHorizontal, Plus, UserPlus, Users as UsersIcon } from 'lucide-react';
+import { Eye, MoreHorizontal, Plus, UserPlus, Users as UsersIcon } from 'lucide-react';
 
 type User = {
   id: string;
@@ -77,16 +79,9 @@ export default function UsersPage() {
   const [canImpersonate, setCanImpersonate] = useState(false);
   // Impersonating yourself is rejected server-side; hiding it keeps the menu honest.
   const [currentUserId, setCurrentUserId] = useState<string | null>(null);
-
-  useEffect(() => {
-    try {
-      const raw = window.localStorage.getItem('user');
-      const parsed = raw ? JSON.parse(raw) : null;
-      setCurrentUserId(parsed?.id ?? parsed?.userId ?? null);
-    } catch {
-      setCurrentUserId(null);
-    }
-  }, []);
+  const [actorIsSuperAdmin, setActorIsSuperAdmin] = useState(false);
+  const [userToPreview, setUserToPreview] = useState<User | null>(null);
+  const [isStartingPreview, setIsStartingPreview] = useState(false);
   const [isCheckingPermissions, setIsCheckingPermissions] = useState(true);
   const [permissionCheckResolved, setPermissionCheckResolved] = useState(false);
   const [permissionToastShown, setPermissionToastShown] = useState(false);
@@ -110,17 +105,18 @@ export default function UsersPage() {
       setIsCheckingPermissions(true);
       setPermissionCheckResolved(false);
       try {
-        const response = await apiClient.get('/auth/permissions', {
-          params: { workspace: 'erp' },
-        });
-        const permissions = Array.isArray(response.data?.permissions)
-          ? response.data.permissions
-          : [];
-        const hasPermission = permissions.includes('user.manage');
-        const canImpersonateUsers = permissions.includes('user.impersonate');
+        const [identityResult, permissionsResult] = await Promise.allSettled([
+          apiClient.get('/auth/me'),
+          apiClient.get('/auth/permissions', { params: { workspace: 'erp' } }),
+        ]);
+        const identity = identityResult.status === 'fulfilled' ? identityResult.value.data?.user : null;
+        const permissions = permissionsResult.status === 'fulfilled' ? permissionsResult.value.data?.permissions : [];
+        const capability = viewAsCapabilities(identity, permissions);
         if (!cancelled) {
-          setCanManage(hasPermission);
-          setCanImpersonate(canImpersonateUsers);
+          setCurrentUserId(capability.currentUserId);
+          setActorIsSuperAdmin(capability.isSuperAdmin);
+          setCanManage(capability.canManage);
+          setCanImpersonate(capability.canImpersonate);
           setPermissionCheckResolved(true);
         }
       } catch {
@@ -317,7 +313,7 @@ export default function UsersPage() {
     [isTenantAdmin, teamMap],
   );
 
-  const openEditModal = (userItem: User) => {
+  const openEditModal = useCallback((userItem: User) => {
     const tenantAssignment = userItem.userRoleAssignments?.find(
       (assignment) => !assignment.teamId && assignment.role?.workspace !== 'wms',
     );
@@ -331,7 +327,7 @@ export default function UsersPage() {
       teamId: userItem.defaultTeamId || '',
     });
     setEditOpen(true);
-  };
+  }, []);
 
   const formatLastLogin = (value?: string | null) =>
     value ? new Date(value).toLocaleString() : '—';
@@ -400,32 +396,31 @@ export default function UsersPage() {
         id: 'actions',
         header: '',
         cell: ({ row }) => (
-          <div className="flex w-full justify-end">
+          <div className="flex w-full items-center justify-end gap-2">
+            {canImpersonate ? (
+              <span title={viewAsDisabledReason(row.original, currentUserId, actorIsSuperAdmin) ?? 'Preview this user’s ERP access'}>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  iconLeft={<Eye className="h-4 w-4" aria-hidden="true" />}
+                  disabled={isStartingPreview || Boolean(viewAsDisabledReason(row.original, currentUserId, actorIsSuperAdmin))}
+                  aria-label={`View as ${row.original.email}`}
+                  onClick={() => setUserToPreview(row.original)}
+                  className="whitespace-nowrap"
+                >
+                  View as
+                </Button>
+              </span>
+            ) : null}
             <DropdownMenu>
-              <DropdownMenuTrigger className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-surface">
+              <DropdownMenuTrigger aria-label={`Manage ${row.original.email}`} className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-surface">
                 <MoreHorizontal className="h-4 w-4" />
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-36">
                 <DropdownMenuItem onClick={() => openEditModal(row.original)}>
                   Edit
                 </DropdownMenuItem>
-                {canImpersonate && row.original.id !== currentUserId ? (
-                  <DropdownMenuItem
-                    onClick={() => {
-                      void startImpersonation(row.original.id).catch((error) => {
-                        // The server enforces the real rules — tenant, super
-                        // admin, admin-to-admin — so surface its reason rather
-                        // than trying to predict them here.
-                        addToast(
-                          'error',
-                          error?.response?.data?.message ?? 'Unable to view as this user.',
-                        );
-                      });
-                    }}
-                  >
-                    View as this user
-                  </DropdownMenuItem>
-                ) : null}
                 <DropdownMenuItem
                   onClick={() => setUserToDelete(row.original)}
                   className="text-rose-600 focus:text-rose-600"
@@ -438,7 +433,7 @@ export default function UsersPage() {
         ),
       },
     ],
-    [getRoleLabel, getTeamLabel],
+    [getRoleLabel, getTeamLabel, openEditModal, canImpersonate, currentUserId, actorIsSuperAdmin, isStartingPreview],
   );
 
   const { table } = useDataTable({
@@ -508,6 +503,44 @@ export default function UsersPage() {
           )}
         </div>
       </Card>
+
+      <Dialog open={Boolean(userToPreview)} onOpenChange={(open) => {
+        if (!open && !isStartingPreview) setUserToPreview(null);
+      }}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>View as {userToPreview?.firstName || userToPreview?.email}</DialogTitle>
+            <DialogDescription>
+              Open a read-only preview of {userToPreview?.email} in this workspace for up to 15 minutes.
+              You will see their menus, teams and data with their current permissions.
+            </DialogDescription>
+          </DialogHeader>
+          <p className="text-sm text-muted">
+            Changes and actions that update records are blocked. All ERP tabs in this browser share
+            the preview session and will reload. Use Exit preview to return to your account.
+            If the preview expires, sign in again with your own account.
+          </p>
+          <DialogFooter>
+            <Button type="button" variant="ghost" disabled={isStartingPreview} onClick={() => setUserToPreview(null)}>Cancel</Button>
+            <Button
+              type="button"
+              variant="primary"
+              loading={isStartingPreview}
+              disabled={isStartingPreview || !userToPreview}
+              onClick={() => {
+                if (!userToPreview || isStartingPreview) return;
+                setIsStartingPreview(true);
+                void startImpersonation(userToPreview.id).catch((error) => {
+                  setIsStartingPreview(false);
+                  addToast('error', error?.response?.data?.message ?? error?.message ?? 'Unable to preview this user.');
+                });
+              }}
+            >
+              {isStartingPreview ? 'Opening preview…' : 'Open read-only preview'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={addExistingOpen} onOpenChange={setAddExistingOpen}>
         <DialogContent className="max-w-md">

@@ -73,7 +73,9 @@ export class AuthController {
   async getProfile(@Request() req) {
     return {
       user: req.user,
-      memberships: await this.authService.listMemberships(req.user.userId || req.user.id),
+      memberships: await this.authService.listSessionMemberships({
+        ...req.user, userId: req.user.userId || req.user.id,
+      }),
     };
   }
 

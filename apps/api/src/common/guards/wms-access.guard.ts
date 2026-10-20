@@ -27,6 +27,10 @@ export class WmsAccessGuard implements CanActivate {
     if (!user) {
       throw new ForbiddenException('User not authenticated');
     }
+    if (user.impersonatedBy) {
+      // ERP preview never opens the globally scoped warehouse staff surface.
+      throw new ForbiddenException('View As is available for ERP. Return to your account to access WMS.');
+    }
 
     const userId = user.userId || user.id;
     if (!userId) {

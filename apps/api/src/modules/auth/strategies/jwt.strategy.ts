@@ -3,6 +3,7 @@ import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { ConfigService } from '@nestjs/config';
 import { AuthService } from '../auth.service';
+import { IMPERSONATION_STOP_REQUEST } from '../../../common/guards/impersonation-policy';
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
@@ -14,10 +15,48 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       ignoreExpiration: false,
       secretOrKey: configService.get<string>('jwt.secret'),
+      passReqToCallback: true,
     });
   }
 
-  async validate(payload: any) {
+  async validate(request: any, payload: any) {
+    if (payload.impersonatedBy) {
+      const stopping = request[IMPERSONATION_STOP_REQUEST] === true;
+      const preview = await this.authService.validateImpersonationSession(payload, stopping);
+      if (stopping) {
+        // Only the exact authenticated stop handler gets this context. Restoring
+        // the real actor must still work if the target was disabled or deleted.
+        return {
+          userId: payload.userId,
+          tenantId: preview.tenant.id,
+          role: 'USER',
+          permissions: [],
+          sessionId: payload.sessionId ?? null,
+          impersonatedBy: preview.actor.id,
+          originalSessionId: payload.originalSessionId ?? null,
+          impersonationExpiresAt: preview.expiresAt,
+          impersonationReadOnly: true,
+        };
+      }
+      const target = preview.target!;
+      return {
+        userId: target.id,
+        email: target.email,
+        tenantId: preview.tenant.id,
+        role: target.role,
+        permissions: target.permissions,
+        firstName: target.firstName,
+        lastName: target.lastName,
+        avatar: target.avatar,
+        defaultTeamId: preview.targetDefaultTeamId,
+        employeeId: target.employeeId,
+        sessionId: payload.sessionId ?? null,
+        impersonatedBy: preview.actor.id,
+        originalSessionId: payload.originalSessionId ?? null,
+        impersonationExpiresAt: preview.expiresAt,
+        impersonationReadOnly: true,
+      };
+    }
     // Validate user still exists and is active
     const user = await this.authService.validateUser(payload.userId);
 

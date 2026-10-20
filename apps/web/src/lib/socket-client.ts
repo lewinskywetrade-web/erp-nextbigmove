@@ -1,12 +1,27 @@
 import { io, Socket } from 'socket.io-client';
+import { getPageSessionToken } from '@/lib/session';
 
 class WorkflowSocketManager {
   private socket: Socket | null = null;
+  private previewSocket: Socket | null = null;
 
   connect() {
-    if (this.socket?.connected) return this.socket;
+    const token = getPageSessionToken();
+    // Workflow room subscriptions are not needed for a preview. Keep consumers'
+    // event API intact without connecting or disclosing the preview token; the
+    // scoped HTTP queries remain available. Normal sessions are unchanged.
+    if (typeof window !== 'undefined' && localStorage.getItem('impersonating_user')) {
+      this.disconnect();
+      if (!this.previewSocket) {
+        this.previewSocket = io({
+          autoConnect: false,
+          reconnection: false,
+        });
+      }
+      return this.previewSocket;
+    }
 
-    const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
+    if (this.socket?.connected) return this.socket;
 
     const rawBase = process.env.NEXT_PUBLIC_SOCKET_URL || process.env.NEXT_PUBLIC_API_URL || '';
     let origin = '';

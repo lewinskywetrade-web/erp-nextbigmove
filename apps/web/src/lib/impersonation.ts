@@ -26,7 +26,10 @@ export function getImpersonation(): ImpersonationBanner | null {
   if (typeof window === 'undefined') return null;
   try {
     const raw = window.localStorage.getItem(IMPERSONATION_KEY);
-    return raw ? (JSON.parse(raw) as ImpersonationBanner) : null;
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed.name === 'string' && typeof parsed.email === 'string'
+      ? { name: parsed.name, email: parsed.email }
+      : null;
   } catch {
     return null;
   }
@@ -66,6 +69,9 @@ export async function syncImpersonationWithServer(): Promise<ImpersonationBanner
 /** Swap the session to the target user and reload into their view. */
 export async function startImpersonation(userId: string): Promise<void> {
   const { data } = await apiClient.post(`/auth/impersonate/${userId}`);
+  if (data?.impersonationReadOnly !== true || !data?.impersonatedBy) {
+    throw new Error('Read-only preview is not available yet. Reload and try again.');
+  }
   applySession(data);
   window.localStorage.setItem(IMPERSONATION_KEY, JSON.stringify({
     name: [data.user?.firstName, data.user?.lastName].filter(Boolean).join(' ') || data.user?.email,

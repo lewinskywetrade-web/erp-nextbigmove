@@ -3,7 +3,9 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
 import { NuqsAdapter } from 'nuqs/adapters/next/app';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { watchSessionChanges } from '@/lib/session';
+import { workflowSocket } from '@/lib/socket-client';
 
 export function Providers({ children }: { children: React.ReactNode }) {
   const [queryClient] = useState(
@@ -18,6 +20,11 @@ export function Providers({ children }: { children: React.ReactNode }) {
         },
       })
   );
+  useEffect(() => watchSessionChanges(() => {
+    workflowSocket.disconnect();
+    void queryClient.cancelQueries();
+    queryClient.clear();
+  }), [queryClient]);
 
   return (
     <QueryClientProvider client={queryClient}>

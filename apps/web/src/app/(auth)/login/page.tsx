@@ -7,6 +7,7 @@ import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import * as z from 'zod';
 import apiClient from '@/lib/api-client';
+import { applySession } from '@/lib/session';
 import { AlertBanner } from '@/components/ui/feedback';
 
 const loginSchema = z.object({
@@ -28,11 +29,17 @@ const parseLoginError = (error: unknown) => {
 export default function LoginPage() {
   const router = useRouter();
   const [error, setError] = useState('');
+  const [sessionNotice, setSessionNotice] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [checkingSession, setCheckingSession] = useState(true);
 
   // Redirect away from login if already authenticated
   useEffect(() => {
+    const notice = window.sessionStorage.getItem('auth_session_notice');
+    if (notice) {
+      setSessionNotice(notice);
+      window.sessionStorage.removeItem('auth_session_notice');
+    }
     const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
     if (token) {
       router.push('/dashboard');
@@ -63,17 +70,11 @@ export default function LoginPage() {
       // left behind — including one under a different partner.
       localStorage.removeItem('impersonating_user');
 
-      // Store tokens and user info
-      localStorage.setItem('access_token', response.data.accessToken);
-      localStorage.setItem('refresh_token', response.data.refreshToken);
-      localStorage.setItem('current_tenant_id', response.data.tenant.id);
-      localStorage.setItem('tenant', JSON.stringify(response.data.tenant));
-      localStorage.setItem('user', JSON.stringify(response.data.user));
+      applySession(response.data);
       const memberships = Array.isArray(response.data.memberships) ? response.data.memberships : [];
-      localStorage.setItem('memberships', JSON.stringify(memberships));
 
       // One tenant: straight in, exactly as before. Several: let them choose.
-      router.push(memberships.length > 1 ? '/select-workspace' : '/dashboard');
+      window.location.href = memberships.length > 1 ? '/select-workspace' : '/dashboard';
     } catch (error: unknown) {
       setError(parseLoginError(error));
     } finally {
@@ -98,6 +99,7 @@ export default function LoginPage() {
         </div>
 
         <form className="mt-8 space-y-6" onSubmit={handleSubmit(onSubmit)}>
+          {sessionNotice && <AlertBanner tone="warning" message={sessionNotice} />}
           {error && (
             <AlertBanner tone="error" message={error} />
           )}
