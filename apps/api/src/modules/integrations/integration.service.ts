@@ -70,6 +70,13 @@ import { assertValidProductCogs } from './product-cogs-validation';
 import { ProductCogsRefreshPublisherService } from './services/product-cogs-refresh-publisher.service';
 import { lockCogsProduct, productCogsToday, findApplicableProductCogs, writeCurrentProductCogs } from '../product-cogs/current-product-cogs';
 import { assertWmsManagedCogsEditable, WmsCogsSyncService } from '../product-cogs/wms-cogs-sync.service';
+import {
+  missingPancakeShopCurrency,
+  normalizePancakeRetailPrice,
+  normalizedPancakeRetailPriceForStorage,
+  readPancakeShopCurrencyResponse,
+  resolvePancakeShopCurrency,
+} from './pancake-retail-price';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -4110,6 +4117,22 @@ export class IntegrationService {
 
   private async fetchProductsFromPancake(shopId: string, apiKey: string): Promise<any[]> {
     const baseUrl = `https://pos.pages.fm/api/v1/shops/${shopId}/products`;
+    // Provider catalog amounts use the current shop currency (e.g. PHP100).
+    // Fetch once per import, not per product, and keep unavailable prices untouched.
+    let currency = missingPancakeShopCurrency(shopId, 'SHOP_CURRENCY_FETCH_UNAVAILABLE');
+    try {
+      const params = new URLSearchParams({ api_key: apiKey });
+      const response = await fetch(`https://pos.pages.fm/api/v1/shops?${params}`, {
+        redirect: 'error',
+        signal: AbortSignal.timeout(15000),
+      });
+      currency = resolvePancakeShopCurrency(await readPancakeShopCurrencyResponse(response), shopId);
+    } catch {
+      // Do not log provider errors/URLs; they can contain the credential.
+    }
+    if (currency.reason) {
+      this.logger.warn(`Catalog price currency unavailable for shop=${shopId}; existing prices will be preserved`);
+    }
     const products: any[] = [];
     let page = 1;
     let totalPages = 1;
@@ -4141,12 +4164,18 @@ export class IntegrationService {
           const productId = this.extractProductIdFromPancakeProduct(item);
           const variationId = this.extractVariationIdFromPancakeProduct(item);
           if (!productId) return null;
+          const price = normalizePancakeRetailPrice(
+            item, { shopId, productId, variationId }, currency, [envelope, envelope?.data],
+          );
 
           return {
             productId,
             variationId,
             warehouseId: this.extractWarehouseIdFromPancakeProduct(item),
-            productSnapshot: this.extractProductSnapshotFromPancakeProduct(item),
+            productSnapshot: {
+              ...this.extractProductSnapshotFromPancakeProduct(item),
+              erpRetailPrice: price.evidence,
+            },
             customId:
               item?.custom_id ||
               item?.code ||
@@ -4156,7 +4185,8 @@ export class IntegrationService {
               item?.variation_info?.name ||
               item?.product?.name ||
               'Unnamed product',
-            retailPrice: this.extractRetailPriceFromPancakeProduct(item),
+            retailPrice: price.retailPrice,
+            retailPriceEvidence: price.evidence,
           };
         })
         .filter(Boolean);
@@ -4192,6 +4222,19 @@ export class IntegrationService {
       const productId = row?.productId?.toString?.().trim?.() || '';
       const key = variationId || `product:${productId}`;
       if (!key) continue;
+      const previous = unique.get(key);
+      if (previous && (
+        previous.productId !== row.productId ||
+        previous.retailPriceEvidence.status !== row.retailPriceEvidence.status ||
+        previous.retailPriceEvidence.normalizedAmount !== row.retailPriceEvidence.normalizedAmount
+      )) {
+        row.retailPrice = null;
+        row.retailPriceEvidence = {
+          ...row.retailPriceEvidence, status: 'SKIPPED',
+          reason: 'DUPLICATE_PROVIDER_VARIATION_PRICE_CONFLICT', normalizedAmount: null,
+        };
+        row.productSnapshot.erpRetailPrice = row.retailPriceEvidence;
+      }
       unique.set(key, row);
     }
 
@@ -4259,7 +4302,7 @@ export class IntegrationService {
 
     const queue: any[] = [payload, envelope];
     const rows: any[] = [];
-    const seen = new Set<string>();
+    const seen = new Set<object>();
 
     while (queue.length > 0) {
       const current = queue.shift();
@@ -4271,15 +4314,13 @@ export class IntegrationService {
       }
 
       if (typeof current !== 'object') continue;
+      if (seen.has(current)) continue;
+      seen.add(current);
 
       if (this.isPancakeProductLike(current)) {
-        const productId = this.extractProductIdFromPancakeProduct(current) || '';
-        const variationId = this.extractVariationIdFromPancakeProduct(current) || '';
-        const key = `${productId}::${variationId}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          rows.push(current);
-        }
+        // Retain distinct rows for the final conflicting-price check, including
+        // duplicate identities; only avoid revisiting the same payload object.
+        rows.push(current);
       }
 
       queue.push(
@@ -4892,7 +4933,7 @@ export class IntegrationService {
     await this.prisma.$transaction(async (tx) => {
       const store = await tx.posStore.findUnique({
         where: { id: storeId },
-        select: { tenantId: true },
+        select: { tenantId: true, shopId: true },
       });
 
       if (!store) {
@@ -4910,7 +4951,9 @@ export class IntegrationService {
         const variationIdRaw = p?.variationId?.toString?.().trim?.() || '';
         const variationId = variationIdRaw.length > 0 ? variationIdRaw : null;
         const hasStockableVariation = Boolean(variationId) && variationId !== productId;
-        const parsedRetailPrice = this.toRetailPriceDecimal(p.retailPrice);
+        const parsedRetailPrice = normalizedPancakeRetailPriceForStorage(
+          p.retailPrice, p.retailPriceEvidence, { shopId: store.shopId, productId, variationId },
+        );
         const productSnapshot = p?.productSnapshot ?? null;
         const existing = variationId
           ? await tx.posProduct.findFirst({
@@ -5104,77 +5147,6 @@ export class IntegrationService {
     return values
       .map((value) => (typeof value === 'string' ? value.trim() : ''))
       .filter((value) => value.length > 0);
-  }
-
-  private extractRetailPriceFromPancakeProduct(item: any): any {
-    const directCandidates = [
-      item?.retail_price,
-      item?.retailPrice,
-      item?.price,
-      item?.selling_price,
-      item?.variation_info?.retail_price,
-      item?.variation_info?.retailPrice,
-      item?.variation_info?.price,
-      item?.variation_info?.exact_price,
-    ];
-
-    for (const candidate of directCandidates) {
-      if (candidate !== null && candidate !== undefined && candidate !== '') {
-        return candidate;
-      }
-    }
-
-    const listCandidates = [
-      ...(Array.isArray(item?.variations) ? item.variations : []),
-      ...(Array.isArray(item?.variation_infos) ? item.variation_infos : []),
-      ...(Array.isArray(item?.items) ? item.items : []),
-    ];
-
-    for (const entry of listCandidates) {
-      const candidate =
-        entry?.retail_price ??
-        entry?.retailPrice ??
-        entry?.price ??
-        entry?.exact_price ??
-        entry?.variation_info?.retail_price ??
-        entry?.variation_info?.price;
-      if (candidate !== null && candidate !== undefined && candidate !== '') {
-        return candidate;
-      }
-    }
-
-    return null;
-  }
-
-  private toRetailPriceDecimal(value: any): Prisma.Decimal | null {
-    if (value === null || value === undefined || value === '') {
-      return null;
-    }
-
-    if (typeof value === 'object' && !(value instanceof Prisma.Decimal)) {
-      const nested =
-        value?.amount ??
-        value?.value ??
-        value?.retail_price ??
-        value?.retailPrice ??
-        value?.price ??
-        value?.exact_price;
-      if (nested !== null && nested !== undefined && nested !== '') {
-        return this.toRetailPriceDecimal(nested);
-      }
-      return null;
-    }
-
-    const raw = typeof value === 'string' ? value.trim() : value.toString?.() ?? '';
-    if (!raw) return null;
-
-    const normalized = raw.replace(/[^0-9.-]/g, '');
-    if (!normalized) return null;
-
-    const parsed = Number(normalized);
-    if (!Number.isFinite(parsed)) return null;
-
-    return new Prisma.Decimal(parsed);
   }
 
   async fetchPancakeProductsByIntegrationId(id: string): Promise<any[]> {

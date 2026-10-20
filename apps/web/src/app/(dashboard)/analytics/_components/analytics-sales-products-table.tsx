@@ -29,6 +29,7 @@ export type SalesProductsSortKey =
 export type SalesProductRowItem = {
   row: SalesOverviewResponse['products'][number];
   index: number;
+  zeroCogsPriority?: 0 | 1 | 2;
   derived: {
     display: string;
     forecast: { revenueAfterRts: number; cmForecast: number };
@@ -65,6 +66,7 @@ type AnalyticsSalesProductsTableProps = {
   entityLabel?: string;
   reportView?: 'actual' | 'forecast';
   showUnits?: boolean;
+  showZeroCogsReview?: boolean;
   productStart: number;
   productEnd: number;
   totalProducts: number;
@@ -119,6 +121,7 @@ export function AnalyticsSalesProductsTable({
   entityLabel = 'Product',
   reportView = 'actual',
   showUnits = false,
+  showZeroCogsReview = false,
   productStart,
   productEnd,
   totalProducts,
@@ -211,6 +214,9 @@ export function AnalyticsSalesProductsTable({
             ) : (
               rows.map((item, idx) => {
                 const { row, derived } = item;
+                const reviewPriority = showZeroCogsReview ? item.zeroCogsPriority ?? 0 : 0;
+                const reviewBackground = reviewPriority > 0
+                  ? 'bg-red-50 dark:bg-red-950' : 'bg-white dark:bg-surface';
                 const {
                   display,
                   forecast,
@@ -224,16 +230,20 @@ export function AnalyticsSalesProductsTable({
                 } = derived;
 
                 return (
-                  <tr key={`${row.mapping || 'null'}-${idx}`} className="hover:bg-slate-50 dark:hover:bg-background-secondary">
-                    <td className="w-16 min-w-[4rem] max-w-[4rem] bg-white px-3 py-3 text-sm whitespace-nowrap text-slate-700 dark:bg-surface dark:text-slate-300 md:sticky md:left-0 md:z-10 sm:px-4 lg:px-6">
+                  <tr key={`${row.mapping || 'null'}-${idx}`} data-cogs-review={reviewPriority > 0 ? 'zero-cogs' : undefined}
+                    className={reviewPriority > 0 ? 'bg-red-50 hover:bg-red-100 dark:bg-red-950 dark:hover:bg-red-900' : 'hover:bg-slate-50 dark:hover:bg-background-secondary'}>
+                    <td className={`${reviewBackground} w-16 min-w-[4rem] max-w-[4rem] px-3 py-3 text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 md:sticky md:left-0 md:z-10 sm:px-4 lg:px-6`}>
                       {(productPage - 1) * pageSize + idx + 1}.
                     </td>
-                    <td className="bg-white px-3 py-3 text-sm font-medium whitespace-nowrap text-slate-900 dark:bg-surface dark:text-foreground md:sticky md:left-16 md:z-10 sm:px-4 lg:px-6">
+                    <td className={`${reviewBackground} px-3 py-3 text-sm font-medium whitespace-nowrap text-slate-900 dark:text-foreground md:sticky md:left-16 md:z-10 sm:px-4 lg:px-6`}>
                       {toTitleCase(display)}
+                      {reviewPriority > 0 && <span className="mt-1 block text-xs font-semibold text-red-700 dark:text-red-300">
+                        {reviewPriority === 2 ? 'Delivered orders · Zero COGS' : 'Orders · Zero COGS'}
+                      </span>}
                     </td>
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.revenue, 'currency')}</td>
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.gross_sales, 'number', isForecast ? 2 : 0)}</td>
-                    <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.cogs, 'currency')}</td>
+                    <td className={`px-3 py-3 text-center text-sm whitespace-nowrap sm:px-4 lg:px-6 ${reviewPriority > 0 ? 'font-semibold text-red-700 dark:text-red-300' : 'text-slate-700 dark:text-slate-300'}`}>{formatMetricValue(row.cogs, 'currency')}</td>
                     {showUnits && <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatUnits(row.actual_units)}</td>}
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.aov, 'currency')}</td>
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.cpp, 'currency')}</td>
