@@ -4,12 +4,13 @@ import { Decimal } from '@prisma/client/runtime/library';
 import { PrismaService } from '../../../common/prisma/prisma.service';
 import { PRODUCT_COGS_REFRESH_FROM, isProductCogsRefreshDate, productCogsManilaDate } from '../product-cogs-refresh-policy';
 
-export type ProductCogsRefreshChange = { productId: string; fromDate: string | null; toDate: string | null };
+export type ProductCogsRefreshChange = { productId: string; fromDate: string | null; toDate: string | null; zeroOnly?: boolean };
 export type ProductCogsRefreshScope = { tenantId: string; storeId: string; changes: ProductCogsRefreshChange[] };
 type CatalogProduct = { id: string; productId: string; variationId: string | null; customId: string | null };
 type SavedOrder = {
   id: string; tenantId: string; shopId: string; dateLocal: string; totalQuantity: number;
-  isVoid: boolean; cogs: string; updatedAt: Date; snapshotItems: unknown; dataItems: unknown;
+  status: number | null; isVoid: boolean; cogs: string; updatedAt: Date;
+  snapshotItemsPresent: boolean; snapshotItems: unknown; dataItems: unknown;
 };
 type CostRow = { productId: string; tenantId: string; storeId: string; cogs: Decimal; startDate: Date | null; endDate: Date | null };
 
@@ -23,6 +24,12 @@ export function isCogsCalendarDate(value: unknown): value is string {
 }
 function validCost(value: Decimal) {
   return value.isFinite() && value.gte(0) && value.lte(MAX_AMOUNT) && value.decimalPlaces() <= 2;
+}
+function savedItems(order: Pick<SavedOrder, 'snapshotItemsPresent' | 'snapshotItems' | 'dataItems'>): unknown {
+  // A present but invalid authoritative snapshot is not evidence that the
+  // legacy itemData still represents this order. Only absence permits fallback.
+  return order.snapshotItemsPresent === true ? order.snapshotItems
+    : order.snapshotItemsPresent === false ? order.dataItems : null;
 }
 
 /** Strict replay never guesses a sibling or interprets free-text order notes. */
@@ -49,11 +56,11 @@ export function resolveSavedCogsProduct(item: any, products: CatalogProduct[]): 
 }
 
 export function calculateSavedErpCogs(
-  order: Pick<SavedOrder, 'dateLocal' | 'totalQuantity' | 'isVoid' | 'snapshotItems' | 'dataItems'>,
+  order: Pick<SavedOrder, 'dateLocal' | 'totalQuantity' | 'status' | 'isVoid' | 'snapshotItemsPresent' | 'snapshotItems' | 'dataItems'>,
   products: CatalogProduct[], costs: CostRow[], scope: Pick<ProductCogsRefreshScope, 'tenantId' | 'storeId'>,
 ): { amount: Decimal; productIds: string[] } | null {
-  if (order.isVoid || !isCogsCalendarDate(order.dateLocal) || !Number.isSafeInteger(order.totalQuantity) || order.totalQuantity <= 0) return null;
-  const items = Array.isArray(order.snapshotItems) ? order.snapshotItems : order.dataItems;
+  if (order.isVoid || order.status === 7 || !isCogsCalendarDate(order.dateLocal) || !Number.isSafeInteger(order.totalQuantity) || order.totalQuantity <= 0) return null;
+  const items = savedItems(order);
   if (!Array.isArray(items) || !items.length) return null;
   let totalQuantity = 0;
   let amount = new Decimal(0);
@@ -91,10 +98,12 @@ const projectItems = (expression: string) => `CASE WHEN jsonb_typeof(${expressio
     'variation_info',jsonb_build_object('product_display_id',item->'variation_info'->'product_display_id',
       'display_id',item->'variation_info'->'display_id','barcode',item->'variation_info'->'barcode')
   ) ORDER BY ordinal),'[]'::jsonb) FROM jsonb_array_elements(${expression}) WITH ORDINALITY AS entries(item,ordinal)) ELSE NULL END`;
-const ORDER_COLUMNS = `o.id,o."tenantId",o."shopId",o."dateLocal",o."totalQuantity",o."isVoid",o.cogs::text AS cogs,o."updatedAt",
+const ORDER_COLUMNS = `o.id,o."tenantId",o."shopId",o."dateLocal",o."totalQuantity",o.status,o."isVoid",o.cogs::text AS cogs,o."updatedAt",
+  coalesce(jsonb_typeof(o."orderSnapshot")='object' AND o."orderSnapshot" ? 'items',false) AS "snapshotItemsPresent",
   ${projectItems(`o."orderSnapshot"->'items'`)} AS "snapshotItems",${projectItems('o."itemData"')} AS "dataItems"`;
 export const COGS_REFRESH_ORDERS_SQL = `SELECT ${ORDER_COLUMNS} FROM pos_orders o
   WHERE o."tenantId"=$1::uuid AND o."shopId"=$2 AND ($3::uuid IS NULL OR o.id>$3::uuid)
+    AND o."isVoid"=false AND (o.status IS NULL OR o.status<>7)
     AND ($4::text IS NULL OR o."dateLocal">=$4) AND ($5::text IS NULL OR o."dateLocal"<=$5)
   ORDER BY o.id LIMIT $6`;
 export const COGS_REFRESH_ORDER_LOCK_SQL = `SELECT ${ORDER_COLUMNS} FROM pos_orders o
@@ -111,6 +120,7 @@ export class ProductCogsRecalculationService {
   private validateScope(scope: ProductCogsRefreshScope) {
     if (!UUID.test(scope.tenantId) || !UUID.test(scope.storeId) || !Array.isArray(scope.changes) || !scope.changes.length
       || scope.changes.some(change => !UUID.test(change.productId)
+        || (change.zeroOnly !== undefined && typeof change.zeroOnly !== 'boolean')
         || (change.fromDate !== null && !isCogsCalendarDate(change.fromDate))
         || (change.toDate !== null && !isCogsCalendarDate(change.toDate))
         || (change.fromDate !== null && change.toDate !== null && change.fromDate > change.toDate))) {
@@ -162,16 +172,19 @@ export class ProductCogsRecalculationService {
     const result = { nextCursor: orders.length === pageSize ? orders[orders.length - 1].id : null,
       affectedDates: [] as string[], examined: orders.length, updated: 0, unchanged: 0, skipped: 0 };
     for (const order of orders) {
-      // Include examined valid dates even on a retry where an earlier attempt
-      // already wrote the amount. Aggregate refresh must not be lost.
       const ranges = scope.changes.filter(change => isCogsCalendarDate(order.dateLocal) && isProductCogsRefreshDate(order.dateLocal, today)
         && (!change.fromDate || order.dateLocal >= change.fromDate) && (!change.toDate || order.dateLocal <= change.toDate));
-      if (!ranges.length || order.tenantId !== scope.tenantId || order.shopId !== store.shopId) { result.skipped++; continue; }
+      if (!ranges.length || order.tenantId !== scope.tenantId || order.shopId !== store.shopId || order.isVoid || order.status === 7) { result.skipped++; continue; }
+      // A previous attempt may have filled a zero before its page continuation
+      // was persisted. Keep valid examined dates even if its cost history later
+      // changes; rebuilding from saved COGS does not authorize revaluing it.
       dates.add(order.dateLocal);
-      const items = Array.isArray(order.snapshotItems) ? order.snapshotItems : order.dataItems;
-      if (!Array.isArray(items) || !items.length || order.isVoid) { result.skipped++; continue; }
+      const items = savedItems(order);
+      if (!Array.isArray(items) || !items.length) { result.skipped++; continue; }
       const resolved = items.map(item => resolveSavedCogsProduct(item, products));
       if (resolved.some(product => !product) || !ranges.some(change => resolved.some(product => product!.id === change.productId))) { result.skipped++; continue; }
+      const zeroOnly = ranges.filter(change => resolved.some(product => product!.id === change.productId))
+        .every(change => change.zeroOnly === true);
       const ids = [...new Set(resolved.map(product => product!.id))].sort();
       const status = await this.boundedTransaction(async tx => {
         // Store/shop and display-code identities lack unique constraints.
@@ -200,13 +213,18 @@ export class ProductCogsRecalculationService {
         const [current] = await tx.$queryRawUnsafe<SavedOrder[]>(COGS_REFRESH_ORDER_LOCK_SQL, order.id, scope.tenantId, store.shopId);
         if (!current || current.updatedAt.getTime() !== order.updatedAt.getTime() || current.cogs !== order.cogs
           || current.dateLocal !== order.dateLocal || current.totalQuantity !== order.totalQuantity || current.isVoid !== order.isVoid
+          || current.status !== order.status || current.snapshotItemsPresent !== order.snapshotItemsPresent
           || JSON.stringify(current.snapshotItems) !== JSON.stringify(order.snapshotItems)
           || JSON.stringify(current.dataItems) !== JSON.stringify(order.dataItems)) {
           throw new ConflictException('ERP order changed during COGS refresh; retry page');
         }
         if (calculated.amount.equals(current.cogs)) return 'unchanged';
+        // An undated current default does not prove an older paid rate was
+        // wrong. Only explicit edit intervals may revalue nonzero saved COGS.
+        if (zeroOnly && !new Decimal(current.cogs).isZero()) return 'skipped';
         const changed = await tx.posOrder.updateMany({ where: { id: order.id, tenantId: scope.tenantId, shopId: store.shopId,
-          updatedAt: order.updatedAt, cogs: new Decimal(order.cogs), dateLocal: order.dateLocal, totalQuantity: order.totalQuantity, isVoid: order.isVoid },
+          updatedAt: order.updatedAt, cogs: new Decimal(order.cogs), dateLocal: order.dateLocal, totalQuantity: order.totalQuantity,
+          status: order.status, isVoid: order.isVoid },
         data: { cogs: calculated.amount } });
         if (changed.count !== 1) throw new ConflictException('ERP order COGS compare-and-set failed; retry page');
         return 'updated';

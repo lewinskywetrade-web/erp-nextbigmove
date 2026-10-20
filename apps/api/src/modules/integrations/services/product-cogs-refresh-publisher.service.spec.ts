@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, jest } from '@jest/globals';
 import { ProductCogsRefreshPublisherService } from './product-cogs-refresh-publisher.service';
-import { PRODUCT_COGS_REFRESH_JOB } from '../product-cogs-refresh.constants';
+import { normalizeCogsRefreshJob, PRODUCT_COGS_REFRESH_JOB } from '../product-cogs-refresh.constants';
 
 const scope = {
   tenantId: '11111111-1111-4111-8111-111111111111',
@@ -26,7 +26,8 @@ describe('ProductCogsRefreshPublisherService', () => {
     const second = queue.add.mock.calls[1];
     expect(first[0]).toBe(PRODUCT_COGS_REFRESH_JOB);
     expect(first[1]).toEqual(expect.objectContaining({ tenantId: scope.tenantId, storeId: scope.storeId,
-      changes: [{ productId: scope.changes[0].productId, fromDate: '2026-01-01', toDate: '2026-10-20' }],
+      changes: [scope.changes[0],
+        { productId: scope.changes[0].productId, fromDate: '2026-01-01', toDate: '2026-10-20', zeroOnly: true }],
       policy: 'ERP_COGS_2026_HISTORY_PROPAGATION_V1', affectedDates: [] }));
     expect(first[1].refreshId).not.toBe(second[1].refreshId);
     expect(first[2].jobId).not.toBe(second[2].jobId);
@@ -39,24 +40,39 @@ describe('ProductCogsRefreshPublisherService', () => {
     await expect(publisher.enqueue(scope)).rejects.toThrow('Redis unavailable');
   });
 
-  it('refreshes each changed product across 2026 history without restricting replay to the newest cost date', async () => {
+  it('preserves original edit ranges and adds a distinct zero-only historical range', async () => {
     const before = { productId: scope.changes[0].productId, fromDate: null, toDate: '2026-10-18' };
     await publisher.enqueue({ ...scope, changes: [before, scope.changes[0], before] });
     expect(queue.add.mock.calls[0][1].changes).toEqual([
-      { productId: scope.changes[0].productId, fromDate: '2026-01-01', toDate: '2026-10-20' },
+      before, scope.changes[0],
+      { productId: scope.changes[0].productId, fromDate: '2026-01-01', toDate: '2026-10-20', zeroOnly: true },
     ]);
   });
 
-  it('keeps distinct product ownership and never publishes an unbounded/pre-2026 interval', async () => {
+  it('keeps distinct original ownership and bounds only the expanded zero-only intervals to 2026', async () => {
     const second = '33333333-3333-4333-8333-333333333334';
     await publisher.enqueue({ ...scope, changes: [
       { productId: scope.changes[0].productId, fromDate: null, toDate: null },
       { productId: second, fromDate: '2025-10-01', toDate: '2025-12-31' },
     ] });
     expect(queue.add.mock.calls[0][1].changes).toEqual([
-      { productId: scope.changes[0].productId, fromDate: '2026-01-01', toDate: '2026-10-20' },
-      { productId: second, fromDate: '2026-01-01', toDate: '2026-10-20' },
+      { productId: scope.changes[0].productId, fromDate: null, toDate: null },
+      { productId: second, fromDate: '2025-10-01', toDate: '2025-12-31' },
+      { productId: scope.changes[0].productId, fromDate: '2026-01-01', toDate: '2026-10-20', zeroOnly: true },
+      { productId: second, fromDate: '2026-01-01', toDate: '2026-10-20', zeroOnly: true },
     ]);
+  });
+
+  it('does not merge a zero-only interval into a matching full edit interval or drop its flag in normalization', async () => {
+    const original = { ...scope.changes[0], fromDate: '2026-01-01', toDate: '2026-10-20' };
+    await publisher.enqueue({ ...scope, changes: [original] });
+    const payload = queue.add.mock.calls[0][1];
+    expect(normalizeCogsRefreshJob(payload).changes).toEqual([original, { ...original, zeroOnly: true }]);
+  });
+
+  it('never broadens an explicitly zero-only request into a nonzero revaluation interval', async () => {
+    await publisher.enqueue({ ...scope, changes: [{ ...scope.changes[0], zeroOnly: true }] });
+    expect(queue.add.mock.calls[0][1].changes.every((change: any) => change.zeroOnly === true)).toBe(true);
   });
 
   it.each([
@@ -64,6 +80,7 @@ describe('ProductCogsRefreshPublisherService', () => {
     { ...scope, changes: [] },
     { ...scope, changes: [{ ...scope.changes[0], fromDate: '2026-02-30' }] },
     { ...scope, changes: [{ ...scope.changes[0], toDate: '2026-10-18' }] },
+    { ...scope, changes: [{ ...scope.changes[0], zeroOnly: 'true' }] },
   ])('refuses invalid scope or intervals before publishing', async invalid => {
     await expect(publisher.enqueue(invalid as any)).rejects.toThrow('Invalid product COGS refresh');
     expect(queue.add).not.toHaveBeenCalled();
