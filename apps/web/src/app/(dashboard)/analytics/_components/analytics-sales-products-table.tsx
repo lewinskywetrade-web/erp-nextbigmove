@@ -238,7 +238,7 @@ export function AnalyticsSalesProductsTable({
                     <td className={`${reviewBackground} px-3 py-3 text-sm font-medium whitespace-nowrap text-slate-900 dark:text-foreground md:sticky md:left-16 md:z-10 sm:px-4 lg:px-6`}>
                       {toTitleCase(display)}
                       {reviewPriority > 0 && <span className="mt-1 block text-xs font-semibold text-red-700 dark:text-red-300">
-                        {reviewPriority === 2 ? 'Delivered orders · Zero COGS' : 'Orders · Zero COGS'}
+                        {reviewPriority === 2 ? 'Delivered orders · Missing ERP COGS' : 'Orders · Missing ERP COGS'}
                       </span>}
                     </td>
                     <td className="px-3 py-3 text-center text-sm whitespace-nowrap text-slate-700 dark:text-slate-300 sm:px-4 lg:px-6">{formatMetricValue(row.revenue, 'currency')}</td>

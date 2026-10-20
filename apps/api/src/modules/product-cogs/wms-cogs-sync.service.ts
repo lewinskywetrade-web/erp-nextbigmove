@@ -121,10 +121,11 @@ export class WmsCogsSyncService {
       try { wms = profile.inhouseUnitCost === null ? null : new Prisma.Decimal(profile.inhouseUnitCost.toString()); }
       catch { await skip('INVALID_WMS_INHOUSE_COST'); continue; }
       if (wms && (!wms.isFinite() || wms.isNegative() || wms.decimalPlaces() > 2 || wms.gt(MAX_ERP_COST))) { await skip('WMS_INHOUSE_COST_NOT_REPRESENTABLE_IN_ERP'); continue; }
+      if (wms?.isZero()) { await skip('WMS_ZERO_INTERNAL_ONLY'); continue; }
       const dated = history.filter(h => h.startDate && h.startDate <= today && (!h.endDate || h.endDate >= today));
       const defaults = history.filter(h => h.startDate === null && (!h.endDate || h.endDate >= today));
       const applicable = dated.length ? dated : defaults;
-      const fallback = !wms || wms.isZero();
+      const fallback = wms === null;
       const selected = fallback && applicable.length === 1 ? new Prisma.Decimal(applicable[0].cogs.toString()) : wms;
       if (!selected || !selected.isFinite() || !selected.gt(0) || selected.gt(MAX_ERP_COST) || selected.decimalPlaces() > 2) {
         await skip('BOTH_WMS_AND_CURRENT_ERP_COST_MISSING'); continue;
@@ -156,7 +157,7 @@ export class WmsCogsSyncService {
     }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10000, timeout: 30000 });
   }
 
-  /** ERP remains the fallback only while WMS is missing/zero. Uses current applicable history after the edit. */
+  /** ERP remains the fallback only while WMS is missing. Explicit WMS zero stays internal. */
   async syncAfterErpWrites(tx: Tx, store: { id: string; tenantId: string }, productIds: string[], actorId: string | null) {
     const tenant = await tx.tenant.findUnique({ where: { id: store.tenantId }, select: { settings: true } });
     if (!settingEnabled(tenant?.settings)) return;

@@ -80,7 +80,9 @@ export function calculateSavedErpCogs(
     const dated = history.filter(row => row.startDate && row.startDate.getTime() <= date && (!row.endDate || row.endDate.getTime() >= date));
     const defaults = history.filter(row => row.startDate === null && (!row.endDate || row.endDate.getTime() >= date));
     const applicable = dated.length ? dated : defaults;
-    if (applicable.length !== 1) return null;
+    // A selected zero is missing ERP evidence, even if a positive default or
+    // another item could otherwise make the order's total positive.
+    if (applicable.length !== 1 || !applicable[0].cogs.gt(0)) return null;
     amount = amount.plus(applicable[0].cogs.times(quantity));
     totalQuantity += quantity;
     productIds.add(product.id);

@@ -170,7 +170,7 @@ function createHarness(initialRows: any[] = []) {
 }
 
 const invalidAmounts: unknown[] = [
-  undefined, null, '12.34', {}, NaN, Infinity, -Infinity, -1,
+  undefined, null, '12.34', {}, NaN, Infinity, -Infinity, -1, 0,
   0.001, 12.345, 10_000_000_000,
 ];
 
@@ -206,7 +206,7 @@ describe('product COGS service validation', () => {
     expect(getStore).not.toHaveBeenCalled();
   });
 
-  it.each([0, 0.01, 12.34, MAX_PRODUCT_COGS])('stores valid peso amounts unchanged: %p', async (amount) => {
+  it.each([0.01, 12.34, MAX_PRODUCT_COGS])('stores valid peso amounts unchanged: %p', async (amount) => {
     const { service, operations } = createHarness();
     const entry = await service.addCogsEntry('product-1', 'store-1', amount);
     expect(operations.create).toHaveBeenCalledWith({
@@ -362,17 +362,25 @@ describe('date-aware current COGS writes and reads', () => {
     expect((await service.getCogsForDate('product-1', 'store-1', yesterday))!.toString()).toBe('8');
   });
 
-  it('preserves a dated zero for partner-supplied stock and keeps the earlier paid rate', async () => {
-    const { service, rows, operations } = createHarness([costEntry({ startDate: new Date('2026-10-01') })]);
-    await service.addCogsEntry('product-1', 'store-1', 0);
+  it('treats selected legacy zero as missing without falling through to the paid default, and permits correction', async () => {
+    const { service, rows } = createHarness([
+      costEntry({ id: 'default', cogs: new Decimal(10) }),
+      costEntry({ id: 'zero', cogs: new Decimal(0), startDate: today }),
+    ]);
+    expect(await service.getCurrentCogs('product-1', 'store-1')).toBeNull();
+    expect(await service.getCogsForDate('product-1', 'store-1', today)).toBeNull();
     expect((await service.getCogsForDate('product-1', 'store-1', yesterday))!.toString()).toBe('10');
-    expect((await service.getCogsForDate('product-1', 'store-1', today))!.toString()).toBe('0');
-    const zero = rows().find(row => row.startDate?.getTime() === today.getTime());
-    expect(zero!.cogs.toString()).toBe('0');
-    operations.update.mockClear();
-    await service.addCogsEntry('product-1', 'store-1', 0);
-    expect(operations.update).not.toHaveBeenCalled();
+    await service.addCogsEntry('product-1', 'store-1', 12);
+    expect((await service.getCurrentCogs('product-1', 'store-1'))!.cogs.toString()).toBe('12');
     expect(rows()).toHaveLength(2);
+  });
+
+  it('can replace a legacy zero default with a dated positive rate while retaining history', async () => {
+    const { service, rows } = createHarness([costEntry({ cogs: new Decimal(0) })]);
+    await service.addCogsEntry('product-1', 'store-1', 12);
+    expect(rows()).toHaveLength(2);
+    expect(rows()[0].cogs.toString()).toBe('0');
+    expect((await service.getCurrentCogs('product-1', 'store-1'))!.cogs.toString()).toBe('12');
   });
 
   it('does not use a future baseline or an expired undated row for an earlier date', async () => {
@@ -428,7 +436,7 @@ describe('single product COGS HTTP contracts', () => {
 
   it.each([
     undefined, null, {}, true, false, [], [12.34], '', ' ', '12.34',
-    NaN, Infinity, -Infinity, -1, 0.001, 12.345, 10_000_000_000,
+    NaN, Infinity, -Infinity, -1, 0, 0.001, 12.345, 10_000_000_000,
   ])(
     'returns a validation error for invalid request amount %p', async (amount) => {
       await expect(pipe.transform({ cogs: amount }, { type: 'body', metatype: ProductCogsDto }))
@@ -436,7 +444,7 @@ describe('single product COGS HTTP contracts', () => {
     },
   );
 
-  it.each([0, 0.01, 12.34, MAX_PRODUCT_COGS])('accepts valid currency amount %p', async (amount) => {
+  it.each([0.01, 12.34, MAX_PRODUCT_COGS])('accepts valid currency amount %p', async (amount) => {
     await expect(pipe.transform({ cogs: amount }, { type: 'body', metatype: ProductCogsDto }))
       .resolves.toMatchObject({ cogs: amount });
   });

@@ -1,6 +1,6 @@
 type CogsReviewValues = { gross_sales?: unknown; cogs?: unknown };
 
-/** A review cue, not a claim that recorded zero cost is invalid. */
+/** Flag missing ERP cost on rows with orders; warehouse zero costs use a separate policy. */
 export function zeroCogsReviewPriority(
   row: CogsReviewValues, actualDeliveredOrders: unknown, enabled: boolean,
 ): 0 | 1 | 2 {

@@ -64,9 +64,30 @@ describe('tenant-scoped WMS to ERP current COGS connection', () => {
     expect(f.publisher.enqueue).toHaveBeenCalledWith({ tenantId: T, storeId: S, changes: [{ productId: P, fromDate: '2026-10-20', toDate: null }] });
     expect(f.audits[0].changes.historicalRatesInferred).toBe(false);
   });
-  it.each([null, '0.00'])('missing WMS %s fills from unique current ERP, leaving ERP history unchanged', async value => {
-    const f = fixture(value, '359.00'), r = await f.sync(); expect(r.outcomes[0].status).toBe('FILLED_WMS_FROM_ERP'); expect(f.profile().inhouseUnitCost.toString()).toBe('359'); expect(f.histories()).toHaveLength(1); expect(f.publisher.enqueue).not.toHaveBeenCalled();
+  it('missing WMS fills from unique current ERP, leaving ERP history unchanged', async () => {
+    const f = fixture(null, '359.00'), r = await f.sync(); expect(r.outcomes[0].status).toBe('FILLED_WMS_FROM_ERP'); expect(f.profile().inhouseUnitCost.toString()).toBe('359'); expect(f.histories()).toHaveLength(1); expect(f.publisher.enqueue).not.toHaveBeenCalled();
     expect(f.tx.wmsProductProfile.update.mock.calls[0][0].where.updatedAt).toEqual(date('2026-10-19'));
+  });
+  it.each([null, '359.00'])('keeps explicit WMS zero internal and leaves ERP %s unchanged', async erp => {
+    const f = fixture('0.00', erp), r = await f.sync();
+    expect(r.outcomes[0]).toMatchObject({ status: 'SKIPPED', reason: 'WMS_ZERO_INTERNAL_ONLY' });
+    expect(f.profile().inhouseUnitCost.toFixed(2)).toBe('0.00');
+    expect(f.tx.wmsProductProfile.update).not.toHaveBeenCalled();
+    expect(f.tx.posProductCogs.create).not.toHaveBeenCalled();
+    expect(f.publisher.enqueue).not.toHaveBeenCalled();
+  });
+  it('positive WMS may correct legacy zero ERP history without deleting that history', async () => {
+    const f = fixture('25.00', '0.00'), r = await f.sync();
+    expect(r.outcomes[0].status).toBe('SYNCED_FROM_WMS');
+    expect(f.histories().map(h => h.cogs.toString())).toEqual(['0', '25']);
+  });
+  it('missing WMS cannot bypass selected ERP zero to a paid default', async () => {
+    const f = fixture(null, '359.00');
+    f.histories().push({ ...f.histories()[0], id: 'ZERO', cogs: money('0'), startDate: date('2026-10-01') });
+    const r = await f.sync();
+    expect(r.outcomes[0].reason).toBe('BOTH_WMS_AND_CURRENT_ERP_COST_MISSING');
+    expect(f.tx.wmsProductProfile.update).not.toHaveBeenCalled();
+    expect(f.publisher.enqueue).not.toHaveBeenCalled();
   });
   it('never replaces a positive WMS cost from ERP or supplier, and same costs are a job/history no-op', async () => {
     const f = fixture('22.00', '22.00'); f.profile().supplierUnitCost = money('999.00'); const r = await f.sync(); expect(r.outcomes[0].status).toBe('ALREADY_EQUAL'); expect(f.tx.posProductCogs.create).not.toHaveBeenCalled(); expect(f.tx.wmsProductProfile.update).not.toHaveBeenCalled(); expect(f.publisher.enqueue).not.toHaveBeenCalled();
@@ -125,7 +146,13 @@ describe('tenant-scoped WMS to ERP current COGS connection', () => {
     tx.wmsProductProfile.findUnique.mockResolvedValue(null); await expect(assertWmsManagedCogsEditable(tx, P, { id: S, tenantId: T })).resolves.toBeUndefined();
   });
   it('ERP fallback after a historical edit uses current applicable cost, never the edited past amount', async () => {
-    const f = fixture('0', '359.00'); f.histories().push({ ...f.histories()[0], id: 'PAST', cogs: money('7.00'), startDate: date('2026-01-01'), endDate: date('2026-01-31') });
+    const f = fixture(null, '359.00'); f.histories().push({ ...f.histories()[0], id: 'PAST', cogs: money('7.00'), startDate: date('2026-01-01'), endDate: date('2026-01-31') });
     await f.service.syncAfterErpWrites(f.tx, { id: S, tenantId: T }, [P], null); expect(f.profile().inhouseUnitCost.toString()).toBe('359'); expect(f.histories()).toHaveLength(2);
+  });
+  it('an ERP edit never backfills an explicit internal WMS zero', async () => {
+    const f = fixture('0', '359');
+    await f.service.syncAfterErpWrites(f.tx, { id: S, tenantId: T }, [P], null);
+    expect(f.profile().inhouseUnitCost.toString()).toBe('0');
+    expect(f.tx.wmsProductProfile.update).not.toHaveBeenCalled();
   });
 });

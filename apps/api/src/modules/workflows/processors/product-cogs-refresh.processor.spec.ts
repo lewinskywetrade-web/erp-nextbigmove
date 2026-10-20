@@ -45,7 +45,10 @@ describe('ProductCogsRefreshProcessor', () => {
   it('queues a durable continuation with prior and current dates before any reports rebuild', async () => {
     recalculation.recalculateBatch.mockResolvedValue(result({ nextCursor: cursor,
       affectedDates: ['2026-10-19', '2026-10-18', '2026-10-19'] }));
-    await processor.handleRefresh(job({ ...data, affectedDates: ['2026-10-17'] }));
+    const receipt = await processor.handleRefresh(job({ ...data, affectedDates: ['2026-10-17'] }));
+    expect(receipt).toEqual({ receiptVersion: 1, refreshId: data.refreshId, storeId: data.storeId,
+      cursor: null, nextCursor: cursor, affectedDates: ['2026-10-17', '2026-10-18', '2026-10-19'],
+      nextJobId: `product-cogs-refresh-${data.refreshId}-${cursor}`, reconcileJobIds: [] });
     expect(queue.add).toHaveBeenCalledTimes(1);
     expect(queue.add).toHaveBeenCalledWith(PRODUCT_COGS_REFRESH_JOB,
       { ...data, cursor, affectedDates: ['2026-10-17', '2026-10-18', '2026-10-19'] },
@@ -69,7 +72,11 @@ describe('ProductCogsRefreshProcessor', () => {
 
   it('rebuilds each affected owner-tenant day once after the last page, without a full reset', async () => {
     recalculation.recalculateBatch.mockResolvedValue(result({ affectedDates: ['2026-10-19', '2026-10-18'] }));
-    await processor.handleRefresh(job({ ...data, cursor, affectedDates: ['2026-10-18', '2026-10-17'] }));
+    const receipt = await processor.handleRefresh(job({ ...data, cursor, affectedDates: ['2026-10-18', '2026-10-17'] }));
+    expect(receipt).toEqual({ receiptVersion: 1, refreshId: data.refreshId, storeId: data.storeId,
+      cursor, nextCursor: null, affectedDates: ['2026-10-17', '2026-10-18', '2026-10-19'],
+      nextJobId: null, reconcileJobIds: ['2026-10-17', '2026-10-18', '2026-10-19']
+        .map(day => `product-cogs-reconcile-${data.refreshId}-${day}`) });
     expect(recalculation.waitForSourceTransaction).not.toHaveBeenCalled();
     expect(queue.add).toHaveBeenCalledTimes(3);
     expect(queue.add.mock.calls.map(call => call[1].dateLocal)).toEqual(['2026-10-17', '2026-10-18', '2026-10-19']);
@@ -132,5 +139,12 @@ describe('ProductCogsRefreshProcessor', () => {
     await processor.handleRefresh(job({ ...data, cursor,
       affectedDates: ['2025-01-01', '2026-06-12', '2027-01-01'] }));
     expect(queue.add.mock.calls.map(call => call[1].dateLocal)).toEqual(['2026-01-01', '2026-06-12']);
+  });
+
+  it('returns an explicit final empty receipt when no valid report dates need enqueueing', async () => {
+    expect(await processor.handleRefresh(job())).toEqual({ receiptVersion: 1,
+      refreshId: data.refreshId, storeId: data.storeId, cursor: null, nextCursor: null,
+      affectedDates: [], nextJobId: null, reconcileJobIds: [] });
+    expect(queue.add).not.toHaveBeenCalled();
   });
 });

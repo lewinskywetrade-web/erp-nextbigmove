@@ -1,6 +1,6 @@
 import { ConflictException } from '@nestjs/common';
 import { PosProductCogs, Prisma } from '@prisma/client';
-import { assertValidProductCogs } from '../integrations/product-cogs-validation';
+import { assertRecordedProductCogs, assertValidProductCogs } from '../integrations/product-cogs-validation';
 
 export type LockedCogsProduct = { id: string; name: string; productId: string; customId: string | null; teamId: string | null };
 
@@ -38,11 +38,13 @@ export async function findApplicableProductCogs(
         OR: [{ endDate: { gte: date } }, { endDate: null }] },
       orderBy: [{ startDate: 'desc' }, { updatedAt: 'desc' }, { id: 'asc' }],
     });
-    if (dated) return dated;
-    return client.posProductCogs.findFirst({
+    const selected = dated ?? await client.posProductCogs.findFirst({
       where: { ...scope, startDate: null, OR: [{ endDate: { gte: date } }, { endDate: null }] },
       orderBy: [{ updatedAt: 'desc' }, { createdAt: 'desc' }, { id: 'asc' }],
     });
+    if (!selected) return null;
+    try { assertValidProductCogs(Number(selected.cogs.toString())); } catch { return null; }
+    return selected;
   }
 
 export function validateCurrentCogsHistory(
@@ -54,7 +56,7 @@ export function validateCurrentCogsHistory(
     const todayTime = today.getTime();
     for (const entry of history) {
       if (entry.productId !== productId || entry.storeId !== store.id || entry.tenantId !== store.tenantId) review('scope mismatch');
-      try { assertValidProductCogs(Number(entry.cogs.toString())); } catch { review('invalid recorded cost'); }
+      try { assertRecordedProductCogs(Number(entry.cogs.toString())); } catch { review('invalid recorded cost'); }
       const start = entry.startDate?.getTime();
       const end = entry.endDate?.getTime();
       if ((start !== undefined && !Number.isFinite(start)) || (end !== undefined && !Number.isFinite(end))) review('invalid date');
@@ -76,6 +78,7 @@ export async function writeCurrentProductCogs(
     tx: Prisma.TransactionClient, product: LockedCogsProduct,
     store: { id: string; tenantId: string }, cogs: number | Prisma.Decimal, today: Date,
   ) {
+    assertValidProductCogs(Number(cogs.toString()));
     // Deliberately include all rows for this parent, so wrong-scope history is
     // rejected rather than hidden by a tenant filter and silently duplicated.
     const history = await tx.posProductCogs.findMany({ where: { productId: product.id } });

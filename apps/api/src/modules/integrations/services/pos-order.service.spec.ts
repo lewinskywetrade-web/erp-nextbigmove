@@ -118,6 +118,24 @@ describe('POS order COGS effective dates', () => {
     await expect((service as any).calculateCogs('tenant-1', 'store-1', [item], '2026-10-01'))
       .resolves.toEqual({ cogs: 22, totalQuantity: 2 });
   });
+
+  it('keeps selected dated zero unresolved despite a positive default and note', async () => {
+    const { service, prisma } = createCogsHarness([variantA], {});
+    const rows = [historyRow('8.00', null), historyRow('0.00', '2026-10-01')];
+    prisma.posProductCogs.findFirst.mockImplementation(async query => queryCostHistory(rows, query));
+    await expect((service as any).calculateCogs('tenant-1', 'store-1', [item], '2026-10-01'))
+      .resolves.toEqual({ cogs: 0, totalQuantity: 2, cogsUnresolved: true });
+    await expect((service as any).calculateCogs('tenant-1', 'store-1', [item], '2026-09-30'))
+      .resolves.toEqual({ cogs: 16, totalQuantity: 2 });
+  });
+
+  it('does not return a partial monetary amount when a mixed order has a zero-cost line', async () => {
+    const { service } = createCogsHarness([variantA, variantB], { 'catalog-a': '10', 'catalog-b': '0' });
+    await expect((service as any).calculateCogs('tenant-1', 'store-1', [
+      { product_id: 'parent', variation_id: 'variant-a', quantity: 1 },
+      { product_id: 'parent', variation_id: 'variant-b', quantity: 1, note_product: 'SKU-999' },
+    ], '2026-10-01')).resolves.toEqual({ cogs: 0, totalQuantity: 2, cogsUnresolved: true });
+  });
 });
 
 describe('POS order catalog COGS identity', () => {
@@ -275,6 +293,7 @@ function createUpsertHarness(previous: any = null) {
   const outbound = { syncForPosOrders: jest.fn(async () => undefined) };
   const service = new PosOrderService(prisma as never, fulfillment as never, inventory as never, outbound as never);
   return { service, prisma, inventory, outbound, updatedAt, events, hooks, tx,
+    setCatalogCost: (amount: number) => { catalogCost = new Decimal(amount); },
     readCogs: () => storedCogs, completeSourceEdit: (amount: number) => {
       catalogCost = new Decimal(amount);
       if (previous) storedCogs = new Decimal(amount);
@@ -285,17 +304,45 @@ function createUpsertHarness(previous: any = null) {
 const rawOrder = { id: 'order-1', shop_id: 'shop-1', inserted_at: '2026-10-18T02:00:00Z', status: 4 };
 
 describe('POS webhook COGS persistence', () => {
-  it.each([false, true])('keeps a verified catalog zero despite an old note price (existing=%s)', async existing => {
-    const { service, completeSourceEdit, readCogs, prisma } = createUpsertHarness(
+  it.each([false, true])('flags a catalog zero unresolved and preserves existing positive cost (existing=%s)', async existing => {
+    const { service, setCatalogCost, readCogs, prisma } = createUpsertHarness(
       existing ? { cogs: new Decimal('123.45'), orderSnapshot: null } : null);
-    completeSourceEdit(0);
+    setCatalogCost(0);
     const result = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{
       ...rawOrder, items: [{ product_id: 'parent', variation_id: 'variant-a', quantity: 2, note_product: 'SKU-999' }],
     }], null);
     expect(result.upserted).toBe(1);
-    expect(readCogs().toFixed(2)).toBe('0.00');
+    expect(readCogs().toFixed(2)).toBe(existing ? '123.45' : '0.00');
+    expect(result.outcomes[0].warning).toContain('ERP_POSITIVE_COGS_WMS_ZERO_ONLY_V1');
     if (!existing) expect(prisma.posOrder.upsert.mock.calls[0][0].create.cogs.toFixed(2)).toBe('0.00');
-    expect(prisma.posOrder.updateMany.mock.calls[0][0].data.cogs.toFixed(2)).toBe('0.00');
+    expect(prisma.posOrder.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('preserves the whole saved amount for mixed resolved and unresolved item lines', async () => {
+    const { service, prisma, tx, readCogs } = createUpsertHarness({ cogs: new Decimal('123.45') });
+    prisma.posProduct.findMany.mockResolvedValue([variantA, variantB]);
+    tx.posProductCogs.findFirst.mockImplementation(async ({ where }: any) =>
+      ({ cogs: new Decimal(where.productId === 'catalog-a' ? 10 : 0) }));
+    const result = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{
+      ...rawOrder, items: [
+        { product_id: 'parent', variation_id: 'variant-a', quantity: 1 },
+        { product_id: 'parent', variation_id: 'variant-b', quantity: 1 },
+      ],
+    }], null);
+    expect(result.upserted).toBe(1);
+    expect(readCogs().toFixed(2)).toBe('123.45');
+    expect(prisma.posOrder.updateMany).not.toHaveBeenCalled();
+    expect(result.outcomes[0].warning).toContain('unresolved');
+  });
+
+  it('uses the locked unresolved result even if parsing previously saw a positive source', async () => {
+    const { service, setCatalogCost, hooks, readCogs, prisma } = createUpsertHarness({ cogs: new Decimal('123.45') });
+    hooks.beforeTransaction = async () => { setCatalogCost(0); };
+    await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{
+      ...rawOrder, items: [{ product_id: 'parent', variation_id: 'variant-a', quantity: 1 }],
+    }], null);
+    expect(readCogs().toFixed(2)).toBe('123.45');
+    expect(prisma.posOrder.updateMany).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -370,7 +417,7 @@ describe('POS webhook COGS persistence', () => {
     },
   );
 
-  it('preserves a legitimate zero cost on a partial webhook', async () => {
+  it('preserves an unresolved zero placeholder on a partial webhook', async () => {
     const { service, prisma } = createUpsertHarness({ cogs: new Decimal(0), orderSnapshot: null });
     await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [rawOrder], null);
     expect(prisma.posOrder.upsert.mock.calls[0][0].update).not.toHaveProperty('cogs');
@@ -393,12 +440,21 @@ describe('POS webhook COGS persistence', () => {
     expect(prisma.posOrder.updateMany).not.toHaveBeenCalled();
   });
 
-  it('still initializes a newly created order without items at zero COGS', async () => {
+  it('flags a newly created order without items as unresolved instead of inventing a cost', async () => {
     const { service, prisma } = createUpsertHarness();
-    await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [rawOrder], null);
+    const result = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [rawOrder], null);
     expect(prisma.posOrder.upsert.mock.calls[0][0].create.cogs.toFixed(2)).toBe('0.00');
     expect(prisma.posOrder.upsert.mock.calls[0][0].update).not.toHaveProperty('cogs');
     expect(prisma.posOrder.updateMany).not.toHaveBeenCalled();
+    expect(result.outcomes[0].warning).toContain('ERP_POSITIVE_COGS_WMS_ZERO_ONLY_V1');
+  });
+
+  it.each([1, 9, 12])('preserves paid COGS during a transient empty nonvoid status-%s snapshot', async status => {
+    const { service, prisma, readCogs } = createUpsertHarness({ cogs: new Decimal('123.45'), orderSnapshot: null });
+    const result = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{ ...rawOrder, status, items: [] }], null);
+    expect(readCogs().toFixed(2)).toBe('123.45');
+    expect(prisma.posOrder.updateMany).not.toHaveBeenCalled();
+    expect(result.outcomes[0].warning).toContain('unresolved');
   });
 
   it('recalculates COGS when a complete replacement item payload is supplied', async () => {

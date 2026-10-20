@@ -52,17 +52,17 @@ describe('strict saved-order ERP catalog calculation', () => {
     expect(calculated.productIds).toEqual([productA.id]);
   });
 
-  it('uses the zero rate on its effective date rather than falling back to the paid default', () => {
+  it('rejects selected zero without bypassing its date precedence or invalidating another positive date', () => {
     const histories = [cost({ cogs: new Decimal(10) }), cost({ startDate: new Date('2026-10-19'), cogs: new Decimal(0) })];
     expect(calculateSavedErpCogs(order({ dateLocal: '2026-10-18' }), [productA], histories, scope)!.amount.toFixed(2)).toBe('20.00');
-    expect(calculateSavedErpCogs(order(), [productA], histories, scope)!.amount.toFixed(2)).toBe('0.00');
+    expect(calculateSavedErpCogs(order(), [productA], histories, scope)).toBeNull();
     expect(calculateSavedErpCogs(order(), [productA], [], scope)).toBeNull();
   });
 
-  it('includes a verified zero-cost line in the full order quantity and sum', () => {
+  it('rejects the whole mixed order when any applicable item cost is zero', () => {
     const saved = order({ totalQuantity: 3, snapshotItems: [itemA, { ...itemA, variation_id: 'variant-b', quantity: 1 }] });
     const histories = [cost({ cogs: new Decimal(0) }), cost({ productId: productB.id, cogs: new Decimal('12.34') })];
-    expect(calculateSavedErpCogs(saved, [productA, productB], histories, scope)!.amount.toFixed(2)).toBe('12.34');
+    expect(calculateSavedErpCogs(saved, [productA, productB], histories, scope)).toBeNull();
   });
 
   it('does not use future/expired costs or note_product text to fill a catalog gap', () => {
@@ -179,12 +179,11 @@ describe('bounded durable ERP order recalculation pages', () => {
     expect(writes).toHaveLength(0);
   });
 
-  it('can apply a verified zero rate to an order without treating missing history as zero', async () => {
+  it('preserves existing paid COGS when the selected ERP rate is zero', async () => {
     const { service, setHistory, writes } = harness([order({ cogs: '20.00' })]);
     setHistory([cost({ cogs: new Decimal(0) })]);
-    expect(await service.recalculateBatch(scope)).toMatchObject({ updated: 1, skipped: 0, affectedDates: ['2026-10-19'] });
-    expect(writes[0].where.cogs.toFixed(2)).toBe('20.00');
-    expect(writes[0].data.cogs.toFixed(2)).toBe('0.00');
+    expect(await service.recalculateBatch(scope)).toMatchObject({ updated: 0, skipped: 1, affectedDates: ['2026-10-19'] });
+    expect(writes).toHaveLength(0);
   });
 
   it('preserves amounts when any line lacks an applicable ERP cost', async () => {
@@ -293,7 +292,7 @@ describe('bounded durable ERP order recalculation pages', () => {
     ]);
     const result = await service.recalculateBatch({ ...scope,
       changes: [{ productId: productA.id, fromDate: '2026-01-01', toDate: '2026-10-20' }] });
-    expect(result).toMatchObject({ examined: 4, updated: 2, unchanged: 1, skipped: 1 });
+    expect(result).toMatchObject({ examined: 4, updated: 2, unchanged: 0, skipped: 2 });
     expect(writes.map(write => [write.where.dateLocal, write.data.cogs.toFixed(2)]))
       .toEqual([['2026-03-05', '10.00'], ['2026-10-05', '24.00']]);
   });
@@ -313,7 +312,7 @@ describe('bounded durable ERP order recalculation pages', () => {
       .toEqual([['2026-09-06', '0.00', '320.00'], ['2026-10-19', '310.00', '320.00']]);
   });
 
-  it('uses dated rates including explicit zero for historical zero-only replay without adopting the newest rate', async () => {
+  it('fills dated positive rates but skips zero history during historical zero-only replay', async () => {
     const rows = ['2026-03-05', '2026-09-05', '2026-10-05'].map((dateLocal, index) =>
       order({ id: `40000000-0000-0000-0000-00000000000${index + 1}`, dateLocal }));
     const { service, writes, setHistory } = harness(rows);
@@ -324,7 +323,7 @@ describe('bounded durable ERP order recalculation pages', () => {
     ]);
     expect(await service.recalculateBatch({ ...scope,
       changes: [{ productId: productA.id, fromDate: '2026-01-01', toDate: null, zeroOnly: true }] }))
-      .toMatchObject({ updated: 2, unchanged: 1, skipped: 0 });
+      .toMatchObject({ updated: 2, unchanged: 0, skipped: 1 });
     expect(writes.map(write => [write.where.dateLocal, write.data.cogs.toFixed(2)]))
       .toEqual([['2026-03-05', '10.00'], ['2026-10-05', '24.00']]);
   });
