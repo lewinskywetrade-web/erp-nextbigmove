@@ -1715,7 +1715,7 @@ export class SalesAnalyticsService {
           accumulatePosOrder(day.sums, order, false);
           orderCount++;
           if (store === UNATTRIBUTED) ambiguousOrderCount++;
-          if (!order.isVoid && order.status !== 7 && this.toNumber(order.cogs) === 0) zeroCogsOrderCount++;
+          if (order.dateLocal >= '2026-01-01' && isSelected(store) && !order.isVoid && order.status !== 7 && this.toNumber(order.cogs) === 0) zeroCogsOrderCount++;
           if (order.dateLocal >= startStr && isSelected(store) && order.updatedAt && (!sourceUpdatedAt || order.updatedAt > sourceUpdatedAt)) sourceUpdatedAt = order.updatedAt;
           // These direct-source projections retain their existing status and
           // denominator policies; the tracking-based count remains separate.

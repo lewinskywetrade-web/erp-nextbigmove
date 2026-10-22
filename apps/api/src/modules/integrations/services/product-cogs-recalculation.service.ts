@@ -42,16 +42,24 @@ export function resolveSavedCogsProduct(item: any, products: CatalogProduct[]): 
   const displays = [item.product_display_id, item.productDisplayId, item.variation_info?.product_display_id,
     item.variation_info?.display_id, item.variation_info?.barcode].map(identifier).filter((value): value is string => !!value);
   const modern = products.filter(product => product.variationId && product.variationId !== product.productId);
-  const matches = variant ? modern.filter(product => product.variationId === variant)
+  const modernMatches = variant ? modern.filter(product => product.variationId === variant)
     : modern.filter(product => product.customId && displays.includes(product.customId));
+  const fallbackMatches = variant
+    ? products.filter(product => product.variationId === variant)
+    : displays.length
+      ? products.filter(product => product.customId && displays.includes(product.customId))
+      : parents.length === 1
+        ? products.filter(product => product.productId === parents[0] || product.customId === parents[0])
+        : [];
+  const matches = modernMatches.length ? modernMatches : fallbackMatches;
   if (matches.length !== 1) return null;
   const product = matches[0];
   if (parents.length && !parents.some(parent => parent === product.productId || parent === product.customId)) return null;
   // Provider display/barcode aliases often differ from the ERP custom SKU.
   // An unknown auxiliary value cannot veto an exact variant. A recognized
   // alias pointing at another product remains a genuine identity conflict,
-  // including when the item also contains this product's own alias.
-  if (displays.some(display => products.some(other => other.id !== product.id && other.customId === display))) return null;
+  // unless it matches this product's own customId (e.g. shared parent SKU).
+  if (displays.some(display => display !== product.customId && products.some(other => other.id !== product.id && other.customId === display))) return null;
   return product;
 }
 
@@ -198,10 +206,11 @@ export class ProductCogsRecalculationService {
         const currentStores = await tx.posStore.findMany({ where: { tenantId: scope.tenantId, shopId: store.shopId }, select: { id: true } });
         if (currentStores.length !== 1 || currentStores[0].id !== scope.storeId) throw new ConflictException('ERP COGS refresh shop scope changed; retry page');
         const variants = items.flatMap(item => [identifier(item?.variation_id), identifier(item?.variationId)]).filter((value): value is string => !!value);
+        const parents = items.flatMap(item => [identifier(item?.product_id), identifier(item?.productId)]).filter((value): value is string => !!value);
         const displays = items.flatMap(item => [item?.product_display_id, item?.productDisplayId, item?.variation_info?.product_display_id,
           item?.variation_info?.display_id, item?.variation_info?.barcode]).map(identifier).filter((value): value is string => !!value);
         const currentProducts = await tx.posProduct.findMany({ where: { storeId: scope.storeId, store: { tenantId: scope.tenantId },
-          OR: [{ id: { in: ids } }, { variationId: { in: variants } }, { customId: { in: displays } }] },
+          OR: [{ id: { in: ids } }, { variationId: { in: variants } }, { productId: { in: parents } }, { customId: { in: displays } }] },
         select: { id: true, productId: true, variationId: true, customId: true } });
         const currentResolved = items.map(item => resolveSavedCogsProduct(item, currentProducts));
         if (currentResolved.some(product => !product)) return 'skipped';

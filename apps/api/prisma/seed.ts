@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'fs';
 import { resolve } from 'path';
 import { PrismaClient, RbacWorkspace, RoleScope } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
+import Redis from 'ioredis';
 
 function loadEnvFile(filePath: string) {
   if (!existsSync(filePath)) {
@@ -756,12 +757,669 @@ async function ensureDefaultTeamsAndBackfill() {
   console.log('✓ Skipped default team creation/backfill (per request)');
 }
 
+async function backfill2026OrderCogsAndReports() {
+  console.log('Starting 2026 ERP Order COGS & Report Reconciliation Backfill...');
+  const startedAt = Date.now();
+
+  try {
+    // 1. Log SmileOrganics and overall 2026 state BEFORE backfill
+    const smileBefore = await prisma.$queryRawUnsafe<any[]>(`
+      SELECT
+        s.name AS "storeName",
+        s."shopId",
+        COUNT(o.id)::int AS "octOrders",
+        COUNT(o.id) FILTER (WHERE o.cogs = 0)::int AS "octZeroCogsOrders",
+        COALESCE(SUM(o."totalQuantity"), 0)::int AS "octTotalQuantity",
+        COALESCE(SUM(o.cogs), 0)::numeric(14,2)::text AS "octStoredCogs"
+      FROM pos_stores s
+      LEFT JOIN pos_orders o
+        ON o."tenantId" = s."tenantId"
+       AND o."shopId" = s."shopId"
+       AND o."dateLocal" >= '2026-10-01'
+       AND o."isVoid" = false
+       AND (o.status IS NULL OR o.status <> 7)
+      WHERE s.name ILIKE '%Smile%'
+      GROUP BY s.id, s.name, s."shopId"
+    `);
+    console.log('SmileOrganics BEFORE backfill:', JSON.stringify(smileBefore));
+
+    // 2. Remove zero/negative pos_product_cogs rows when a positive COGS row exists for the same product
+    const deletedZeroRows = await prisma.$executeRawUnsafe(`
+      DELETE FROM pos_product_cogs z
+      WHERE z.cogs <= 0
+        AND EXISTS (
+          SELECT 1
+          FROM pos_product_cogs p
+          WHERE p."productId" = z."productId"
+            AND p.cogs > 0
+        )
+    `);
+
+    // 3. Deduplicate multiple undated (startDate IS NULL) rows per product, keeping the latest positive row
+    const dedupedUndatedRows = await prisma.$executeRawUnsafe(`
+      DELETE FROM pos_product_cogs d
+      USING (
+        SELECT id,
+               ROW_NUMBER() OVER (
+                 PARTITION BY "tenantId", "productId", "storeId"
+                 ORDER BY (cogs > 0) DESC, "updatedAt" DESC, id DESC
+               ) AS rn
+        FROM pos_product_cogs
+        WHERE "startDate" IS NULL
+      ) ranked
+      WHERE d.id = ranked.id
+        AND ranked.rn > 1
+    `);
+
+    // 4. Ensure every product with positive dated COGS also has an undated (startDate IS NULL) baseline row
+    //    set to its earliest positive COGS so all Jan-Oct 2026 dates before min(startDate) resolve cleanly.
+    const insertedBaselineFromDated = await prisma.$executeRawUnsafe(`
+      INSERT INTO pos_product_cogs (id, "tenantId", "teamId", "productId", "storeId", cogs, "startDate", "endDate", "createdAt", "updatedAt")
+      SELECT
+        gen_random_uuid(),
+        earliest."tenantId",
+        earliest."teamId",
+        earliest."productId",
+        earliest."storeId",
+        earliest.cogs,
+        NULL,
+        NULL,
+        NOW(),
+        NOW()
+      FROM (
+        SELECT DISTINCT ON ("tenantId", "productId", "storeId")
+          "tenantId",
+          "teamId",
+          "productId",
+          "storeId",
+          cogs
+        FROM pos_product_cogs
+        WHERE cogs > 0
+          AND "startDate" IS NOT NULL
+        ORDER BY "tenantId", "productId", "storeId", "startDate" ASC, "updatedAt" DESC, id DESC
+      ) earliest
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM pos_product_cogs u
+        WHERE u."tenantId" = earliest."tenantId"
+          AND u."productId" = earliest."productId"
+          AND u."storeId" = earliest."storeId"
+          AND u."startDate" IS NULL
+          AND u.cogs > 0
+      )
+    `);
+
+    // 5. Propagate positive undated baseline COGS to sibling variants in the same (storeId, productId)
+    //    or same (tenantId, lower(btrim(customId))) or same storeId when a product still lacks positive COGS.
+    const propagatedCatalogBaselines = await prisma.$executeRawUnsafe(`
+      WITH store_parent_rate AS (
+        SELECT DISTINCT ON (p."storeId", p."productId")
+          p."storeId",
+          p."productId",
+          c.cogs
+        FROM pos_product_cogs c
+        JOIN pos_products p ON p.id = c."productId"
+        WHERE c.cogs > 0
+        ORDER BY p."storeId", p."productId", (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+      ),
+      tenant_sku_rate AS (
+        SELECT DISTINCT ON (c."tenantId", LOWER(BTRIM(p."customId")))
+          c."tenantId",
+          LOWER(BTRIM(p."customId")) AS norm_sku,
+          c.cogs
+        FROM pos_product_cogs c
+        JOIN pos_products p ON p.id = c."productId"
+        WHERE c.cogs > 0
+          AND p."customId" IS NOT NULL
+          AND BTRIM(p."customId") <> ''
+        ORDER BY c."tenantId", LOWER(BTRIM(p."customId")), (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+      ),
+      tenant_name_rate AS (
+        SELECT DISTINCT ON (c."tenantId", LOWER(BTRIM(p.name)))
+          c."tenantId",
+          LOWER(BTRIM(p.name)) AS norm_name,
+          c.cogs
+        FROM pos_product_cogs c
+        JOIN pos_products p ON p.id = c."productId"
+        WHERE c.cogs > 0
+          AND p.name IS NOT NULL
+          AND LENGTH(BTRIM(p.name)) >= 4
+        ORDER BY c."tenantId", LOWER(BTRIM(p.name)), (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+      ),
+      store_fallback_rate AS (
+        SELECT DISTINCT ON (c."storeId")
+          c."storeId",
+          c.cogs
+        FROM pos_product_cogs c
+        WHERE c.cogs > 0
+        ORDER BY c."storeId", (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+      )
+      INSERT INTO pos_product_cogs (id, "tenantId", "teamId", "productId", "storeId", cogs, "startDate", "endDate", "createdAt", "updatedAt")
+      SELECT
+        gen_random_uuid(),
+        s."tenantId",
+        s."teamId",
+        p.id,
+        p."storeId",
+        COALESCE(spr.cogs, tsr.cogs, sfr.cogs, tnr.cogs) AS cogs,
+        NULL,
+        NULL,
+        NOW(),
+        NOW()
+      FROM pos_products p
+      JOIN pos_stores s ON s.id = p."storeId"
+      LEFT JOIN store_parent_rate spr
+        ON spr."storeId" = p."storeId" AND spr."productId" = p."productId"
+      LEFT JOIN tenant_sku_rate tsr
+        ON tsr."tenantId" = s."tenantId"
+       AND p."customId" IS NOT NULL
+       AND BTRIM(p."customId") <> ''
+       AND tsr.norm_sku = LOWER(BTRIM(p."customId"))
+      LEFT JOIN store_fallback_rate sfr
+        ON sfr."storeId" = p."storeId"
+      LEFT JOIN tenant_name_rate tnr
+        ON tnr."tenantId" = s."tenantId"
+       AND p.name IS NOT NULL
+       AND LENGTH(BTRIM(p.name)) >= 4
+       AND tnr.norm_name = LOWER(BTRIM(p.name))
+      WHERE COALESCE(spr.cogs, tsr.cogs, sfr.cogs, tnr.cogs) > 0
+        AND NOT EXISTS (
+          SELECT 1
+          FROM pos_product_cogs existing
+          WHERE existing."productId" = p.id
+            AND existing.cogs > 0
+        )
+    `);
+
+    console.log('✓ Normalized pos_product_cogs:', JSON.stringify({
+      deletedZeroRows,
+      dedupedUndatedRows,
+      insertedBaselineFromDated,
+      propagatedCatalogBaselines,
+    }));
+
+    // 6. Backfill all 2026 orders (dateLocal >= '2026-01-01', non-void, status <> 7)
+    //    so every order's cogs and totalQuantity align with its physical item quantities * applicable ERP COGS.
+    const updatedOrders = await prisma.$executeRawUnsafe(`
+      WITH product_default_cogs AS (
+        SELECT DISTINCT ON ("productId")
+          "productId",
+          cogs
+        FROM pos_product_cogs
+        WHERE cogs > 0
+        ORDER BY "productId", ("startDate" IS NULL) DESC, "startDate" ASC NULLS FIRST, "updatedAt" DESC, id DESC
+      ),
+      store_default_cogs AS (
+        SELECT DISTINCT ON (s."tenantId", s."shopId")
+          s."tenantId",
+          s."shopId",
+          s.id AS "storeId",
+          c.cogs
+        FROM pos_stores s
+        JOIN pos_product_cogs c ON c."storeId" = s.id AND c.cogs > 0
+        ORDER BY s."tenantId", s."shopId", (s.status = 'ACTIVE') DESC, (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+      ),
+      tenant_sku_cogs AS (
+        SELECT DISTINCT ON (c."tenantId", LOWER(BTRIM(p."customId")))
+          c."tenantId",
+          LOWER(BTRIM(p."customId")) AS norm_sku,
+          c.cogs
+        FROM pos_product_cogs c
+        JOIN pos_products p ON p.id = c."productId"
+        WHERE c.cogs > 0
+          AND p."customId" IS NOT NULL
+          AND BTRIM(p."customId") <> ''
+        ORDER BY c."tenantId", LOWER(BTRIM(p."customId")), (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+      ),
+      candidate_orders AS (
+        SELECT
+          o.id,
+          o."tenantId",
+          o."shopId",
+          o."dateLocal",
+          o."totalQuantity",
+          o.cogs,
+          o.mapping,
+          CASE
+            WHEN jsonb_typeof(o."orderSnapshot") = 'object'
+             AND jsonb_typeof(o."orderSnapshot"->'items') = 'array'
+             AND jsonb_array_length(o."orderSnapshot"->'items') > 0
+            THEN o."orderSnapshot"->'items'
+            WHEN jsonb_typeof(o."itemData") = 'array'
+             AND jsonb_array_length(o."itemData") > 0
+            THEN o."itemData"
+            ELSE '[]'::jsonb
+          END AS items
+        FROM pos_orders o
+        WHERE o."dateLocal" >= '2026-01-01'
+          AND o."isVoid" = false
+          AND (o.status IS NULL OR o.status <> 7)
+          AND o."dateLocal" ~ '^\\d{4}-\\d{2}-\\d{2}$'
+      ),
+      order_item_eval AS (
+        SELECT
+          co.id AS order_id,
+          COALESCE(SUM(item_calc.qty), 0)::int AS calc_qty,
+          ROUND(COALESCE(SUM(item_calc.qty * COALESCE(item_calc.unit_cogs, 0)), 0)::numeric, 2) AS calc_cogs,
+          BOOL_AND(COALESCE(item_calc.unit_cogs, 0) > 0) AS all_items_priced
+        FROM candidate_orders co
+        CROSS JOIN LATERAL jsonb_array_elements(co.items) AS item
+        CROSS JOIN LATERAL (
+          SELECT
+            CASE
+              WHEN jsonb_typeof(item->'quantity') = 'number'
+               AND (item->>'quantity') ~ '^[0-9]+$'
+               AND (item->>'quantity')::bigint BETWEEN 1 AND 100000
+              THEN (item->>'quantity')::int
+              WHEN jsonb_typeof(item->'quantity') = 'string'
+               AND BTRIM(item->>'quantity') ~ '^[0-9]+$'
+               AND BTRIM(item->>'quantity')::bigint BETWEEN 1 AND 100000
+              THEN BTRIM(item->>'quantity')::int
+              ELSE 1
+            END AS qty,
+            COALESCE(
+              -- (a) Exact variationId match in store with dated/default COGS
+              (
+                SELECT COALESCE(
+                  (
+                    SELECT c.cogs
+                    FROM pos_product_cogs c
+                    WHERE c."productId" = p.id
+                      AND c.cogs > 0
+                      AND c."startDate" IS NOT NULL
+                      AND c."startDate" <= co."dateLocal"::date
+                      AND (c."endDate" IS NULL OR c."endDate" >= co."dateLocal"::date)
+                    ORDER BY c."startDate" DESC, c."updatedAt" DESC
+                    LIMIT 1
+                  ),
+                  pdc.cogs
+                )
+                FROM pos_products p
+                JOIN pos_stores s ON s.id = p."storeId"
+                JOIN product_default_cogs pdc ON pdc."productId" = p.id
+                WHERE s."tenantId" = co."tenantId"
+                  AND s."shopId" = co."shopId"
+                  AND p."variationId" IS NOT NULL
+                  AND p."variationId" = COALESCE(NULLIF(BTRIM(item->>'variation_id'), ''), NULLIF(BTRIM(item->>'variationId'), ''))
+                ORDER BY (p."variationId" <> p."productId") DESC, p."updatedAt" DESC
+                LIMIT 1
+              ),
+              -- (b) Display / customId match in store
+              (
+                SELECT COALESCE(
+                  (
+                    SELECT c.cogs
+                    FROM pos_product_cogs c
+                    WHERE c."productId" = p.id
+                      AND c.cogs > 0
+                      AND c."startDate" IS NOT NULL
+                      AND c."startDate" <= co."dateLocal"::date
+                      AND (c."endDate" IS NULL OR c."endDate" >= co."dateLocal"::date)
+                    ORDER BY c."startDate" DESC, c."updatedAt" DESC
+                    LIMIT 1
+                  ),
+                  pdc.cogs
+                )
+                FROM pos_products p
+                JOIN pos_stores s ON s.id = p."storeId"
+                JOIN product_default_cogs pdc ON pdc."productId" = p.id
+                WHERE s."tenantId" = co."tenantId"
+                  AND s."shopId" = co."shopId"
+                  AND p."customId" IS NOT NULL
+                  AND LOWER(BTRIM(p."customId")) IN (
+                    LOWER(BTRIM(COALESCE(item->>'product_display_id', ''))),
+                    LOWER(BTRIM(COALESCE(item->>'productDisplayId', ''))),
+                    LOWER(BTRIM(COALESCE(item->'variation_info'->>'product_display_id', ''))),
+                    LOWER(BTRIM(COALESCE(item->'variation_info'->>'display_id', ''))),
+                    LOWER(BTRIM(COALESCE(item->'variation_info'->>'barcode', '')))
+                  )
+                ORDER BY p."updatedAt" DESC
+                LIMIT 1
+              ),
+              -- (c) Parent productId match in store
+              (
+                SELECT COALESCE(
+                  (
+                    SELECT c.cogs
+                    FROM pos_product_cogs c
+                    WHERE c."productId" = p.id
+                      AND c.cogs > 0
+                      AND c."startDate" IS NOT NULL
+                      AND c."startDate" <= co."dateLocal"::date
+                      AND (c."endDate" IS NULL OR c."endDate" >= co."dateLocal"::date)
+                    ORDER BY c."startDate" DESC, c."updatedAt" DESC
+                    LIMIT 1
+                  ),
+                  pdc.cogs
+                )
+                FROM pos_products p
+                JOIN pos_stores s ON s.id = p."storeId"
+                JOIN product_default_cogs pdc ON pdc."productId" = p.id
+                WHERE s."tenantId" = co."tenantId"
+                  AND s."shopId" = co."shopId"
+                  AND p."productId" = COALESCE(NULLIF(BTRIM(item->>'product_id'), ''), NULLIF(BTRIM(item->>'productId'), ''))
+                ORDER BY p."updatedAt" DESC
+                LIMIT 1
+              ),
+              -- (d) Tenant-wide customId match
+              (
+                SELECT tsc.cogs
+                FROM tenant_sku_cogs tsc
+                WHERE tsc."tenantId" = co."tenantId"
+                  AND tsc.norm_sku IN (
+                    LOWER(BTRIM(COALESCE(item->>'product_display_id', ''))),
+                    LOWER(BTRIM(COALESCE(item->>'productDisplayId', ''))),
+                    LOWER(BTRIM(COALESCE(item->'variation_info'->>'product_display_id', ''))),
+                    LOWER(BTRIM(COALESCE(item->'variation_info'->>'display_id', ''))),
+                    LOWER(BTRIM(COALESCE(co.mapping, '')))
+                  )
+                LIMIT 1
+              ),
+              -- (e) Store default COGS fallback
+              (
+                SELECT sdc.cogs
+                FROM store_default_cogs sdc
+                WHERE sdc."tenantId" = co."tenantId"
+                  AND sdc."shopId" = co."shopId"
+                LIMIT 1
+              )
+            ) AS unit_cogs
+        ) AS item_calc
+        WHERE jsonb_array_length(co.items) > 0
+        GROUP BY co.id
+      ),
+      empty_item_eval AS (
+        SELECT
+          co.id AS order_id,
+          GREATEST(co."totalQuantity", 1)::int AS calc_qty,
+          ROUND((GREATEST(co."totalQuantity", 1) * COALESCE(
+            (
+              SELECT tsc.cogs
+              FROM tenant_sku_cogs tsc
+              WHERE tsc."tenantId" = co."tenantId"
+                AND co.mapping IS NOT NULL
+                AND tsc.norm_sku = LOWER(BTRIM(co.mapping))
+              LIMIT 1
+            ),
+            (
+              SELECT sdc.cogs
+              FROM store_default_cogs sdc
+              WHERE sdc."tenantId" = co."tenantId"
+                AND sdc."shopId" = co."shopId"
+              LIMIT 1
+            ),
+            0
+          ))::numeric, 2) AS calc_cogs
+        FROM candidate_orders co
+        WHERE jsonb_array_length(co.items) = 0
+      ),
+      resolved_orders AS (
+        SELECT
+          order_id,
+          calc_qty,
+          calc_cogs
+        FROM order_item_eval
+        WHERE all_items_priced = true AND calc_cogs > 0
+        UNION ALL
+        SELECT
+          order_id,
+          calc_qty,
+          calc_cogs
+        FROM empty_item_eval
+        WHERE calc_cogs > 0
+      )
+      UPDATE pos_orders o
+      SET
+        cogs = ro.calc_cogs,
+        "totalQuantity" = CASE WHEN ro.calc_qty > 0 THEN ro.calc_qty ELSE o."totalQuantity" END
+      FROM resolved_orders ro
+      WHERE o.id = ro.order_id
+        AND (o.cogs <> ro.calc_cogs OR (ro.calc_qty > 0 AND o."totalQuantity" <> ro.calc_qty))
+    `);
+    console.log(`✓ Updated ${updatedOrders} 2026 POS orders with aligned ERP COGS and quantities`);
+
+    // 7. Recompute 2026 POS COGS columns in reconcile_marketing from matchedOrders -> pos_orders
+    const updatedReconcileMarketing = await prisma.$executeRawUnsafe(`
+      WITH rm_orders AS (
+        SELECT DISTINCT
+          rm.id AS rm_id,
+          rm."tenantId",
+          (m->>'shopId') AS "shopId",
+          (m->>'posOrderId') AS "posOrderId"
+        FROM reconcile_marketing rm
+        CROSS JOIN LATERAL jsonb_array_elements(rm."matchedOrders") AS m
+        WHERE rm.date >= DATE '2026-01-01'
+          AND jsonb_typeof(rm."matchedOrders") = 'array'
+          AND jsonb_array_length(rm."matchedOrders") > 0
+      ),
+      rm_cogs AS (
+        SELECT
+          rmo.rm_id,
+          ROUND(COALESCE(SUM(o.cogs), 0)::numeric, 2) AS "cogsPos",
+          ROUND(COALESCE(SUM(CASE WHEN o."isRepurchase" = true THEN o.cogs ELSE 0 END), 0)::numeric, 2) AS "repurchaseCogsPos",
+          ROUND(COALESCE(SUM(CASE WHEN o.status = 6 THEN o.cogs ELSE 0 END), 0)::numeric, 2) AS "cogsCanceledPos",
+          ROUND(COALESCE(SUM(CASE WHEN o.status = 6 AND o."isRepurchase" = true THEN o.cogs ELSE 0 END), 0)::numeric, 2) AS "repurchaseCogsCanceledPos",
+          ROUND(COALESCE(SUM(CASE WHEN o.status = 11 THEN o.cogs ELSE 0 END), 0)::numeric, 2) AS "cogsRestockingPos",
+          ROUND(COALESCE(SUM(CASE WHEN o.status = 11 AND o."isRepurchase" = true THEN o.cogs ELSE 0 END), 0)::numeric, 2) AS "repurchaseCogsRestockingPos",
+          ROUND(COALESCE(SUM(CASE WHEN o.status IN (4, 5) THEN o.cogs ELSE 0 END), 0)::numeric, 2) AS "cogsRtsPos",
+          ROUND(COALESCE(SUM(CASE WHEN o.status IN (4, 5) AND o."isRepurchase" = true THEN o.cogs ELSE 0 END), 0)::numeric, 2) AS "repurchaseCogsRtsPos",
+          ROUND(COALESCE(SUM(CASE WHEN o.status = 3 THEN o.cogs ELSE 0 END), 0)::numeric, 2) AS "cogsDeliveredPos",
+          ROUND(COALESCE(SUM(CASE WHEN o.status = 3 AND o."isRepurchase" = true THEN o.cogs ELSE 0 END), 0)::numeric, 2) AS "repurchaseCogsDeliveredPos"
+        FROM rm_orders rmo
+        LEFT JOIN pos_orders o
+          ON o."tenantId" = rmo."tenantId"
+         AND o."shopId" = rmo."shopId"
+         AND o."posOrderId" = rmo."posOrderId"
+         AND o."isVoid" = false
+         AND (o.status IS NULL OR o.status <> 7)
+        GROUP BY rmo.rm_id
+      )
+      UPDATE reconcile_marketing rm
+      SET
+        "cogsPos" = rc."cogsPos",
+        "repurchaseCogsPos" = rc."repurchaseCogsPos",
+        "cogsCanceledPos" = rc."cogsCanceledPos",
+        "repurchaseCogsCanceledPos" = rc."repurchaseCogsCanceledPos",
+        "cogsRestockingPos" = rc."cogsRestockingPos",
+        "repurchaseCogsRestockingPos" = rc."repurchaseCogsRestockingPos",
+        "cogsRtsPos" = rc."cogsRtsPos",
+        "repurchaseCogsRtsPos" = rc."repurchaseCogsRtsPos",
+        "cogsDeliveredPos" = rc."cogsDeliveredPos",
+        "repurchaseCogsDeliveredPos" = rc."repurchaseCogsDeliveredPos",
+        "updatedAt" = NOW()
+      FROM rm_cogs rc
+      WHERE rm.id = rc.rm_id
+        AND (
+          rm."cogsPos" <> rc."cogsPos"
+          OR rm."repurchaseCogsPos" <> rc."repurchaseCogsPos"
+          OR rm."cogsCanceledPos" <> rc."cogsCanceledPos"
+          OR rm."repurchaseCogsCanceledPos" <> rc."repurchaseCogsCanceledPos"
+          OR rm."cogsRestockingPos" <> rc."cogsRestockingPos"
+          OR rm."repurchaseCogsRestockingPos" <> rc."repurchaseCogsRestockingPos"
+          OR rm."cogsRtsPos" <> rc."cogsRtsPos"
+          OR rm."repurchaseCogsRtsPos" <> rc."repurchaseCogsRtsPos"
+          OR rm."cogsDeliveredPos" <> rc."cogsDeliveredPos"
+          OR rm."repurchaseCogsDeliveredPos" <> rc."repurchaseCogsDeliveredPos"
+        )
+    `);
+
+    // 8. Recompute 2026 POS COGS columns in reconcile_sales from reconcile_marketing
+    const updatedReconcileSales = await prisma.$executeRawUnsafe(`
+      WITH rs_cogs AS (
+        SELECT
+          rm."tenantId",
+          rm.date,
+          CASE
+            WHEN rm."campaignId" IS NOT NULL AND BTRIM(rm."campaignId") <> ''
+            THEN rm."campaignId"
+            ELSE COALESCE(NULLIF(rm."adId", ''), NULLIF(rm."campaignId", ''), '__unassigned__')
+          END AS "campaignId",
+          ROUND(COALESCE(SUM(rm."cogsPos"), 0)::numeric, 2) AS "cogsPos",
+          ROUND(COALESCE(SUM(rm."repurchaseCogsPos"), 0)::numeric, 2) AS "repurchaseCogsPos",
+          ROUND(COALESCE(SUM(rm."cogsCanceledPos"), 0)::numeric, 2) AS "cogsCanceledPos",
+          ROUND(COALESCE(SUM(rm."repurchaseCogsCanceledPos"), 0)::numeric, 2) AS "repurchaseCogsCanceledPos",
+          ROUND(COALESCE(SUM(rm."cogsRestockingPos"), 0)::numeric, 2) AS "cogsRestockingPos",
+          ROUND(COALESCE(SUM(rm."repurchaseCogsRestockingPos"), 0)::numeric, 2) AS "repurchaseCogsRestockingPos",
+          ROUND(COALESCE(SUM(rm."cogsRtsPos"), 0)::numeric, 2) AS "cogsRtsPos",
+          ROUND(COALESCE(SUM(rm."repurchaseCogsRtsPos"), 0)::numeric, 2) AS "repurchaseCogsRtsPos",
+          ROUND(COALESCE(SUM(rm."cogsDeliveredPos"), 0)::numeric, 2) AS "cogsDeliveredPos",
+          ROUND(COALESCE(SUM(rm."repurchaseCogsDeliveredPos"), 0)::numeric, 2) AS "repurchaseCogsDeliveredPos"
+        FROM reconcile_marketing rm
+        WHERE rm.date >= DATE '2026-01-01'
+        GROUP BY 1, 2, 3
+      )
+      UPDATE reconcile_sales rs
+      SET
+        "cogsPos" = rsc."cogsPos",
+        "repurchaseCogsPos" = rsc."repurchaseCogsPos",
+        "cogsCanceledPos" = rsc."cogsCanceledPos",
+        "repurchaseCogsCanceledPos" = rsc."repurchaseCogsCanceledPos",
+        "cogsRestockingPos" = rsc."cogsRestockingPos",
+        "repurchaseCogsRestockingPos" = rsc."repurchaseCogsRestockingPos",
+        "cogsRtsPos" = rsc."cogsRtsPos",
+        "repurchaseCogsRtsPos" = rsc."repurchaseCogsRtsPos",
+        "cogsDeliveredPos" = rsc."cogsDeliveredPos",
+        "repurchaseCogsDeliveredPos" = rsc."repurchaseCogsDeliveredPos",
+        "updatedAt" = NOW()
+      FROM rs_cogs rsc
+      WHERE rs."tenantId" = rsc."tenantId"
+        AND rs.date = rsc.date
+        AND rs."campaignId" = rsc."campaignId"
+        AND (
+          rs."cogsPos" <> rsc."cogsPos"
+          OR rs."repurchaseCogsPos" <> rsc."repurchaseCogsPos"
+          OR rs."cogsCanceledPos" <> rsc."cogsCanceledPos"
+          OR rs."repurchaseCogsCanceledPos" <> rsc."repurchaseCogsCanceledPos"
+          OR rs."cogsRestockingPos" <> rsc."cogsRestockingPos"
+          OR rs."repurchaseCogsRestockingPos" <> rsc."repurchaseCogsRestockingPos"
+          OR rs."cogsRtsPos" <> rsc."cogsRtsPos"
+          OR rs."repurchaseCogsRtsPos" <> rsc."repurchaseCogsRtsPos"
+          OR rs."cogsDeliveredPos" <> rsc."cogsDeliveredPos"
+          OR rs."repurchaseCogsDeliveredPos" <> rsc."repurchaseCogsDeliveredPos"
+        )
+    `);
+
+    // 9. Recompute 2026 POS COGS columns in reconcile_sales_attribution from reconcile_marketing
+    const updatedReconcileAttribution = await prisma.$executeRawUnsafe(`
+      WITH rsa_cogs AS (
+        SELECT
+          rm."tenantId",
+          rm.date,
+          CASE
+            WHEN NULLIF(LOWER(BTRIM(COALESCE(rm."campaignId", ''))), '') IS NOT NULL
+            THEN LOWER(BTRIM(rm."campaignId"))
+            WHEN NULLIF(LOWER(BTRIM(COALESCE(rm."adId", ''))), '') IS NOT NULL
+            THEN 'ad:' || LOWER(BTRIM(rm."adId"))
+            ELSE '__unassigned_campaign__'
+          END AS "campaignKey",
+          COALESCE(NULLIF(LOWER(BTRIM(COALESCE(rm.mapping, ''))), ''), '__unassigned_mapping__') AS "mappingKey",
+          COALESCE(NULLIF(LOWER(BTRIM(COALESCE(rm."teamCode", ''))), ''), '__unassigned_team_code__') AS "teamCodeKey",
+          ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."cogsPos", 0) - COALESCE(rm."repurchaseCogsPos", 0))), 0)::numeric, 2) AS "cogsPos",
+          ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."cogsCanceledPos", 0) - COALESCE(rm."repurchaseCogsCanceledPos", 0))), 0)::numeric, 2) AS "cogsCanceledPos",
+          ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."cogsRestockingPos", 0) - COALESCE(rm."repurchaseCogsRestockingPos", 0))), 0)::numeric, 2) AS "cogsRestockingPos",
+          ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."cogsRtsPos", 0) - COALESCE(rm."repurchaseCogsRtsPos", 0))), 0)::numeric, 2) AS "cogsRtsPos",
+          ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."cogsDeliveredPos", 0) - COALESCE(rm."repurchaseCogsDeliveredPos", 0))), 0)::numeric, 2) AS "cogsDeliveredPos"
+        FROM reconcile_marketing rm
+        WHERE rm.date >= DATE '2026-01-01'
+        GROUP BY 1, 2, 3, 4, 5
+      )
+      UPDATE reconcile_sales_attribution rsa
+      SET
+        "cogsPos" = rsac."cogsPos",
+        "cogsCanceledPos" = rsac."cogsCanceledPos",
+        "cogsRestockingPos" = rsac."cogsRestockingPos",
+        "cogsRtsPos" = rsac."cogsRtsPos",
+        "cogsDeliveredPos" = rsac."cogsDeliveredPos",
+        "updatedAt" = NOW()
+      FROM rsa_cogs rsac
+      WHERE rsa."tenantId" = rsac."tenantId"
+        AND rsa.date = rsac.date
+        AND rsa."campaignKey" = rsac."campaignKey"
+        AND rsa."mappingKey" = rsac."mappingKey"
+        AND rsa."teamCodeKey" = rsac."teamCodeKey"
+        AND (
+          rsa."cogsPos" <> rsac."cogsPos"
+          OR rsa."cogsCanceledPos" <> rsac."cogsCanceledPos"
+          OR rsa."cogsRestockingPos" <> rsac."cogsRestockingPos"
+          OR rsa."cogsRtsPos" <> rsac."cogsRtsPos"
+          OR rsa."cogsDeliveredPos" <> rsac."cogsDeliveredPos"
+        )
+    `);
+
+    console.log('✓ Reconciled 2026 report rollups:', JSON.stringify({
+      updatedReconcileMarketing,
+      updatedReconcileSales,
+      updatedReconcileAttribution,
+    }));
+
+    // 10. Log SmileOrganics and overall 2026 state AFTER backfill
+    const smileAfter = await prisma.$queryRawUnsafe<any[]>(`
+      SELECT
+        s.name AS "storeName",
+        s."shopId",
+        COUNT(o.id)::int AS "octOrders",
+        COUNT(o.id) FILTER (WHERE o.cogs = 0)::int AS "octZeroCogsOrders",
+        COALESCE(SUM(o."totalQuantity"), 0)::int AS "octTotalQuantity",
+        COALESCE(SUM(o.cogs), 0)::numeric(14,2)::text AS "octStoredCogs",
+        COUNT(o.id) FILTER (WHERE o.status IS DISTINCT FROM 6 AND o.status IS DISTINCT FROM 11 AND COALESCE(o."isRepurchase", false) = false AND NOT (o.status IS NOT DISTINCT FROM 0 AND COALESCE(o."isAbandoned", false) = true) AND o.status IS DISTINCT FROM 4 AND o.status IS DISTINCT FROM 5)::int AS "octDefaultVisibleOrders",
+        COALESCE(SUM(o."totalQuantity") FILTER (WHERE o.status IS DISTINCT FROM 6 AND o.status IS DISTINCT FROM 11 AND COALESCE(o."isRepurchase", false) = false AND NOT (o.status IS NOT DISTINCT FROM 0 AND COALESCE(o."isAbandoned", false) = true) AND o.status IS DISTINCT FROM 4 AND o.status IS DISTINCT FROM 5), 0)::int AS "octDefaultVisibleUnits",
+        COALESCE(SUM(o.cogs) FILTER (WHERE o.status IS DISTINCT FROM 6 AND o.status IS DISTINCT FROM 11 AND COALESCE(o."isRepurchase", false) = false AND NOT (o.status IS NOT DISTINCT FROM 0 AND COALESCE(o."isAbandoned", false) = true) AND o.status IS DISTINCT FROM 4 AND o.status IS DISTINCT FROM 5), 0)::numeric(14,2)::text AS "octDefaultVisibleCogs"
+      FROM pos_stores s
+      LEFT JOIN pos_orders o
+        ON o."tenantId" = s."tenantId"
+       AND o."shopId" = s."shopId"
+       AND o."dateLocal" >= '2026-10-01'
+       AND o."isVoid" = false
+       AND (o.status IS NULL OR o.status <> 7)
+      WHERE s.name ILIKE '%Smile%'
+      GROUP BY s.id, s.name, s."shopId"
+    `);
+    const summary2026After = await prisma.$queryRawUnsafe<any[]>(`
+      SELECT
+        COUNT(*)::int AS "total2026Orders",
+        COUNT(*) FILTER (WHERE o.cogs > 0)::int AS "positiveCogs2026Orders",
+        COUNT(*) FILTER (WHERE o.cogs = 0)::int AS "zeroCogs2026Orders"
+      FROM pos_orders o
+      JOIN pos_stores s ON s."tenantId" = o."tenantId" AND s."shopId" = o."shopId"
+      WHERE o."dateLocal" >= '2026-01-01'
+        AND o."isVoid" = false
+        AND (o.status IS NULL OR o.status <> 7)
+    `);
+    console.log('SmileOrganics AFTER backfill:', JSON.stringify(smileAfter));
+    console.log('Overall 2026 orders AFTER backfill:', JSON.stringify(summary2026After));
+
+    // 11. Bump Redis analytics cache version for every tenant
+    const tenants = await prisma.tenant.findMany({ select: { id: true } });
+    const host = process.env.REDIS_HOST || 'localhost';
+    const port = parseInt(process.env.REDIS_PORT || '6379', 10);
+    const keyPrefix = process.env.CACHE_PREFIX || 'erp:';
+    const password = process.env.REDIS_PASSWORD || undefined;
+    const redis = new Redis({ host, port, keyPrefix, password, lazyConnect: true, maxRetriesPerRequest: 2 });
+    try {
+      await redis.connect();
+      for (const tenant of tenants) {
+        const nextVersion = await redis.incrby(`analytics:${tenant.id}:version`, 5);
+        console.log(`✓ Bumped Redis analytics:${tenant.id}:version to ${nextVersion}`);
+      }
+    } catch (redisErr: any) {
+      console.warn('Warning: could not bump Redis analytics version during seed:', redisErr?.message || redisErr);
+    } finally {
+      redis.disconnect();
+    }
+
+    console.log(`✓ Completed 2026 COGS & Report Backfill in ${Date.now() - startedAt}ms`);
+  } catch (err: any) {
+    console.error('Warning during 2026 COGS backfill:', err?.message || err);
+  }
+}
+
 async function main() {
   console.log('Starting database seed...');
   await ensureSuperAdmin();
   await seedPermissions();
   await seedRoles();
   await ensureDefaultTeamsAndBackfill();
+  await backfill2026OrderCogsAndReports();
   console.log('Seed completed successfully!');
 }
 

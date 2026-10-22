@@ -456,22 +456,39 @@ export class PosOrderService {
           .filter((v: string | undefined) => !!v),
       ),
     ) as string[];
+    const itemVariationIds = Array.from(
+      new Set(
+        items
+          .map((item: any) => this.readCogsIdentifier(item?.variation_id) ?? this.readCogsIdentifier(item?.variationId))
+          .filter((v): v is string => Boolean(v)),
+      ),
+    );
 
-    if (productIds.length === 0) return undefined;
+    if (productIds.length === 0 && itemVariationIds.length === 0) return undefined;
 
     const products = await this.prisma.posProduct.findMany({
       where: {
         storeId,
-        productId: { in: productIds },
+        ...(productIds.length > 0
+          ? { productId: { in: productIds } }
+          : { variationId: { in: itemVariationIds } }),
       },
       select: { mapping: true, variationId: true },
     });
+
+    const variationMatched = itemVariationIds.length > 0
+      ? products.filter((p) => {
+          const vid = (p.variationId || '').trim();
+          return vid.length > 0 && itemVariationIds.includes(vid);
+        })
+      : [];
+    const scopedProducts = variationMatched.length > 0 ? variationMatched : products;
 
     // Single, uniquely-identifiable product -> store the precise store+variation
     // key so the per-product breakdown can name it. (storeId, variationId) is
     // unique in pos_products, so this can't collide across stores/variations.
     const distinctVariationIds = Array.from(
-      new Set(products.map((p) => (p.variationId || '').trim()).filter((v) => v.length > 0)),
+      new Set(scopedProducts.map((p) => (p.variationId || '').trim()).filter((v) => v.length > 0)),
     );
     if (distinctVariationIds.length === 1) {
       const key = buildProductMappingKey(storeId, distinctVariationIds[0]);
@@ -480,7 +497,7 @@ export class PosOrderService {
 
     // Multi-product or no variationId -> fall back to the coarse mapping label
     // (unchanged behaviour), keeping the ad<->sales join intact.
-    const mappings = products
+    const mappings = scopedProducts
       .map((p) => (p.mapping || '').trim())
       .filter((m) => m.length > 0)
       .map((m) => m.toLowerCase());
@@ -576,6 +593,8 @@ export class PosOrderService {
         continue;
       }
 
+      totalQuantity += quantity;
+
       const product = await this.resolveCogsProduct(tenantId, storeId, item, client);
 
       if (!product) {
@@ -630,8 +649,6 @@ export class PosOrderService {
       } else {
         unresolved = true;
       }
-
-      totalQuantity += quantity;
     }
 
     if (items.length && (!Number.isFinite(totalCogs) || totalCogs <= 0 || totalCogs > MAX_PRODUCT_COGS)) unresolved = true;
@@ -652,7 +669,9 @@ export class PosOrderService {
       // sorting parents, but defer every history read until parents are held.
       const ids = new Set<string>();
       for (const item of items) {
-        if (parseInt(item.quantity || '0', 10) === 0) continue;
+        const quantity = typeof item?.quantity === 'number' ? item.quantity
+          : typeof item?.quantity === 'string' && /^\d+$/.test(item.quantity) ? Number(item.quantity) : NaN;
+        if (!Number.isSafeInteger(quantity) || quantity <= 0) continue;
         const product = await this.resolveCogsProduct(tenantId, storeId, item, tx);
         if (product) ids.add(product.id);
       }

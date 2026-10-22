@@ -45,6 +45,15 @@ describe('strict saved-order ERP catalog calculation', () => {
     expect(calculateSavedErpCogs(saved, [productA, { ...productB, customId: 'SKU-A' }], [cost()], scope)).toBeNull();
   });
 
+  it('resolves exact variant when sibling variants share a parent customId and resolves single-product parents', () => {
+    const sharedA = { ...productA, customId: 'LS' };
+    const sharedB = { ...productB, customId: 'LS' };
+    expect(resolveSavedCogsProduct({ ...itemA, product_display_id: 'LS' }, [sharedA, sharedB])).toBe(sharedA);
+    expect(resolveSavedCogsProduct({ product_id: 'parent' }, [productA])).toBe(productA);
+    const legacyProduct = { ...productA, variationId: null };
+    expect(resolveSavedCogsProduct({ product_id: 'parent', product_display_id: 'SKU-A' }, [legacyProduct])).toBe(legacyProduct);
+  });
+
   it('prefers a valid dated ERP cost over the undated default', () => {
     const history = [cost({ cogs: new Decimal(5) }), cost({ startDate: new Date('2026-10-19'), cogs: new Decimal('10.25') })];
     const calculated = calculateSavedErpCogs(order(), [productA], history, scope)!;

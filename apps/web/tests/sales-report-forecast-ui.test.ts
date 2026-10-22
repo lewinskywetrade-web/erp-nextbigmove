@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createElement } from 'react';
+import React, { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { AnalyticsSalesProductsTable, type SalesProductRowItem } from '../src/app/(dashboard)/analytics/_components/analytics-sales-products-table';
+
+(globalThis as any).React = React;
 
 function render(view: 'actual' | 'forecast', options: { showUnits?: boolean; units?: number | null; totalUnits?: number | null } = {}) {
   const row = {

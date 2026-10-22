@@ -515,14 +515,25 @@ export default function SalesByTeamAnalyticsPage() {
   const productEnd = Math.min(productPage * pageSize, totalProducts);
   const productCanPrev = productPage > 1;
   const productCanNext = productPage < totalProductPages;
+  const productTotals = computedKpis
+    ? {
+        revenue: computedKpis.revenue ?? 0,
+        grossSales: data?.counts?.purchases ?? 0,
+        cogs: products.reduce((total, row) => total + (row.cogs ?? 0), 0),
+        aov: computedKpis.aov ?? 0,
+        cpp: computedKpis.cpp ?? 0,
+        processedCpp: computedKpis.processed_cpp ?? 0,
+        adSpend: computedKpis.ad_spend ?? 0,
+        arPct: computedKpis.ar_pct ?? 0,
+        rtsPct: computedKpis.rts_pct ?? 0,
+        profitEfficiency: computedKpis.profit_efficiency ?? 0,
+        contributionMargin: computedKpis.contribution_margin ?? 0,
+        cmRtsForecast: computedKpis.cm_rts_forecast ?? 0,
+        netMargin: computedKpis.net_margin ?? 0,
+      }
+    : null;
   const cmRtsExportLabel = `CM (RTS ${rtsForecastSafe}%)`;
   const exportableProducts: SalesProductsExportRow[] = sortedProducts
-    .filter((item) => {
-      const adSpend = item.row.ad_spend ?? 0;
-      if (adSpend !== 0) return true;
-      const revenue = item.row.revenue ?? 0;
-      return revenue !== 0;
-    })
     .map((item) => ({
       product: toTitleCase(item.derived.display),
       grossRevenue: item.row.revenue ?? 0,
@@ -771,8 +782,12 @@ export default function SalesByTeamAnalyticsPage() {
     const rtsCodAdj = excludeRts ? kpis.rts_cod ?? 0 : 0;
     const excludedCogsCanceled = excludeCanceled ? kpis.cogs_canceled ?? 0 : 0;
     const excludedCogsRestocking = excludeRestocking ? kpis.cogs_restocking ?? 0 : 0;
+    const excludedCogsRts = excludeRts ? kpis.cogs_rts ?? 0 : 0;
     const cogsRaw = kpis.cogs ?? 0;
-    const cogsIncluded = cogsRaw - excludedCogsCanceled - excludedCogsRestocking;
+    const cogsIncluded =
+      kpis.cogs_adjusted ??
+      cogsRaw - excludedCogsCanceled - excludedCogsRestocking - excludedCogsRts;
+    const rtsCogsCredit = kpis.cogs_rts_credit ?? (excludeRts ? 0 : kpis.cogs_rts ?? 0);
     const filtersLabel = [
       `${startDate} → ${endDate}`,
       selectedTeamCode ? teamDisplay(selectedTeamCode) : 'All teams',
@@ -839,13 +854,17 @@ export default function SalesByTeamAnalyticsPage() {
           <span>- COGS Restocking</span>
           <span>{pos(excludedCogsRestocking)}</span>
         </div>
+        <div className="flex justify-between text-[12px] text-slate-700">
+          <span>- COGS RTS</span>
+          <span>{pos(excludedCogsRts)}</span>
+        </div>
         <div className="flex justify-between border-t border-slate-100 pt-1 text-foreground">
           <span>COGS used in CM</span>
           <span>{neg(cogsIncluded)}</span>
         </div>
         <div className="flex justify-between text-[12px] text-slate-700">
           <span>+ RTS COGS</span>
-          <span>{pos(kpis.cogs_rts ?? 0)}</span>
+          <span>{pos(rtsCogsCredit)}</span>
         </div>
         <div className="flex justify-between border-t border-slate-200 pt-1 font-semibold text-slate-900">
           <span>Contribution Margin</span>
@@ -1370,6 +1389,7 @@ export default function SalesByTeamAnalyticsPage() {
             totalProductPages={totalProductPages}
             rtsForecastSafe={rtsForecastSafe}
             rows={pagedProducts}
+            totals={productTotals}
             sourceCount={products.length}
             renderSortLabel={renderSortLabel}
           />

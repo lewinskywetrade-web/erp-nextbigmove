@@ -19,6 +19,9 @@ export type SalesAttributionKpis = {
   contribution_margin: number;
   net_margin: number;
   cogs: number;
+  cogs_adjusted?: number;
+  cogs_rts_credit?: number;
+  cogs_forecast_basis?: number;
   cogs_canceled: number;
   cogs_restocking: number;
   cogs_rts: number;
@@ -59,6 +62,10 @@ export type SalesAttributionProductRow = {
   revenue: number;
   gross_sales: number;
   cogs: number;
+  cogs_raw?: number;
+  cogs_canceled?: number;
+  cogs_rts_credit?: number;
+  cogs_forecast_basis?: number;
   aov: number;
   cpp: number;
   processed_cpp: number;
@@ -66,6 +73,7 @@ export type SalesAttributionProductRow = {
   ar_pct: number;
   profit_efficiency: number;
   contribution_margin: number;
+  cm_rts_forecast?: number;
   net_margin: number;
   sf_fees?: number;
   ff_fees?: number;

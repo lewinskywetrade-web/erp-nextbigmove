@@ -100,10 +100,14 @@ export class SalesAttributionAnalyticsService {
     const sfSdr = this.toNumber(sum?._sum?.sfSdrPos);
     const ffSdr = this.toNumber(sum?._sum?.ffSdrPos);
     const ifSdr = this.toNumber(sum?._sum?.ifSdrPos);
-    const cogsAdjusted =
+    const cogsBeforeRts =
       cogs
       - (opts.excludeCancel ? cogsCanceled : 0)
       - (opts.excludeRestocking ? cogsRestocking : 0);
+    const cogsAdjusted = cogsBeforeRts - (opts.excludeRts ? cogsRts : 0);
+    // A returned item's cost is credited only while it is still in COGS.
+    // Excluding it above and crediting it again would inflate contribution.
+    const cogsRtsCredit = opts.excludeRts ? 0 : cogsRts;
     const arPct = revenue > 0 ? (spend / revenue) * 100 : 0;
 
     const contributionMargin =
@@ -114,7 +118,7 @@ export class SalesAttributionAnalyticsService {
       - iF
       - spend
       - codFee
-      + cogsRts;
+      + cogsRtsCredit;
 
     const delivered = this.toNumber(sum?._sum?.deliveredCodPos);
     const codFeeDelivered = this.toNumber(sum?._sum?.codFeeDeliveredPos);
@@ -185,6 +189,9 @@ export class SalesAttributionAnalyticsService {
       contribution_margin: contributionMargin,
       net_margin: netMargin,
       cogs,
+      cogs_adjusted: cogsAdjusted,
+      cogs_rts_credit: cogsRtsCredit,
+      cogs_forecast_basis: cogsBeforeRts,
       cogs_canceled: cogsCanceled,
       cogs_restocking: cogsRestocking,
       cogs_rts: cogsRts,
@@ -251,6 +258,7 @@ export class SalesAttributionAnalyticsService {
       excludeRts: boolean;
       includeTax12: boolean;
       includeTax1: boolean;
+      rtsForecastPct?: number;
     },
   ): SalesAttributionProductRow {
     const spendBase = this.toNumber(sum?._sum?.spend);
@@ -280,10 +288,14 @@ export class SalesAttributionAnalyticsService {
     const cogsCanceled = this.toNumber(sum?._sum?.cogsCanceledPos);
     const cogsRestocking = this.toNumber(sum?._sum?.cogsRestockingPos);
     const cogsRts = this.toNumber(sum?._sum?.cogsRtsPos);
-    const cogsAdjusted =
+    const cogsBeforeRts =
       cogs
       - (opts.excludeCancel ? cogsCanceled : 0)
       - (opts.excludeRestocking ? cogsRestocking : 0);
+    const cogsAdjusted = cogsBeforeRts - (opts.excludeRts ? cogsRts : 0);
+    // A returned item's cost is credited only while it is still in COGS.
+    // Excluding it above and crediting it again would inflate contribution.
+    const cogsRtsCredit = opts.excludeRts ? 0 : cogsRts;
 
     const sf = this.toNumber(sum?._sum?.sfPos);
     const ff = this.toNumber(sum?._sum?.ffPos);
@@ -298,7 +310,7 @@ export class SalesAttributionAnalyticsService {
       - iF
       - spend
       - codFee
-      + cogsRts;
+      + cogsRtsCredit;
 
     const delivered = this.toNumber(sum?._sum?.deliveredCodPos);
     const sfSdr = this.toNumber(sum?._sum?.sfSdrPos);
@@ -320,12 +332,35 @@ export class SalesAttributionAnalyticsService {
     const aov = purchasesAdj > 0 ? revenue / purchasesAdj : 0;
     const cpp = purchasesAdj > 0 ? spend / purchasesAdj : 0;
     const processedCpp = processedPurchases > 0 ? spend / processedPurchases : 0;
+    const purchasesAdjForCmRts = Math.max(0, purchasesRaw - cancelAdjCount - restockAdjCount - abandonedAdjCount);
+    const grossCodAdjusted =
+      cod
+      - (opts.excludeCancel ? canceledCod : 0)
+      - (opts.excludeRestocking ? restockingCod : 0)
+      - (opts.excludeAbandoned ? abandonedCod : 0);
+    const aovForCmRts = purchasesAdjForCmRts > 0 ? grossCodAdjusted / purchasesAdjForCmRts : 0;
+    const revenueBaseForCmRts = aovForCmRts * purchasesAdjForCmRts;
+    const rtsForecast = typeof opts.rtsForecastPct === 'number' ? opts.rtsForecastPct : 20;
+    const rtsFraction = rtsForecast / 100;
+    const cmRtsForecast =
+      (1 - rtsFraction) * revenueBaseForCmRts -
+      spend -
+      sf -
+      ff -
+      iF -
+      codFeeDelivered -
+      cogsBeforeRts +
+      cogsRts;
 
     return {
       mapping: sum.mapping ?? null,
       revenue,
       gross_sales: purchasesAdj,
       cogs: cogsAdjusted,
+      cogs_raw: cogs,
+      cogs_canceled: cogsCanceled,
+      cogs_rts_credit: cogsRtsCredit,
+      cogs_forecast_basis: cogsBeforeRts,
       aov,
       cpp,
       processed_cpp: processedCpp,
@@ -333,6 +368,7 @@ export class SalesAttributionAnalyticsService {
       ar_pct: arPct,
       profit_efficiency: profitEfficiency,
       contribution_margin: contributionMargin,
+      cm_rts_forecast: cmRtsForecast,
       net_margin: netMargin,
       rts_count: this.toNumber(sum?._sum?.rtsCount),
       delivered_count: this.toNumber(sum?._sum?.deliveredCount),
@@ -461,6 +497,7 @@ export class SalesAttributionAnalyticsService {
 
     const cacheVersion = await this.analyticsCache.getVersion(tenantId);
     const cachePayload = {
+      calculationVersion: 'sales-attribution-cogs-basis-v1',
       tenantId,
       analyticsScope: 'tenant',
       start: startStr,
@@ -688,6 +725,7 @@ export class SalesAttributionAnalyticsService {
     }
     mappingOptions.sort((a, b) => (mappingDisplayMap[a] || a).localeCompare(mappingDisplayMap[b] || b));
 
+    const rtsForecastPct = 20;
     const products = productGroups.map((group) => {
       const row = this.computeProductRow(
         { _sum: group._sum, mapping: group.mapping },
@@ -698,6 +736,7 @@ export class SalesAttributionAnalyticsService {
           excludeRts: query.exclude_rts,
           includeTax12: query.include_tax_12,
           includeTax1: query.include_tax_1,
+          rtsForecastPct,
         },
       );
       return {
@@ -736,7 +775,6 @@ export class SalesAttributionAnalyticsService {
     const prevTotalOrdersCount = this.toNumber(previousAggregate?._sum?.purchasesPos);
     const prevCancelledOrdersCount = this.toNumber(previousAggregate?._sum?.canceledCount);
 
-    const rtsForecastPct = 20;
     const kpis = {
       ...this.computeKpis(aggregate, {
         excludeCancel: query.exclude_cancel,

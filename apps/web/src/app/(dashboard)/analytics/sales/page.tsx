@@ -1515,7 +1515,7 @@ export default function SalesAnalyticsPage() {
         {error && (
           <AlertBanner tone="error" message={error} className="mt-4" />
         )}
-        {selectedTeamIds.length > 0 && data?.teamSpendCoverage &&
+        {showUnits && selectedTeamIds.length > 0 && data?.teamSpendCoverage &&
           (data.teamSpendCoverage.current.unassignedSpend > 0 || data.teamSpendCoverage.previous.unassignedSpend > 0) && (
           <AlertBanner
             tone="warning"
@@ -1523,8 +1523,8 @@ export default function SalesAnalyticsPage() {
             className="mt-4"
           />
         )}
-        {dimension === 'store' && data?.coverage && (
-          data.coverage.ambiguousShopCount > 0 || data.coverage.unattributedAdRows > 0 || data.coverage.previousUnattributedAdRows > 0 ||
+        {showUnits && dimension === 'store' && data?.coverage && (
+          data.coverage.ambiguousOrderCount > 0 || data.coverage.unattributedAdRows > 0 || data.coverage.previousUnattributedAdRows > 0 ||
           data.coverage.unknownSelectedStoreCount > 0 || data.coverage.zeroCogsOrderCount > 0 || data.coverage.hasCanonicalDifferences
         ) && (
           <AlertBanner
@@ -1533,7 +1533,7 @@ export default function SalesAnalyticsPage() {
               'Store revenue and COGS use saved POS orders for each shop.',
               data.coverage.zeroCogsOrderCount > 0
                 ? `${data.coverage.zeroCogsOrderCount} nonvoid, nondeleted orders have saved COGS of zero across the active shops in the selected team scope in the current and previous periods, including orders excluded by the current filters. Review the declared ERP cost and affected orders; ERP COGS must be positive.` : '',
-              data.coverage.ambiguousShopCount > 0
+              data.coverage.ambiguousOrderCount > 0
                 ? `Across the current and previous periods, ${data.coverage.ambiguousOrderCount} orders have conflicting store ownership and remain under Unattributed.` : '',
               data.coverage.unattributedAdRows > 0 || data.coverage.previousUnattributedAdRows > 0
                 ? 'Some ad spend in the current or previous period has no unique store owner and remains under Unattributed; individual store margins may therefore exclude that spend.' : '',

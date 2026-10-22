@@ -183,7 +183,7 @@ describe('POS order catalog COGS identity', () => {
     const result = await (service as any).calculateCogs('tenant-1', 'store-1', [{
       product_id: 'parent', quantity: 2, note_product: 'Product-18',
     }], '2026-10-19');
-    expect(result.cogs).toBe(36);
+    expect(result).toEqual({ cogs: 36, totalQuantity: 2 });
     expect(prisma.posProductCogs.findFirst).not.toHaveBeenCalled();
     expect(warn).not.toHaveBeenCalled();
   });
@@ -193,11 +193,32 @@ describe('POS order catalog COGS identity', () => {
     const result = await (service as any).calculateCogs('tenant-1', 'store-1', [{
       product_id: 'parent', variation_id: 'not-in-catalog', quantity: 2,
     }], '2026-10-19');
-    expect(result.cogs).toBe(0);
+    expect(result).toEqual({ cogs: 0, totalQuantity: 2, cogsUnresolved: true });
     expect(prisma.posProductCogs.findFirst).not.toHaveBeenCalled();
     expect(warn).toHaveBeenCalledWith(
       'COGS unresolved catalog identity {"storeId":"store-1","productId":"parent","variationId":"not-in-catalog"}',
     );
+  });
+
+  it('derives a precise pv::<storeId>::<variationId> mapping for a single-variation order of a multi-variation product', async () => {
+    const { service } = createCogsHarness([
+      { ...variantA, mapping: 'map-a' } as any,
+      { ...variantB, mapping: 'map-b' } as any,
+    ], {});
+    const mapping = await (service as any).deriveMappingFromItems('store-1', [
+      { product_id: 'parent', variation_id: 'variant-a', quantity: 1 },
+    ]);
+    expect(mapping).toBe('pv::store-1::variant-a');
+  });
+
+  it('derives a precise pv::<storeId>::<variationId> mapping for a variation-only item without product_id', async () => {
+    const { service } = createCogsHarness([
+      { ...variantB, mapping: 'map-b' } as any,
+    ], {});
+    const mapping = await (service as any).deriveMappingFromItems('store-1', [
+      { variation_id: 'variant-b', quantity: 1 },
+    ]);
+    expect(mapping).toBe('pv::store-1::variant-b');
   });
 
   it('warns on an ambiguous identity without logging order notes or customer fields', async () => {
