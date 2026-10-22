@@ -144,11 +144,24 @@ export default function SalesAnalyticsPage() {
   const { beginRequest, cancelRequest } = useLatestAnalyticsRequest();
   const [selectedMappings, setSelectedMappings] = useState<string[]>([]);
   const [isAllMappingsMode, setIsAllMappingsMode] = useState(true);
-  const [selectedTeamIds, setSelectedTeamIds] = useState<string[]>([]);
+  const [selectedTeamIds, setSelectedTeamIds] = useState<string[]>(() => {
+    if (typeof window === 'undefined') return [];
+    try {
+      return parseSalesTeamSelection(
+        window.localStorage.getItem('current_team_ids'),
+        window.localStorage.getItem('current_team_id'),
+      );
+    } catch {
+      return [];
+    }
+  });
   const [mappingOptions, setMappingOptions] = useState<string[]>([]);
   const [mappingDisplayMap, setMappingDisplayMap] = useState<Record<string, string>>({});
   const mappingOptionsRef = useRef<string[]>([]);
   const selectedMappingsRef = useRef<string[]>([]);
+  const responseCacheRef = useRef<Map<string, OverviewResponse>>(new Map());
+  const isInitialFetchRef = useRef(true);
+  const lastFetchedDimensionRef = useRef<'product' | 'store'>('product');
   const [excludeCanceled, setExcludeCanceled] = useState(true);
   const [excludeRestocking, setExcludeRestocking] = useState(true);
   const [excludeAbandoned, setExcludeAbandoned] = useState(true);
@@ -310,13 +323,41 @@ export default function SalesAnalyticsPage() {
     );
   }, [hasLoadedKpiVisibility, visibleKpiKeys]);
 
-  const fetchData = useCallback(async (opts?: { silent?: boolean }) => {
+  const applyOverviewPayload = useCallback(
+    (payload: OverviewResponse, queryKey: string, sendAll: boolean, currentSelected: string[]) => {
+      setData(payload);
+      setResolvedQueryKey(queryKey);
+      const optsList = payload.filters.mappings || [];
+      const normalized = optsList.map((m) => m.toLowerCase());
+      setMappingOptions((prev) => (areArraysEqual(prev, normalized) ? prev : normalized));
+      const nextDisplayMap = payload.filters.mappingsDisplayMap || {};
+      setMappingDisplayMap((prev) => (areRecordsEqual(prev, nextDisplayMap) ? prev : nextDisplayMap));
+      if (sendAll) {
+        setSelectedMappings((prev) => (areArraysEqual(prev, normalized) ? prev : normalized));
+      } else {
+        const bounded = currentSelected.filter((m) => normalized.includes(m));
+        setSelectedMappings((prev) => (areArraysEqual(prev, bounded) ? prev : bounded));
+      }
+      syncDateRangeFromApi(payload.selected.start_date, payload.selected.end_date);
+    },
+    [syncDateRangeFromApi],
+  );
+
+  const fetchData = useCallback(async (opts?: { silent?: boolean; force?: boolean }) => {
+    const currentSelected = selectedMappingsRef.current;
+    const sendAll = isAllMappingsMode;
+    const cachedResponse = !opts?.force ? responseCacheRef.current.get(analyticsQueryKey) : undefined;
+    if (cachedResponse && !opts?.silent) {
+      applyOverviewPayload(cachedResponse, analyticsQueryKey, sendAll, currentSelected);
+      setError(null);
+      setIsLoading(false);
+      return;
+    }
+
     const request = beginRequest();
     if (!opts?.silent) setIsLoading(true);
     setError(null);
     try {
-      const currentSelected = selectedMappingsRef.current;
-      const sendAll = isAllMappingsMode;
       const mappingSelection = buildSalesMappingSelection(sendAll, currentSelected);
       const params = new URLSearchParams();
       params.set('start_date', startDate);
@@ -337,20 +378,40 @@ export default function SalesAnalyticsPage() {
         ? await analyticsOverviewApi.getSalesStoreOverview<OverviewResponse>(params, request.signal)
         : await analyticsOverviewApi.getSalesOverview<OverviewResponse>(params, request.signal);
       if (!request.isLatest()) return;
-      setData(res.data);
-      setResolvedQueryKey(analyticsQueryKey);
-      const optsList = res.data.filters.mappings || [];
-      const normalized = optsList.map((m) => m.toLowerCase());
-      setMappingOptions((prev) => (areArraysEqual(prev, normalized) ? prev : normalized));
-      const nextDisplayMap = res.data.filters.mappingsDisplayMap || {};
-      setMappingDisplayMap((prev) => (areRecordsEqual(prev, nextDisplayMap) ? prev : nextDisplayMap));
+      responseCacheRef.current.set(analyticsQueryKey, res.data);
+      applyOverviewPayload(res.data, analyticsQueryKey, sendAll, currentSelected);
+
+      // Prefetch opposite dimension in the background when all mappings/stores are selected
+      // so switching between Product and Store tabs is instant (0ms).
       if (sendAll) {
-        setSelectedMappings((prev) => (areArraysEqual(prev, normalized) ? prev : normalized));
-      } else {
-        const bounded = currentSelected.filter((m) => normalized.includes(m));
-        setSelectedMappings((prev) => (areArraysEqual(prev, bounded) ? prev : bounded));
+        const oppositeDimension = dimension === 'store' ? 'product' : 'store';
+        const oppositeKey =
+          `${oppositeDimension}:${selectedTeamIds.join(',') || '__all_teams__'}:` +
+          buildAnalyticsQueryKey(
+            res.data.selected.start_date,
+            res.data.selected.end_date,
+            '__all__',
+            excludeCanceled,
+            excludeRestocking,
+            excludeAbandoned,
+            excludeRts,
+            excludeRepurchase,
+            includeTax12,
+            includeTax1,
+          );
+        if (!responseCacheRef.current.has(oppositeKey)) {
+          const prefetchParams = new URLSearchParams(params.toString());
+          const prefetchPromise =
+            oppositeDimension === 'store'
+              ? analyticsOverviewApi.getSalesStoreOverview<OverviewResponse>(prefetchParams)
+              : analyticsOverviewApi.getSalesOverview<OverviewResponse>(prefetchParams);
+          void prefetchPromise
+            .then((oppositeRes) => {
+              responseCacheRef.current.set(oppositeKey, oppositeRes.data);
+            })
+            .catch(() => undefined);
+        }
       }
-      syncDateRangeFromApi(res.data.selected.start_date, res.data.selected.end_date);
     } catch (error: unknown) {
       if (!request.isLatest()) return;
       setData(null);
@@ -362,6 +423,7 @@ export default function SalesAnalyticsPage() {
     }
   }, [
     analyticsQueryKey,
+    applyOverviewPayload,
     beginRequest,
     dimension,
     endDate,
@@ -373,8 +435,8 @@ export default function SalesAnalyticsPage() {
     includeTax1,
     includeTax12,
     isAllMappingsMode,
+    selectedTeamIds,
     startDate,
-    syncDateRangeFromApi,
   ]);
 
   useEffect(() => {
@@ -396,7 +458,8 @@ export default function SalesAnalyticsPage() {
       } else {
         addToast('success', 'Reconcile completed successfully');
       }
-      await fetchData();
+      responseCacheRef.current.clear();
+      await fetchData({ force: true });
     } catch (error: unknown) {
       const message = parseErrorMessage(error, 'Failed to reconcile sales data');
       setError(message);
@@ -408,13 +471,39 @@ export default function SalesAnalyticsPage() {
 
   useEffect(() => {
     cancelRequest();
+    const isImmediate =
+      isInitialFetchRef.current ||
+      lastFetchedDimensionRef.current !== dimension ||
+      responseCacheRef.current.has(analyticsQueryKey);
+    isInitialFetchRef.current = false;
+    lastFetchedDimensionRef.current = dimension;
+
+    if (isImmediate) {
+      void fetchData();
+      return;
+    }
+
     setIsLoading(true);
     const timeoutId = window.setTimeout(() => {
       void fetchData();
     }, ANALYTICS_FILTER_DEBOUNCE_MS);
 
     return () => window.clearTimeout(timeoutId);
-  }, [cancelRequest, fetchData, mappingSelectionKey]);
+  }, [analyticsQueryKey, cancelRequest, dimension, fetchData, mappingSelectionKey]);
+
+  const handleDimensionChange = useCallback(
+    (nextDimension: 'product' | 'store') => {
+      if (nextDimension === dimension) return;
+      setDimension(nextDimension);
+      setMappingOptions([]);
+      setSelectedMappings([]);
+      setIsAllMappingsMode(true);
+      setTableSelection('products');
+      setProductPage(1);
+      setDeliveryPage(1);
+    },
+    [dimension],
+  );
 
   // Switching dimension swaps what the picker's options mean (mappings vs
   // stores), so selection state is cleared and the new overview refetched.
@@ -434,11 +523,12 @@ export default function SalesAnalyticsPage() {
   }, [dimension]);
 
   useVisibleAutoRefresh(() => {
-    void fetchData({ silent: true });
+    void fetchData({ silent: true, force: true });
   });
 
   useWorkflowTenantEvent('marketing:updated', (payload) => {
     if (payload.source === 'reconcile_sales') return;
+    responseCacheRef.current.clear();
     fetchDataRef.current?.({ silent: true });
   });
 
@@ -1247,7 +1337,7 @@ export default function SalesAnalyticsPage() {
             <button
               key={key}
               type="button"
-              onClick={() => setDimension(key)}
+              onClick={() => handleDimensionChange(key)}
               className={`whitespace-nowrap pb-3 text-sm font-semibold transition-colors ${
                 dimension === key
                   ? 'border-b-2 border-primary text-orange-600'

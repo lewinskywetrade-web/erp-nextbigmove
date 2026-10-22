@@ -8,7 +8,7 @@ export class AnalyticsRequestCoordinatorService {
   private readonly waitersByTenant = new Map<string, Array<() => void>>();
   private readonly maxConcurrentPerTenant = Math.max(
     1,
-    Number(process.env.ANALYTICS_MAX_CONCURRENT_PER_TENANT || 2),
+    Number(process.env.ANALYTICS_MAX_CONCURRENT_PER_TENANT || 4),
   );
 
   async run<T>(

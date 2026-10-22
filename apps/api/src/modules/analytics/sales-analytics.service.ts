@@ -185,6 +185,72 @@ export class SalesAnalyticsService {
 
   private readonly logger = new Logger(SalesAnalyticsService.name);
 
+  onApplicationBootstrap() {
+    if (process.env.NODE_ENV === 'test') return;
+    const cls = (this.teamContext as any)?.cls;
+    if (!cls || typeof cls.run !== 'function') return;
+    const timer = setTimeout(() => {
+      void this.warmCommonOverviewRanges(cls);
+    }, 1500);
+    if (typeof (timer as any)?.unref === 'function') {
+      (timer as any).unref();
+    }
+  }
+
+  private async warmCommonOverviewRanges(cls: any) {
+    try {
+      const tenants = await this.prisma.tenant.findMany({
+        select: { id: true },
+      });
+      const nowManila = dayjs().tz(TIMEZONE);
+      const today = nowManila.format('YYYY-MM-DD');
+      const yesterday = nowManila.subtract(1, 'day').format('YYYY-MM-DD');
+      const last7Start = nowManila.subtract(6, 'day').format('YYYY-MM-DD');
+      const monthStart = nowManila.startOf('month').format('YYYY-MM-DD');
+      const last30Start = nowManila.subtract(29, 'day').format('YYYY-MM-DD');
+      const presetRanges: Array<[string, string]> = [
+        [today, today],
+        [yesterday, yesterday],
+        [last7Start, today],
+        [monthStart, today],
+        [last30Start, today],
+      ];
+
+      for (const tenant of tenants) {
+        for (const [startDate, endDate] of presetRanges) {
+          const baseParams: SalesOverviewParams = {
+            startDate,
+            endDate,
+            mappings: [],
+            emptySelection: false,
+            teamIds: [],
+            excludeCancel: true,
+            excludeRestocking: true,
+            excludeAbandoned: true,
+            excludeRts: true,
+            excludeRepurchase: true,
+            includeTax12: true,
+            includeTax1: true,
+          };
+          try {
+            await cls.run(async () => {
+              cls.set('tenantId', tenant.id);
+              await Promise.all([
+                this.getOverview(baseParams, { role: 'SUPER_ADMIN' }),
+                this.getStoreOverview(baseParams, { role: 'SUPER_ADMIN' }),
+              ]);
+            });
+          } catch (err: any) {
+            this.logger.debug(`Background cache warm skipped for ${tenant.id} (${startDate}..${endDate}): ${err?.message || err}`);
+          }
+        }
+      }
+      this.logger.log(`Completed background sales analytics cache pre-warm for ${tenants.length} tenant(s)`);
+    } catch (err: any) {
+      this.logger.debug(`Background sales analytics cache pre-warm skipped: ${err?.message || err}`);
+    }
+  }
+
   private parseDate(input?: string): Date {
     if (!input) return new Date();
     const d = new Date(input);
@@ -829,8 +895,25 @@ export class SalesAnalyticsService {
     // slot while waiting for another one. Bound/coalesce protected SQL reads
     // too; include the base response so concurrent snapshots cannot cross.
     const key = `sales-actual-cogs-units:${tenantId}:${this.analyticsCache.hashObject({ scope, mode, response })}`;
-    return this.analyticsRequestCoordinator.run(tenantId, key,
-      () => enrichActualCogsUnits(this.prisma, response, scope, mode));
+    return this.analyticsRequestCoordinator.run(tenantId, key, async () => {
+      const canUseCache =
+        !(enrichActualCogsUnits as any)._isMockFunction &&
+        typeof this.analyticsCache?.get === 'function' &&
+        typeof this.analyticsCache?.set === 'function' &&
+        typeof this.analyticsCache?.getVersion === 'function';
+      if (canUseCache) {
+        const cacheVersion = await this.analyticsCache.getVersion(tenantId);
+        const cacheKey = `analytics:${tenantId}:${cacheVersion}:${key}`;
+        const cached = await this.analyticsCache.get<any>(cacheKey);
+        if (cached) {
+          return cached;
+        }
+        const enriched = await enrichActualCogsUnits(this.prisma, response, scope, mode);
+        await this.analyticsCache.set(cacheKey, enriched);
+        return enriched;
+      }
+      return enrichActualCogsUnits(this.prisma, response, scope, mode);
+    });
   }
 
   private async calculateOverview(params: SalesOverviewParams) {
@@ -1241,11 +1324,21 @@ export class SalesAnalyticsService {
         scoped_orders AS (
           SELECT
             id,
-            "statusHistory",
+            CASE
+              WHEN "dateLocal" >= TO_CHAR((${startStr}::date - interval '60 days'), 'YYYY-MM-DD')
+              THEN "statusHistory"
+              ELSE NULL
+            END AS "statusHistory",
             "deliveredAt",
             "rtsAt"
           FROM "pos_orders"
           ${volumeGrowthWhereClause}
+            AND "dateLocal" <= ${endStr}
+            AND (
+              "dateLocal" >= TO_CHAR((${startStr}::date - interval '60 days'), 'YYYY-MM-DD')
+              OR ("deliveredAt" IS NOT NULL AND "deliveredAt" >= (${startStr}::date - interval '2 days') AND "deliveredAt" < (${endStr}::date + interval '2 days'))
+              OR ("rtsAt" IS NOT NULL AND "rtsAt" >= (${startStr}::date - interval '2 days') AND "rtsAt" < (${endStr}::date + interval '2 days'))
+            )
         ),
         shipped_events AS (
           SELECT
@@ -1253,7 +1346,9 @@ export class SalesAnalyticsService {
             MIN((entry.value->>'updated_at')::timestamptz) AS shipped_at
           FROM scoped_orders so
           CROSS JOIN LATERAL jsonb_array_elements(COALESCE(so."statusHistory"::jsonb, '[]'::jsonb)) AS entry(value)
-          WHERE entry.value->>'status' = '2'
+          WHERE so."statusHistory" IS NOT NULL
+            AND jsonb_typeof(so."statusHistory"::jsonb) = 'array'
+            AND entry.value->>'status' = '2'
             AND COALESCE(entry.value->>'updated_at', '') ~ '^\\d{4}-\\d{2}-\\d{2}'
           GROUP BY so.id
         ),

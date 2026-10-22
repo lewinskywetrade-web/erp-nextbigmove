@@ -9,7 +9,7 @@ export class AnalyticsCacheService {
   private readonly redis: Redis;
 
   constructor() {
-    const ttlSeconds = parseInt(process.env.CACHE_TTL_SECONDS || '60', 10);
+    const ttlSeconds = parseInt(process.env.CACHE_TTL_SECONDS || '900', 10);
     this.defaultTtlMs = ttlSeconds * 1000;
     const host = process.env.REDIS_HOST || 'localhost';
     const port = parseInt(process.env.REDIS_PORT || '6379', 10);

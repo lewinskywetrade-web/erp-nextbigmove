@@ -1083,9 +1083,62 @@ async function backfill2026OrderCogsAndReports() {
       propagatedCatalogBaselines,
     }));
 
+    // Ensure high-performance covering indexes for Business Performance (/analytics/sales)
+    await prisma.$executeRawUnsafe(`
+      CREATE INDEX IF NOT EXISTS pos_orders_sales_overview_covering_idx
+      ON pos_orders ("tenantId", "dateLocal", "isVoid", "isRepurchase", status, "shopId")
+      INCLUDE (cod, cogs, "totalQuantity", "teamId", mapping, "isAbandoned")
+    `);
+    await prisma.$executeRawUnsafe(`
+      CREATE INDEX IF NOT EXISTS pos_orders_store_overview_cursor_idx
+      ON pos_orders ("tenantId", "dateLocal", id)
+      INCLUDE ("shopId", "posOrderId", status, "isVoid", cod, cogs, "totalQuantity", "isRepurchase", "isAbandoned", "wasAbandonedCart", tracking, "updatedAt", "teamId", mapping)
+    `);
+    await prisma.$executeRawUnsafe(`
+      CREATE INDEX IF NOT EXISTS pos_orders_delivered_at_idx
+      ON pos_orders ("tenantId", "deliveredAt")
+      WHERE "deliveredAt" IS NOT NULL AND "isVoid" = false
+    `);
+    await prisma.$executeRawUnsafe(`
+      CREATE INDEX IF NOT EXISTS pos_orders_rts_at_idx
+      ON pos_orders ("tenantId", "rtsAt")
+      WHERE "rtsAt" IS NOT NULL AND "isVoid" = false
+    `);
+    await prisma.$executeRawUnsafe(`
+      CREATE INDEX IF NOT EXISTS reconcile_marketing_tenant_date_id_idx
+      ON reconcile_marketing ("tenantId", date, id)
+    `);
+    await prisma.$executeRawUnsafe(`
+      CREATE INDEX IF NOT EXISTS reconcile_marketing_tenant_date_mapping_idx
+      ON reconcile_marketing ("tenantId", date, mapping)
+    `);
+    await prisma.$executeRawUnsafe(`
+      CREATE INDEX IF NOT EXISTS pos_products_store_custom_id_idx
+      ON pos_products ("storeId", "customId")
+      INCLUDE (name, mapping)
+    `);
+    console.log('✓ Ensured sales analytics performance indexes');
+
+    const pendingOrderBackfillCheck = await prisma.$queryRawUnsafe<Array<{ cnt: number }>>(`
+      SELECT COUNT(*)::int AS cnt
+      FROM pos_orders
+      WHERE cogs <= 0 OR "totalQuantity" <= 0
+    `);
+    const pendingZeroOrders = pendingOrderBackfillCheck[0]?.cnt ?? 0;
+    const hasChangesRequiringBackfill =
+      pendingZeroOrders > 0 ||
+      consolidatedDuplicateStoreCogs > 0 ||
+      disabledDuplicateStores > 0 ||
+      alignedConflictStoreOrders > 0 ||
+      deletedZeroRows > 0 ||
+      insertedBaselineFromDated > 0 ||
+      propagatedCatalogBaselines > 0;
+
     // 6. Backfill all 2026 orders (dateLocal >= '2026-01-01', non-void, status <> 7)
     //    using materialized CTE lookup tables and hash joins per month so execution is connection-pool safe.
-    const months = ['2026-10', '2026-09', '2026-08', '2026-07', '2026-06', '2026-05', '2026-04', '2026-03', '2026-02', '2026-01'];
+    const months = hasChangesRequiringBackfill
+      ? ['2026-10', '2026-09', '2026-08', '2026-07', '2026-06', '2026-05', '2026-04', '2026-03', '2026-02', '2026-01']
+      : [];
     let updatedOrders = 0;
     for (const month of months) {
       const monthUpdated = await prisma.$executeRawUnsafe(`
@@ -1288,7 +1341,7 @@ async function backfill2026OrderCogsAndReports() {
     }
 
     // 6b. Catch-all pass for ANY remaining order in pos_orders (e.g. 2025 or any date/status) with cogs <= 0 or totalQuantity <= 0
-    const updatedRemainingZeroOrders = await prisma.$executeRawUnsafe(`
+    const updatedRemainingZeroOrders = !hasChangesRequiringBackfill ? 0 : await prisma.$executeRawUnsafe(`
       WITH tmp_var_cogs AS MATERIALIZED (
         SELECT DISTINCT ON (s."tenantId", s."shopId", p."variationId")
           s."tenantId",
@@ -1501,19 +1554,26 @@ async function backfill2026OrderCogsAndReports() {
     let updatedReconcileMarketing = 0;
     let updatedReconcileSales = 0;
     let updatedReconcileAttribution = 0;
-    const monthRanges: Array<[string, string]> = [
-      ['2026-10-01', '2026-11-01'],
-      ['2026-09-01', '2026-10-01'],
-      ['2026-08-01', '2026-09-01'],
-      ['2026-07-01', '2026-08-01'],
-      ['2026-06-01', '2026-07-01'],
-      ['2026-05-01', '2026-06-01'],
-      ['2026-04-01', '2026-05-01'],
-      ['2026-03-01', '2026-04-01'],
-      ['2026-02-01', '2026-03-01'],
-      ['2026-01-01', '2026-02-01'],
-      ['2025-01-01', '2026-01-01'],
-    ];
+    const shouldReconcileRollups =
+      updatedOrders > 0 ||
+      updatedRemainingZeroOrders > 0 ||
+      alignedConflictStoreOrders > 0 ||
+      consolidatedDuplicateStoreCogs > 0;
+    const monthRanges: Array<[string, string]> = shouldReconcileRollups
+      ? [
+          ['2026-10-01', '2026-11-01'],
+          ['2026-09-01', '2026-10-01'],
+          ['2026-08-01', '2026-09-01'],
+          ['2026-07-01', '2026-08-01'],
+          ['2026-06-01', '2026-07-01'],
+          ['2026-05-01', '2026-06-01'],
+          ['2026-04-01', '2026-05-01'],
+          ['2026-03-01', '2026-04-01'],
+          ['2026-02-01', '2026-03-01'],
+          ['2026-01-01', '2026-02-01'],
+          ['2025-01-01', '2026-01-01'],
+        ]
+      : [];
 
     for (const [mStart, mEnd] of monthRanges) {
       const rmCount = await prisma.$executeRawUnsafe(`
@@ -1740,23 +1800,32 @@ async function backfill2026OrderCogsAndReports() {
     console.log('Overall 2026 orders AFTER backfill:', JSON.stringify(summary2026After));
     console.log('Overall ALL-TIME orders & catalog AFTER backfill:', JSON.stringify(summaryAllTimeAfter));
 
-    // 11. Bump Redis analytics cache version for every tenant
-    const tenants = await prisma.tenant.findMany({ select: { id: true } });
-    const host = process.env.REDIS_HOST || 'localhost';
-    const port = parseInt(process.env.REDIS_PORT || '6379', 10);
-    const keyPrefix = process.env.CACHE_PREFIX || 'erp:';
-    const password = process.env.REDIS_PASSWORD || undefined;
-    const redis = new Redis({ host, port, keyPrefix, password, lazyConnect: true, maxRetriesPerRequest: 2 });
-    try {
-      await redis.connect();
-      for (const tenant of tenants) {
-        const nextVersion = await redis.incrby(`analytics:${tenant.id}:version`, 5);
-        console.log(`✓ Bumped Redis analytics:${tenant.id}:version to ${nextVersion}`);
+    await prisma.$executeRawUnsafe(`
+      ANALYZE pos_orders, reconcile_marketing, reconcile_sales, reconcile_sales_attribution, pos_products, pos_product_cogs, pos_stores
+    `);
+    console.log('✓ Analyzed sales analytics tables for optimal query planning');
+
+    // 11. Bump Redis analytics cache version for every tenant when data changed
+    if (shouldReconcileRollups || updatedReconcileMarketing > 0 || updatedReconcileSales > 0 || updatedReconcileAttribution > 0) {
+      const tenants = await prisma.tenant.findMany({ select: { id: true } });
+      const host = process.env.REDIS_HOST || 'localhost';
+      const port = parseInt(process.env.REDIS_PORT || '6379', 10);
+      const keyPrefix = process.env.CACHE_PREFIX || 'erp:';
+      const password = process.env.REDIS_PASSWORD || undefined;
+      const redis = new Redis({ host, port, keyPrefix, password, lazyConnect: true, maxRetriesPerRequest: 2 });
+      try {
+        await redis.connect();
+        for (const tenant of tenants) {
+          const nextVersion = await redis.incrby(`analytics:${tenant.id}:version`, 5);
+          console.log(`✓ Bumped Redis analytics:${tenant.id}:version to ${nextVersion}`);
+        }
+      } catch (redisErr: any) {
+        console.warn('Warning: could not bump Redis analytics version during seed:', redisErr?.message || redisErr);
+      } finally {
+        redis.disconnect();
       }
-    } catch (redisErr: any) {
-      console.warn('Warning: could not bump Redis analytics version during seed:', redisErr?.message || redisErr);
-    } finally {
-      redis.disconnect();
+    } else {
+      console.log('✓ Preserved warm Redis analytics cache (no order/rollup COGS changes detected)');
     }
 
     console.log(`✓ Completed 2026 COGS & Report Backfill in ${Date.now() - startedAt}ms`);
