@@ -939,74 +939,67 @@ async function backfill2026OrderCogsAndReports() {
     }));
 
     // 6. Backfill all 2026 orders (dateLocal >= '2026-01-01', non-void, status <> 7)
-    //    using materialized temporary lookup tables and hash joins per month so execution completes in seconds.
-    await prisma.$executeRawUnsafe(`DROP TABLE IF EXISTS tmp_var_cogs, tmp_sku_cogs, tmp_parent_cogs, tmp_tenant_sku_cogs, tmp_store_cogs`);
-    await prisma.$executeRawUnsafe(`
-      CREATE TEMP TABLE tmp_var_cogs AS
-      SELECT DISTINCT ON (s."tenantId", s."shopId", p."variationId")
-        s."tenantId",
-        s."shopId",
-        p."variationId",
-        c.cogs
-      FROM pos_products p
-      JOIN pos_stores s ON s.id = p."storeId"
-      JOIN pos_product_cogs c ON c."productId" = p.id AND c.cogs > 0
-      WHERE p."variationId" IS NOT NULL AND BTRIM(p."variationId") <> ''
-      ORDER BY s."tenantId", s."shopId", p."variationId", (p."variationId" <> p."productId") DESC, (c."startDate" IS NULL) DESC, c."updatedAt" DESC
-    `);
-    await prisma.$executeRawUnsafe(`
-      CREATE TEMP TABLE tmp_sku_cogs AS
-      SELECT DISTINCT ON (s."tenantId", s."shopId", LOWER(BTRIM(p."customId")))
-        s."tenantId",
-        s."shopId",
-        LOWER(BTRIM(p."customId")) AS norm_sku,
-        c.cogs
-      FROM pos_products p
-      JOIN pos_stores s ON s.id = p."storeId"
-      JOIN pos_product_cogs c ON c."productId" = p.id AND c.cogs > 0
-      WHERE p."customId" IS NOT NULL AND BTRIM(p."customId") <> ''
-      ORDER BY s."tenantId", s."shopId", LOWER(BTRIM(p."customId")), (c."startDate" IS NULL) DESC, c."updatedAt" DESC
-    `);
-    await prisma.$executeRawUnsafe(`
-      CREATE TEMP TABLE tmp_parent_cogs AS
-      SELECT DISTINCT ON (s."tenantId", s."shopId", p."productId")
-        s."tenantId",
-        s."shopId",
-        p."productId",
-        c.cogs
-      FROM pos_products p
-      JOIN pos_stores s ON s.id = p."storeId"
-      JOIN pos_product_cogs c ON c."productId" = p.id AND c.cogs > 0
-      WHERE p."productId" IS NOT NULL AND BTRIM(p."productId") <> ''
-      ORDER BY s."tenantId", s."shopId", p."productId", (c."startDate" IS NULL) DESC, c."updatedAt" DESC
-    `);
-    await prisma.$executeRawUnsafe(`
-      CREATE TEMP TABLE tmp_tenant_sku_cogs AS
-      SELECT DISTINCT ON (c."tenantId", LOWER(BTRIM(p."customId")))
-        c."tenantId",
-        LOWER(BTRIM(p."customId")) AS norm_sku,
-        c.cogs
-      FROM pos_product_cogs c
-      JOIN pos_products p ON p.id = c."productId"
-      WHERE c.cogs > 0 AND p."customId" IS NOT NULL AND BTRIM(p."customId") <> ''
-      ORDER BY c."tenantId", LOWER(BTRIM(p."customId")), (c."startDate" IS NULL) DESC, c."updatedAt" DESC
-    `);
-    await prisma.$executeRawUnsafe(`
-      CREATE TEMP TABLE tmp_store_cogs AS
-      SELECT DISTINCT ON (s."tenantId", s."shopId")
-        s."tenantId",
-        s."shopId",
-        c.cogs
-      FROM pos_stores s
-      JOIN pos_product_cogs c ON c."storeId" = s.id AND c.cogs > 0
-      ORDER BY s."tenantId", s."shopId", (s.status = 'ACTIVE') DESC, (c."startDate" IS NULL) DESC, c."updatedAt" DESC
-    `);
-
+    //    using materialized CTE lookup tables and hash joins per month so execution is connection-pool safe.
     const months = ['2026-10', '2026-09', '2026-08', '2026-07', '2026-06', '2026-05', '2026-04', '2026-03', '2026-02', '2026-01'];
     let updatedOrders = 0;
     for (const month of months) {
       const monthUpdated = await prisma.$executeRawUnsafe(`
-        WITH candidate_orders AS (
+        WITH tmp_var_cogs AS MATERIALIZED (
+          SELECT DISTINCT ON (s."tenantId", s."shopId", p."variationId")
+            s."tenantId",
+            s."shopId",
+            p."variationId",
+            c.cogs
+          FROM pos_products p
+          JOIN pos_stores s ON s.id = p."storeId"
+          JOIN pos_product_cogs c ON c."productId" = p.id AND c.cogs > 0
+          WHERE p."variationId" IS NOT NULL AND BTRIM(p."variationId") <> ''
+          ORDER BY s."tenantId", s."shopId", p."variationId", (p."variationId" <> p."productId") DESC, (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+        ),
+        tmp_sku_cogs AS MATERIALIZED (
+          SELECT DISTINCT ON (s."tenantId", s."shopId", LOWER(BTRIM(p."customId")))
+            s."tenantId",
+            s."shopId",
+            LOWER(BTRIM(p."customId")) AS norm_sku,
+            c.cogs
+          FROM pos_products p
+          JOIN pos_stores s ON s.id = p."storeId"
+          JOIN pos_product_cogs c ON c."productId" = p.id AND c.cogs > 0
+          WHERE p."customId" IS NOT NULL AND BTRIM(p."customId") <> ''
+          ORDER BY s."tenantId", s."shopId", LOWER(BTRIM(p."customId")), (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+        ),
+        tmp_parent_cogs AS MATERIALIZED (
+          SELECT DISTINCT ON (s."tenantId", s."shopId", p."productId")
+            s."tenantId",
+            s."shopId",
+            p."productId",
+            c.cogs
+          FROM pos_products p
+          JOIN pos_stores s ON s.id = p."storeId"
+          JOIN pos_product_cogs c ON c."productId" = p.id AND c.cogs > 0
+          WHERE p."productId" IS NOT NULL AND BTRIM(p."productId") <> ''
+          ORDER BY s."tenantId", s."shopId", p."productId", (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+        ),
+        tmp_tenant_sku_cogs AS MATERIALIZED (
+          SELECT DISTINCT ON (c."tenantId", LOWER(BTRIM(p."customId")))
+            c."tenantId",
+            LOWER(BTRIM(p."customId")) AS norm_sku,
+            c.cogs
+          FROM pos_product_cogs c
+          JOIN pos_products p ON p.id = c."productId"
+          WHERE c.cogs > 0 AND p."customId" IS NOT NULL AND BTRIM(p."customId") <> ''
+          ORDER BY c."tenantId", LOWER(BTRIM(p."customId")), (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+        ),
+        tmp_store_cogs AS MATERIALIZED (
+          SELECT DISTINCT ON (s."tenantId", s."shopId")
+            s."tenantId",
+            s."shopId",
+            c.cogs
+          FROM pos_stores s
+          JOIN pos_product_cogs c ON c."storeId" = s.id AND c.cogs > 0
+          ORDER BY s."tenantId", s."shopId", (s.status = 'ACTIVE') DESC, (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+        ),
+        candidate_orders AS (
           SELECT
             o.id,
             o."tenantId",
