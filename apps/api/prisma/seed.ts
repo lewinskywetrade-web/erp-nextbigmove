@@ -783,6 +783,87 @@ async function backfill2026OrderCogsAndReports() {
     `);
     console.log('SmileOrganics BEFORE backfill:', JSON.stringify(smileBefore));
 
+    // 1b. Resolve duplicate-shopId store conflicts (Zenith 1290117012 & The Book Hub 1021344092 -> Team Zenith)
+    //     Consolidate any positive COGS from the duplicate WeTrade store records into the Team Zenith store records,
+    //     disable the duplicate WeTrade store records, and align pos_orders.teamId & pos_shop_ownerships to Team Zenith.
+    const consolidatedDuplicateStoreCogs = await prisma.$executeRawUnsafe(`
+      INSERT INTO pos_product_cogs (id, "tenantId", "teamId", "productId", "storeId", cogs, "startDate", "endDate", "createdAt", "updatedAt")
+      SELECT DISTINCT ON (target_p.id)
+        gen_random_uuid(),
+        target_s."tenantId",
+        target_s."teamId",
+        target_p.id,
+        target_s.id,
+        src_c.cogs,
+        NULL,
+        NULL,
+        NOW(),
+        NOW()
+      FROM pos_stores src_s
+      JOIN pos_products src_p ON src_p."storeId" = src_s.id
+      JOIN pos_product_cogs src_c ON src_c."productId" = src_p.id AND src_c.cogs > 0
+      JOIN pos_stores target_s
+        ON target_s."tenantId" = src_s."tenantId"
+       AND target_s."shopId" = src_s."shopId"
+       AND target_s.id IN ('64df6bb0-2582-47cd-882a-76b5da8c2c91', '8f9caa4b-b047-4d21-9839-72208b53ecd5')
+      JOIN pos_products target_p
+        ON target_p."storeId" = target_s.id
+       AND (
+         (src_p."variationId" IS NOT NULL AND BTRIM(src_p."variationId") <> '' AND target_p."variationId" = src_p."variationId")
+         OR (src_p."customId" IS NOT NULL AND BTRIM(src_p."customId") <> '' AND LOWER(BTRIM(RTRIM(target_p."customId", '\`'))) = LOWER(BTRIM(RTRIM(src_p."customId", '\`'))))
+         OR (src_p.name IS NOT NULL AND BTRIM(src_p.name) <> '' AND LOWER(BTRIM(target_p.name)) = LOWER(BTRIM(src_p.name)))
+       )
+      WHERE src_s.id IN ('48a33293-b104-4210-916a-75039f9a5014', '2300dcd9-db25-4712-8502-ea7933268c33')
+        AND NOT EXISTS (
+          SELECT 1
+          FROM pos_product_cogs existing
+          WHERE existing."productId" = target_p.id
+            AND existing.cogs > 0
+        )
+      ORDER BY target_p.id, (src_c."startDate" IS NULL) DESC, src_c."updatedAt" DESC
+    `);
+
+    const disabledDuplicateStores = await prisma.$executeRawUnsafe(`
+      UPDATE pos_stores
+      SET status = 'DISABLED', enabled = false, "updatedAt" = NOW()
+      WHERE id IN ('48a33293-b104-4210-916a-75039f9a5014', '2300dcd9-db25-4712-8502-ea7933268c33')
+        AND (status <> 'DISABLED' OR enabled IS DISTINCT FROM false)
+    `);
+
+    await prisma.$executeRawUnsafe(`
+      UPDATE pos_stores
+      SET status = 'ACTIVE', enabled = true, "updatedAt" = NOW()
+      WHERE id IN ('64df6bb0-2582-47cd-882a-76b5da8c2c91', '8f9caa4b-b047-4d21-9839-72208b53ecd5')
+        AND (status <> 'ACTIVE' OR enabled IS DISTINCT FROM true)
+    `);
+
+    await prisma.$executeRawUnsafe(`
+      UPDATE pos_shop_ownerships
+      SET "storeId" = '64df6bb0-2582-47cd-882a-76b5da8c2c91', "updatedAt" = NOW()
+      WHERE "shopId" = '1290117012'
+        AND "storeId" <> '64df6bb0-2582-47cd-882a-76b5da8c2c91'
+    `);
+
+    await prisma.$executeRawUnsafe(`
+      UPDATE pos_shop_ownerships
+      SET "storeId" = '8f9caa4b-b047-4d21-9839-72208b53ecd5', "updatedAt" = NOW()
+      WHERE "shopId" = '1021344092'
+        AND "storeId" <> '8f9caa4b-b047-4d21-9839-72208b53ecd5'
+    `);
+
+    const alignedConflictStoreOrders = await prisma.$executeRawUnsafe(`
+      UPDATE pos_orders
+      SET "teamId" = '83bf4287-bfee-4c22-93a0-7d34a97f7703'
+      WHERE "shopId" IN ('1290117012', '1021344092')
+        AND "teamId" IS DISTINCT FROM '83bf4287-bfee-4c22-93a0-7d34a97f7703'
+    `);
+
+    console.log('✓ Resolved duplicate store ownership conflicts (Zenith & The Book Hub -> Team Zenith):', JSON.stringify({
+      consolidatedDuplicateStoreCogs,
+      disabledDuplicateStores,
+      alignedConflictStoreOrders,
+    }));
+
     // 2. Remove zero/negative pos_product_cogs rows when a positive COGS row exists for the same product
     const deletedZeroRows = await prisma.$executeRawUnsafe(`
       DELETE FROM pos_product_cogs z
@@ -1023,6 +1104,7 @@ async function backfill2026OrderCogsAndReports() {
             AND o."dateLocal" <= '${month}-31'
             AND o."isVoid" = false
             AND (o.status IS NULL OR o.status <> 7)
+            AND (o.cogs = 0 OR o."totalQuantity" <= 0 OR o."shopId" IN ('1290117012', '1021344092', '1943124266'))
         ),
         expanded_items AS (
           SELECT
