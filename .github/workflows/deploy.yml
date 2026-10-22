@@ -31,9 +31,10 @@ jobs:
           set -e
 
           # Fetch transient network failures safely, then deploy exactly this workflow's commit.
-          ssh "$SSH_USER@$SSH_HOST" "DEPLOY_SHA='$DEPLOY_SHA' bash -s" <<'REMOTE'
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$SSH_USER@$SSH_HOST" "DEPLOY_SHA='$DEPLOY_SHA' bash -s" <<'REMOTE'
             set -euo pipefail
             cd /opt/erp
+            git rev-parse HEAD > /opt/erp/.prev_deploy_sha || true
 
             max_attempts=4
             for attempt in $(seq 1 "$max_attempts"); do
@@ -54,17 +55,30 @@ jobs:
           REMOTE
 
           # Write env file from secret
-          echo "$PROD_ENV_FILE" | ssh "$SSH_USER@$SSH_HOST" "cat > /opt/erp/.env.prod"
+          echo "$PROD_ENV_FILE" | ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$SSH_USER@$SSH_HOST" "cat > /opt/erp/.env.prod"
 
           # Copy env to api directory
-          ssh "$SSH_USER@$SSH_HOST" "cp /opt/erp/.env.prod /opt/erp/apps/api/.env.prod"
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$SSH_USER@$SSH_HOST" "cp /opt/erp/.env.prod /opt/erp/apps/api/.env.prod"
 
           # Build images sequentially to avoid OOM (exit code 137)
-          ssh "$SSH_USER@$SSH_HOST" "cd /opt/erp && \
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$SSH_USER@$SSH_HOST" "cd /opt/erp && \
+            PREV_SHA=\$(cat /opt/erp/.prev_deploy_sha 2>/dev/null || echo '') && \
             docker compose -f docker-compose.prod.yml -f docker-compose.prod.override.yml --env-file .env.prod build api && \
-            docker compose -f docker-compose.prod.yml -f docker-compose.prod.override.yml --env-file .env.prod build web && \
-            docker compose -f docker-compose.prod.yml -f docker-compose.prod.override.yml --env-file .env.prod build admin && \
-            docker compose -f docker-compose.prod.yml -f docker-compose.prod.override.yml --env-file .env.prod build whisper"
+            if [ -z \"\$PREV_SHA\" ] || ! docker image inspect erp-web:latest >/dev/null 2>&1 || ! git diff --quiet \"\$PREV_SHA\" HEAD -- apps/web packages package.json package-lock.json; then \
+              docker compose -f docker-compose.prod.yml -f docker-compose.prod.override.yml --env-file .env.prod build web; \
+            else \
+              echo 'Skipping web build (no changes since previous deploy)'; \
+            fi && \
+            if [ -z \"\$PREV_SHA\" ] || ! docker image inspect erp-admin:latest >/dev/null 2>&1 || ! git diff --quiet \"\$PREV_SHA\" HEAD -- apps/admin packages package.json package-lock.json; then \
+              docker compose -f docker-compose.prod.yml -f docker-compose.prod.override.yml --env-file .env.prod build admin; \
+            else \
+              echo 'Skipping admin build (no changes since previous deploy)'; \
+            fi && \
+            if [ -z \"\$PREV_SHA\" ] || ! docker image inspect erp-whisper:latest >/dev/null 2>&1 || ! git diff --quiet \"\$PREV_SHA\" HEAD -- apps/whisper; then \
+              docker compose -f docker-compose.prod.yml -f docker-compose.prod.override.yml --env-file .env.prod build whisper; \
+            else \
+              echo 'Skipping whisper build (no changes since previous deploy)'; \
+            fi"
 
           # Clean up old images BEFORE starting services to free memory
           ssh "$SSH_USER@$SSH_HOST" "docker image prune -f"
@@ -81,7 +95,7 @@ jobs:
           ssh "$SSH_USER@$SSH_HOST" "cd /opt/erp && ./scripts/prisma-migrate-deploy-safe.sh"
 
           # Run seed (uses compiled JS, idempotent - safe to run every deploy)
-          ssh "$SSH_USER@$SSH_HOST" "cd /opt/erp && \
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$SSH_USER@$SSH_HOST" "cd /opt/erp && \
             docker compose -f docker-compose.prod.yml --env-file .env.prod run --rm -T api node apps/api/dist/prisma/seed.js"
 
           # Now start all services
