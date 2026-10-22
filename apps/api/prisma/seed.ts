@@ -977,27 +977,27 @@ async function backfill2026OrderCogsAndReports() {
           AND LENGTH(BTRIM(p.name)) >= 3
         ORDER BY c."tenantId", LOWER(BTRIM(p.name)), (c."startDate" IS NULL) DESC, c."updatedAt" DESC
       ),
-      wms_sku_rate AS (
-        SELECT DISTINCT ON (w."tenantId", LOWER(BTRIM(RTRIM(w.sku, '\`'))))
-          w."tenantId",
-          LOWER(BTRIM(RTRIM(w.sku, '\`'))) AS norm_sku,
+      wms_var_rate AS (
+        SELECT DISTINCT ON (w."storeId", w."variationId")
+          w."storeId",
+          w."variationId",
           COALESCE(NULLIF(w."inhouseUnitCost", 0), NULLIF(w."supplierUnitCost", 0)) AS cogs
         FROM wms_product_profiles w
         WHERE COALESCE(NULLIF(w."inhouseUnitCost", 0), NULLIF(w."supplierUnitCost", 0)) > 0
-          AND w.sku IS NOT NULL
-          AND BTRIM(RTRIM(w.sku, '\`')) <> ''
-        ORDER BY w."tenantId", LOWER(BTRIM(RTRIM(w.sku, '\`'))), w."updatedAt" DESC
+          AND w."variationId" IS NOT NULL
+          AND BTRIM(w."variationId") <> ''
+        ORDER BY w."storeId", w."variationId", w."updatedAt" DESC
       ),
-      wms_name_rate AS (
-        SELECT DISTINCT ON (w."tenantId", LOWER(BTRIM(w.name)))
-          w."tenantId",
-          LOWER(BTRIM(w.name)) AS norm_name,
+      wms_parent_rate AS (
+        SELECT DISTINCT ON (w."storeId", w."productId")
+          w."storeId",
+          w."productId",
           COALESCE(NULLIF(w."inhouseUnitCost", 0), NULLIF(w."supplierUnitCost", 0)) AS cogs
         FROM wms_product_profiles w
         WHERE COALESCE(NULLIF(w."inhouseUnitCost", 0), NULLIF(w."supplierUnitCost", 0)) > 0
-          AND w.name IS NOT NULL
-          AND LENGTH(BTRIM(w.name)) >= 3
-        ORDER BY w."tenantId", LOWER(BTRIM(w.name)), w."updatedAt" DESC
+          AND w."productId" IS NOT NULL
+          AND BTRIM(w."productId") <> ''
+        ORDER BY w."storeId", w."productId", w."updatedAt" DESC
       ),
       store_fallback_rate AS (
         SELECT DISTINCT ON (c."storeId")
@@ -1039,25 +1039,24 @@ async function backfill2026OrderCogsAndReports() {
         s."teamId",
         p.id,
         p."storeId",
-        COALESCE(spr.cogs, tsr.cogs, wsr.cogs, sfr.cogs, tnr.cogs, wnr.cogs, tmfr.cogs, tnfr.cogs, 140.00::numeric(12,2)) AS cogs,
+        COALESCE(wvr.cogs, spr.cogs, wpr.cogs, tsr.cogs, sfr.cogs, tnr.cogs, tmfr.cogs, tnfr.cogs, 140.00::numeric(12,2)) AS cogs,
         NULL,
         NULL,
         NOW(),
         NOW()
       FROM pos_products p
       JOIN pos_stores s ON s.id = p."storeId"
+      LEFT JOIN wms_var_rate wvr
+        ON wvr."storeId" = p."storeId" AND wvr."variationId" = p."variationId"
       LEFT JOIN store_parent_rate spr
         ON spr."storeId" = p."storeId" AND spr."productId" = p."productId"
+      LEFT JOIN wms_parent_rate wpr
+        ON wpr."storeId" = p."storeId" AND wpr."productId" = p."productId"
       LEFT JOIN tenant_sku_rate tsr
         ON tsr."tenantId" = s."tenantId"
        AND p."customId" IS NOT NULL
        AND BTRIM(RTRIM(p."customId", '\`')) <> ''
        AND tsr.norm_sku = LOWER(BTRIM(RTRIM(p."customId", '\`')))
-      LEFT JOIN wms_sku_rate wsr
-        ON wsr."tenantId" = s."tenantId"
-       AND p."customId" IS NOT NULL
-       AND BTRIM(RTRIM(p."customId", '\`')) <> ''
-       AND wsr.norm_sku = LOWER(BTRIM(RTRIM(p."customId", '\`')))
       LEFT JOIN store_fallback_rate sfr
         ON sfr."storeId" = p."storeId"
       LEFT JOIN tenant_name_rate tnr
@@ -1065,11 +1064,6 @@ async function backfill2026OrderCogsAndReports() {
        AND p.name IS NOT NULL
        AND LENGTH(BTRIM(p.name)) >= 3
        AND tnr.norm_name = LOWER(BTRIM(p.name))
-      LEFT JOIN wms_name_rate wnr
-        ON wnr."tenantId" = s."tenantId"
-       AND p.name IS NOT NULL
-       AND LENGTH(BTRIM(p.name)) >= 3
-       AND wnr.norm_name = LOWER(BTRIM(p.name))
       LEFT JOIN team_fallback_rate tmfr
         ON tmfr."tenantId" = s."tenantId" AND tmfr."teamId" = s."teamId"
       LEFT JOIN tenant_fallback_rate tnfr
