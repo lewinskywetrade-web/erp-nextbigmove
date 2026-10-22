@@ -1083,7 +1083,43 @@ async function backfill2026OrderCogsAndReports() {
       propagatedCatalogBaselines,
     }));
 
-    // Ensure high-performance covering indexes for Business Performance (/analytics/sales)
+    // Ensure high-performance covering indexes & immutable SQL functions for Business Performance (/analytics/sales)
+    await prisma.$executeRawUnsafe(`
+      CREATE OR REPLACE FUNCTION erp_pos_order_shipped_date(status_history jsonb)
+      RETURNS date
+      LANGUAGE sql
+      IMMUTABLE
+      PARALLEL SAFE
+      AS $$
+        SELECT (MIN((entry.value->>'updated_at')::timestamptz) AT TIME ZONE 'Asia/Manila')::date
+        FROM jsonb_array_elements(
+          CASE
+            WHEN status_history IS NOT NULL AND jsonb_typeof(status_history) = 'array'
+            THEN status_history
+            ELSE '[]'::jsonb
+          END
+        ) AS entry(value)
+        WHERE entry.value->>'status' = '2'
+          AND COALESCE(entry.value->>'updated_at', '') ~ '^\\d{4}-\\d{2}-\\d{2}';
+      $$
+    `);
+    await prisma.$executeRawUnsafe(`
+      CREATE OR REPLACE FUNCTION erp_pos_order_extract_quantities(items jsonb)
+      RETURNS jsonb
+      LANGUAGE sql
+      IMMUTABLE
+      PARALLEL SAFE
+      AS $$
+        SELECT CASE
+          WHEN items IS NULL THEN NULL::jsonb
+          WHEN jsonb_typeof(items) = 'array' THEN COALESCE((
+            SELECT jsonb_agg(jsonb_build_object('quantity', item.value->'quantity') ORDER BY item.ord)
+            FROM jsonb_array_elements(items) WITH ORDINALITY AS item(value, ord)
+          ), '[]'::jsonb)
+          ELSE items
+        END;
+      $$
+    `);
     await prisma.$executeRawUnsafe(`
       CREATE INDEX IF NOT EXISTS pos_orders_sales_overview_covering_idx
       ON pos_orders ("tenantId", "dateLocal", "isVoid", "isRepurchase", status, "shopId")
@@ -1093,6 +1129,49 @@ async function backfill2026OrderCogsAndReports() {
       CREATE INDEX IF NOT EXISTS pos_orders_store_overview_cursor_idx
       ON pos_orders ("tenantId", "dateLocal", id)
       INCLUDE ("shopId", "posOrderId", status, "isVoid", cod, cogs, "totalQuantity", "isRepurchase", "isAbandoned", "wasAbandonedCart", tracking, "updatedAt", "teamId", mapping)
+    `);
+    await prisma.$executeRawUnsafe(`
+      CREATE INDEX IF NOT EXISTS pos_orders_store_cursor_id_first_idx
+      ON pos_orders ("tenantId", id, "dateLocal")
+      INCLUDE ("shopId", "posOrderId", status, "isVoid", cod, cogs, "totalQuantity", "isRepurchase", "isAbandoned", "wasAbandonedCart", tracking, "updatedAt", "teamId", mapping)
+      WHERE "isVoid" = false AND status IS DISTINCT FROM 7
+    `);
+    await prisma.$executeRawUnsafe(`
+      CREATE INDEX IF NOT EXISTS pos_orders_fast_cogs_cohort_idx
+      ON pos_orders (
+        "tenantId",
+        "dateLocal",
+        id,
+        "shopId",
+        "posOrderId",
+        "teamId",
+        status,
+        "isVoid",
+        "isRepurchase",
+        "isAbandoned",
+        cogs,
+        "totalQuantity",
+        erp_pos_order_extract_quantities(COALESCE("orderSnapshot"->'items', "itemData"))
+      )
+      WHERE "isVoid" = false AND status IS DISTINCT FROM 7
+    `);
+    await prisma.$executeRawUnsafe(`
+      CREATE INDEX IF NOT EXISTS pos_orders_shipped_date_manila_idx
+      ON pos_orders ("tenantId", erp_pos_order_shipped_date("statusHistory"::jsonb))
+      INCLUDE ("shopId", "teamId", mapping, "isRepurchase")
+      WHERE "statusHistory" IS NOT NULL AND "isVoid" = false AND status IS DISTINCT FROM 7
+    `);
+    await prisma.$executeRawUnsafe(`
+      CREATE INDEX IF NOT EXISTS pos_orders_delivered_date_manila_idx
+      ON pos_orders ("tenantId", ((("deliveredAt" AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Manila')::date))
+      INCLUDE ("shopId", "teamId", mapping, "isRepurchase")
+      WHERE "deliveredAt" IS NOT NULL AND "isVoid" = false AND status IS DISTINCT FROM 7
+    `);
+    await prisma.$executeRawUnsafe(`
+      CREATE INDEX IF NOT EXISTS pos_orders_rts_date_manila_idx
+      ON pos_orders ("tenantId", ((("rtsAt" AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Manila')::date))
+      INCLUDE ("shopId", "teamId", mapping, "isRepurchase")
+      WHERE "rtsAt" IS NOT NULL AND "isVoid" = false AND status IS DISTINCT FROM 7
     `);
     await prisma.$executeRawUnsafe(`
       CREATE INDEX IF NOT EXISTS pos_orders_delivered_at_idx
@@ -1105,12 +1184,31 @@ async function backfill2026OrderCogsAndReports() {
       WHERE "rtsAt" IS NOT NULL AND "isVoid" = false
     `);
     await prisma.$executeRawUnsafe(`
+      CREATE INDEX IF NOT EXISTS pos_orders_abandoned_join_covering_idx
+      ON pos_orders ("tenantId", "dateLocal", "shopId", "posOrderId")
+      INCLUDE (id, "teamId", mapping, status, "isVoid", "isAbandoned", "isRepurchase", cod, cogs)
+    `);
+    await prisma.$executeRawUnsafe(`
       CREATE INDEX IF NOT EXISTS reconcile_marketing_tenant_date_id_idx
       ON reconcile_marketing ("tenantId", date, id)
     `);
     await prisma.$executeRawUnsafe(`
+      CREATE INDEX IF NOT EXISTS reconcile_marketing_cursor_id_first_idx
+      ON reconcile_marketing ("tenantId", id, date)
+      INCLUDE ("teamId", mapping)
+    `);
+    await prisma.$executeRawUnsafe(`
       CREATE INDEX IF NOT EXISTS reconcile_marketing_tenant_date_mapping_idx
       ON reconcile_marketing ("tenantId", date, mapping)
+    `);
+    await prisma.$executeRawUnsafe(`
+      CREATE INDEX IF NOT EXISTS reconcile_marketing_abandoned_targets_idx
+      ON reconcile_marketing ("tenantId", date)
+      INCLUDE (id, "teamId", mapping, "currentAbandonedCount", "repurchaseCurrentAbandonedCount", "currentAbandonedCodPos", "repurchaseCurrentAbandonedCodPos")
+      WHERE COALESCE("currentAbandonedCount", 0) > 0
+         OR COALESCE("repurchaseCurrentAbandonedCount", 0) > 0
+         OR COALESCE("currentAbandonedCodPos", 0) <> 0
+         OR COALESCE("repurchaseCurrentAbandonedCodPos", 0) <> 0
     `);
     await prisma.$executeRawUnsafe(`
       CREATE INDEX IF NOT EXISTS pos_products_store_custom_id_idx

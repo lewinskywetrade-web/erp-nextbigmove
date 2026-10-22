@@ -40,14 +40,14 @@ export function abandonedCostQueries(scope: Scope) {
   const orderTeam = teamIds.length ? Prisma.sql`o."teamId" IN (${Prisma.join(teamIds.map(id => Prisma.sql`${id}::uuid`))})` : Prisma.sql`TRUE`;
   const active = scope.activeShopIds.length ? Prisma.sql`o."shopId" IN (${Prisma.join(scope.activeShopIds)})` : Prisma.sql`FALSE`;
   const targets = Prisma.sql`
-    targets AS (
+    targets AS MATERIALIZED (
       SELECT r.* FROM reconcile_marketing r
       WHERE r."tenantId" = ${scope.tenantId}::uuid
         AND r.date BETWEEN ${scope.previousStart}::date AND ${scope.end}::date
         AND ${selection} AND ${rowTeam}
         AND (r."currentAbandonedCount" <> 0 OR r."repurchaseCurrentAbandonedCount" <> 0)
     ),
-    witnesses AS (
+    witnesses AS MATERIALIZED (
       SELECT r.id, r.date, r."matchedOrders" FROM reconcile_marketing r
       WHERE r."tenantId" = ${scope.tenantId}::uuid
         AND r.date IN (SELECT DISTINCT date FROM targets)
@@ -60,7 +60,7 @@ export function abandonedCostQueries(scope: Scope) {
         THEN jsonb_array_length("matchedOrders") ELSE 0 END), 0)::text AS "members"
     FROM witnesses`;
   const groups = Prisma.sql`WITH ${targets},
-    ownership AS (
+    ownership AS MATERIALIZED (
       SELECT w.date, j.value->>'shopId' AS shop, j.value->>'posOrderId' AS external_id, count(*) AS owners
       FROM witnesses w CROSS JOIN LATERAL jsonb_array_elements(
         CASE WHEN jsonb_typeof(w."matchedOrders") = 'array' THEN w."matchedOrders" ELSE '[]'::jsonb END) j

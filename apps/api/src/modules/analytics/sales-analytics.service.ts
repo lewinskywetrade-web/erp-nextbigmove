@@ -18,7 +18,7 @@ import { ReconcileSalesService } from '../workflows/services/reconcile-sales.ser
 import { ReconcileSalesAttributionService } from '../workflows/services/reconcile-sales-attribution.service';
 import { AnalyticsRequestCoordinatorService } from './analytics-request-coordinator.service';
 import { readCurrentAbandonedCosts, attachCurrentAbandonedCosts } from './utils/current-abandoned-cogs';
-import { enrichActualCogsUnits } from './utils/actual-cogs-units';
+import { allocateCogsUnits, enrichActualCogsUnits } from './utils/actual-cogs-units';
 import { loadSalesStoreAttribution, partitionTeamAdSpend } from './utils/team-ad-spend';
 import {
   UNATTRIBUTED_STORE_KEY,
@@ -184,6 +184,15 @@ export class SalesAnalyticsService {
   ) {}
 
   private readonly logger = new Logger(SalesAnalyticsService.name);
+  private readonly cogsCohortCache = new Map<
+    string,
+    Promise<{
+      stores: any[];
+      orders: any[];
+      reportRows: any[];
+      expiresAt: number;
+    }>
+  >();
 
   onApplicationBootstrap() {
     if (process.env.NODE_ENV === 'test') return;
@@ -194,6 +203,12 @@ export class SalesAnalyticsService {
     }, 1500);
     if (typeof (timer as any)?.unref === 'function') {
       (timer as any).unref();
+    }
+    const interval = setInterval(() => {
+      void this.warmCommonOverviewRanges(cls);
+    }, 20 * 60 * 1000);
+    if (typeof (interval as any)?.unref === 'function') {
+      (interval as any).unref();
     }
   }
 
@@ -208,12 +223,15 @@ export class SalesAnalyticsService {
       const last7Start = nowManila.subtract(6, 'day').format('YYYY-MM-DD');
       const monthStart = nowManila.startOf('month').format('YYYY-MM-DD');
       const last30Start = nowManila.subtract(29, 'day').format('YYYY-MM-DD');
+      const lastMonthStart = nowManila.subtract(1, 'month').startOf('month').format('YYYY-MM-DD');
+      const lastMonthEnd = nowManila.subtract(1, 'month').endOf('month').format('YYYY-MM-DD');
       const presetRanges: Array<[string, string]> = [
         [today, today],
         [yesterday, yesterday],
         [last7Start, today],
         [monthStart, today],
         [last30Start, today],
+        [lastMonthStart, lastMonthEnd],
       ];
 
       for (const tenant of tenants) {
@@ -908,12 +926,131 @@ export class SalesAnalyticsService {
         if (cached) {
           return cached;
         }
-        const enriched = await enrichActualCogsUnits(this.prisma, response, scope, mode);
+        const enriched =
+          process.env.NODE_ENV !== 'test'
+            ? await this.enrichWithFastCohort(response, scope, mode, cacheVersion)
+            : await enrichActualCogsUnits(this.prisma, response, scope, mode);
         await this.analyticsCache.set(cacheKey, enriched);
         return enriched;
       }
       return enrichActualCogsUnits(this.prisma, response, scope, mode);
     });
+  }
+
+  private async enrichWithFastCohort(
+    response: any,
+    scope: {
+      tenantId: string;
+      start: string;
+      end: string;
+      teamIds: string[];
+      excludeRepurchase: boolean;
+      excludeCancel: boolean;
+      excludeRestocking: boolean;
+      excludeAbandoned: boolean;
+      excludeRts: boolean;
+      emptySelection: boolean;
+      allSelected: boolean;
+    },
+    mode: 'product' | 'store',
+    cacheVersion: number,
+  ) {
+    try {
+      const cohortKey = `${scope.tenantId}:${cacheVersion}:${scope.start}:${scope.end}`;
+      let cohortPromise = this.cogsCohortCache.get(cohortKey);
+      if (cohortPromise) {
+        const existing = await cohortPromise.catch(() => null);
+        if (!existing || existing.expiresAt <= Date.now()) {
+          this.cogsCohortCache.delete(cohortKey);
+          cohortPromise = undefined;
+        }
+      }
+      if (!cohortPromise) {
+        if (this.cogsCohortCache.size >= 6) {
+          const oldestKey = this.cogsCohortCache.keys().next().value;
+          if (oldestKey) this.cogsCohortCache.delete(oldestKey);
+        }
+        cohortPromise = this.prisma.$transaction(
+          async (tx) => {
+            await tx.$executeRaw`SET TRANSACTION READ ONLY`;
+            const startDate = new Date(`${scope.start}T00:00:00.000Z`);
+            const endDate = new Date(`${scope.end}T00:00:00.000Z`);
+            const [stores, orders, reportRows] = await Promise.all([
+              tx.posStore.findMany({
+                where: {
+                  tenantId: scope.tenantId,
+                  status: 'ACTIVE',
+                  OR: [{ enabled: true }, { enabled: null }],
+                },
+                select: { id: true, shopId: true, name: true, teamId: true },
+                orderBy: { id: 'asc' },
+              }),
+              tx.$queryRaw<any[]>(Prisma.sql`
+                SELECT
+                  o.id,
+                  o."tenantId",
+                  o."shopId",
+                  o."posOrderId",
+                  o."dateLocal",
+                  o."teamId",
+                  o.status,
+                  o."isVoid",
+                  o."isRepurchase",
+                  o."isAbandoned",
+                  o.cogs,
+                  o."totalQuantity",
+                  erp_pos_order_extract_quantities(COALESCE(o."orderSnapshot"->'items', o."itemData")) AS "extractedItems"
+                FROM "pos_orders" o
+                WHERE o."tenantId" = ${scope.tenantId}::uuid
+                  AND o."dateLocal" >= ${scope.start}
+                  AND o."dateLocal" <= ${scope.end}
+                  AND o."isVoid" = false
+                  AND o.status IS DISTINCT FROM 7
+                ORDER BY o.id ASC
+              `),
+              tx.reconcileMarketing.findMany({
+                where: {
+                  tenantId: scope.tenantId,
+                  date: { gte: startDate, lte: endDate },
+                },
+                select: {
+                  id: true,
+                  date: true,
+                  teamId: true,
+                  mapping: true,
+                  matchedOrders: true,
+                },
+                orderBy: { id: 'asc' },
+              }),
+            ]);
+            return {
+              stores,
+              orders,
+              reportRows,
+              expiresAt: Date.now() + 10 * 60 * 1000,
+            };
+          },
+          {
+            isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead,
+            maxWait: 5000,
+            timeout: 60000,
+          },
+        );
+        this.cogsCohortCache.set(cohortKey, cohortPromise);
+      }
+      const cohort = await cohortPromise;
+      return allocateCogsUnits(
+        response,
+        scope,
+        mode,
+        cohort.stores,
+        cohort.orders,
+        mode === 'product' ? cohort.reportRows : [],
+        new Date().toISOString(),
+      );
+    } catch (err) {
+      return enrichActualCogsUnits(this.prisma, response, scope, mode);
+    }
   }
 
   private async calculateOverview(params: SalesOverviewParams) {
@@ -1321,59 +1458,38 @@ export class SalesAnalyticsService {
         WITH dates AS (
           SELECT generate_series(${startStr}::date, ${endStr}::date, interval '1 day')::date AS d
         ),
-        scoped_orders AS (
-          SELECT
-            id,
-            CASE
-              WHEN "dateLocal" >= TO_CHAR((${startStr}::date - interval '60 days'), 'YYYY-MM-DD')
-              THEN "statusHistory"
-              ELSE NULL
-            END AS "statusHistory",
-            "deliveredAt",
-            "rtsAt"
-          FROM "pos_orders"
-          ${volumeGrowthWhereClause}
-            AND "dateLocal" <= ${endStr}
-            AND (
-              "dateLocal" >= TO_CHAR((${startStr}::date - interval '60 days'), 'YYYY-MM-DD')
-              OR ("deliveredAt" IS NOT NULL AND "deliveredAt" >= (${startStr}::date - interval '2 days') AND "deliveredAt" < (${endStr}::date + interval '2 days'))
-              OR ("rtsAt" IS NOT NULL AND "rtsAt" >= (${startStr}::date - interval '2 days') AND "rtsAt" < (${endStr}::date + interval '2 days'))
-            )
-        ),
-        shipped_events AS (
-          SELECT
-            so.id,
-            MIN((entry.value->>'updated_at')::timestamptz) AS shipped_at
-          FROM scoped_orders so
-          CROSS JOIN LATERAL jsonb_array_elements(COALESCE(so."statusHistory"::jsonb, '[]'::jsonb)) AS entry(value)
-          WHERE so."statusHistory" IS NOT NULL
-            AND jsonb_typeof(so."statusHistory"::jsonb) = 'array'
-            AND entry.value->>'status' = '2'
-            AND COALESCE(entry.value->>'updated_at', '') ~ '^\\d{4}-\\d{2}-\\d{2}'
-          GROUP BY so.id
-        ),
         movement_events AS (
           SELECT
-            (shipped_at AT TIME ZONE ${TIMEZONE})::date AS d,
+            erp_pos_order_shipped_date("statusHistory"::jsonb) AS d,
             'shipped'::text AS kind
-          FROM shipped_events
-          WHERE shipped_at IS NOT NULL
+          FROM "pos_orders"
+          ${volumeGrowthWhereClause}
+            AND "statusHistory" IS NOT NULL
+            AND "dateLocal" <= ${endStr}
+            AND "dateLocal" >= TO_CHAR((${startStr}::date - interval '60 days'), 'YYYY-MM-DD')
+            AND erp_pos_order_shipped_date("statusHistory"::jsonb) BETWEEN ${startStr}::date AND ${endStr}::date
 
           UNION ALL
 
           SELECT
-            (("deliveredAt" AT TIME ZONE 'UTC') AT TIME ZONE ${TIMEZONE})::date AS d,
+            (("deliveredAt" AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Manila')::date AS d,
             'delivered'::text AS kind
-          FROM scoped_orders
-          WHERE "deliveredAt" IS NOT NULL
+          FROM "pos_orders"
+          ${volumeGrowthWhereClause}
+            AND "deliveredAt" IS NOT NULL
+            AND "dateLocal" <= ${endStr}
+            AND (("deliveredAt" AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Manila')::date BETWEEN ${startStr}::date AND ${endStr}::date
 
           UNION ALL
 
           SELECT
-            (("rtsAt" AT TIME ZONE 'UTC') AT TIME ZONE ${TIMEZONE})::date AS d,
+            (("rtsAt" AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Manila')::date AS d,
             'rts'::text AS kind
-          FROM scoped_orders
-          WHERE "rtsAt" IS NOT NULL
+          FROM "pos_orders"
+          ${volumeGrowthWhereClause}
+            AND "rtsAt" IS NOT NULL
+            AND "dateLocal" <= ${endStr}
+            AND (("rtsAt" AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Manila')::date BETWEEN ${startStr}::date AND ${endStr}::date
         ),
         counts AS (
           SELECT

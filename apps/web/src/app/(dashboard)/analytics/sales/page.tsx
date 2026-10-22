@@ -162,6 +162,8 @@ export default function SalesAnalyticsPage() {
   const responseCacheRef = useRef<Map<string, OverviewResponse>>(new Map());
   const isInitialFetchRef = useRef(true);
   const lastFetchedDimensionRef = useRef<'product' | 'store'>('product');
+  const lastFetchedRangeTeamRef = useRef<string>('');
+  const prefetchAbortRef = useRef<AbortController | null>(null);
   const [excludeCanceled, setExcludeCanceled] = useState(true);
   const [excludeRestocking, setExcludeRestocking] = useState(true);
   const [excludeAbandoned, setExcludeAbandoned] = useState(true);
@@ -355,6 +357,8 @@ export default function SalesAnalyticsPage() {
     }
 
     const request = beginRequest();
+    prefetchAbortRef.current?.abort();
+    prefetchAbortRef.current = null;
     if (!opts?.silent) setIsLoading(true);
     setError(null);
     try {
@@ -400,14 +404,18 @@ export default function SalesAnalyticsPage() {
             includeTax1,
           );
         if (!responseCacheRef.current.has(oppositeKey)) {
+          const prefetchController = new AbortController();
+          prefetchAbortRef.current = prefetchController;
           const prefetchParams = new URLSearchParams(params.toString());
           const prefetchPromise =
             oppositeDimension === 'store'
-              ? analyticsOverviewApi.getSalesStoreOverview<OverviewResponse>(prefetchParams)
-              : analyticsOverviewApi.getSalesOverview<OverviewResponse>(prefetchParams);
+              ? analyticsOverviewApi.getSalesStoreOverview<OverviewResponse>(prefetchParams, prefetchController.signal)
+              : analyticsOverviewApi.getSalesOverview<OverviewResponse>(prefetchParams, prefetchController.signal);
           void prefetchPromise
             .then((oppositeRes) => {
-              responseCacheRef.current.set(oppositeKey, oppositeRes.data);
+              if (!prefetchController.signal.aborted) {
+                responseCacheRef.current.set(oppositeKey, oppositeRes.data);
+              }
             })
             .catch(() => undefined);
         }
@@ -471,12 +479,17 @@ export default function SalesAnalyticsPage() {
 
   useEffect(() => {
     cancelRequest();
+    prefetchAbortRef.current?.abort();
+    prefetchAbortRef.current = null;
+    const rangeTeamSignature = `${startDate}|${endDate}|${selectedTeamIds.join(',')}`;
     const isImmediate =
       isInitialFetchRef.current ||
       lastFetchedDimensionRef.current !== dimension ||
+      lastFetchedRangeTeamRef.current !== rangeTeamSignature ||
       responseCacheRef.current.has(analyticsQueryKey);
     isInitialFetchRef.current = false;
     lastFetchedDimensionRef.current = dimension;
+    lastFetchedRangeTeamRef.current = rangeTeamSignature;
 
     if (isImmediate) {
       void fetchData();
@@ -489,7 +502,7 @@ export default function SalesAnalyticsPage() {
     }, ANALYTICS_FILTER_DEBOUNCE_MS);
 
     return () => window.clearTimeout(timeoutId);
-  }, [analyticsQueryKey, cancelRequest, dimension, fetchData, mappingSelectionKey]);
+  }, [analyticsQueryKey, cancelRequest, dimension, endDate, fetchData, mappingSelectionKey, selectedTeamIds, startDate]);
 
   const handleDimensionChange = useCallback(
     (nextDimension: 'product' | 'store') => {

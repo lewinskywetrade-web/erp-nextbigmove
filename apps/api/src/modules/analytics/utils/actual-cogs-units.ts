@@ -101,7 +101,7 @@ export function cogsOrderPage(scope: Scope, shopIds: string[], cursor?: string):
         FROM jsonb_array_elements(o."orderSnapshot"->'items') WITH ORDINALITY AS entries(item,ordinal))
       ELSE NULL END AS "snapshotQuantities",
     jsonb_typeof(o."itemData") AS "dataKind",
-    CASE WHEN jsonb_typeof(o."itemData")='array' THEN
+    CASE WHEN jsonb_typeof(o."orderSnapshot"->'items') IS NULL AND jsonb_typeof(o."itemData")='array' THEN
       (SELECT jsonb_agg(CASE WHEN jsonb_typeof(item->'quantity') IN ('number','string')
         AND length(item->>'quantity') <= 16 THEN item->'quantity' ELSE 'null'::jsonb END ORDER BY ordinal)
         FROM jsonb_array_elements(o."itemData") WITH ORDINALITY AS entries(item,ordinal))
