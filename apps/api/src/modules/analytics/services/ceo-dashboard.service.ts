@@ -70,6 +70,7 @@ export class CeoDashboardService {
           spend: true, purchasesPos: true, codPos: true,
           deliveredCount: true, canceledCount: true, rtsCount: true, shippedCount: true,
           deliveredCodPos: true, canceledCodPos: true, rtsCodPos: true, shippedCodPos: true,
+          unconfirmedCodPos: true, confirmedCodPos: true, waitingPickupCodPos: true, restockingCodPos: true,
           cogsDeliveredPos: true, sfSdrPos: true, ffSdrPos: true, ifSdrPos: true, codFeeDeliveredPos: true,
         },
       }),
@@ -133,7 +134,17 @@ export class CeoDashboardService {
     const ltvCac = ltv !== null && cac !== null && cac > 0 ? ltv / cac : null;
 
     const inFlight = Math.max(0, rawOrders - rates.resolvedBase - (sums.shippedCount ?? 0));
-    const bucketValueSum = deliveredValue + cancelledValue + rtsValue + shippedValue;
+    const explicitInProcessValue =
+      toNumber(sums.unconfirmedCodPos) +
+      toNumber(sums.confirmedCodPos) +
+      toNumber(sums.waitingPickupCodPos) +
+      toNumber(sums.restockingCodPos);
+    const settledAndShippedValue = deliveredValue + cancelledValue + rtsValue + shippedValue;
+    const inProcessValue = Math.max(
+      explicitInProcessValue,
+      Math.max(0, orderValue - settledAndShippedValue),
+    );
+    const bucketValueSum = settledAndShippedValue + inProcessValue;
 
     const integrity = runIntegrityChecks({
       counts, rates, rawOrders, bucketValueSum, totalOrderValue: orderValue,
@@ -198,7 +209,7 @@ export class CeoDashboardService {
       lossBar: this.buildLossBar({
         counts, rawOrders, inFlight,
         shippedCount: sums.shippedCount ?? 0,
-        deliveredValue, cancelledValue, rtsValue, shippedValue, orderValue,
+        deliveredValue, cancelledValue, rtsValue, shippedValue, inProcessValue, orderValue,
       }),
       retention: retention.curve,
       firstMove: this.buildFirstMove({
@@ -327,9 +338,9 @@ export class CeoDashboardService {
   private buildLossBar(input: {
     counts: { delivered: number; cancelled: number; rts: number };
     rawOrders: number; inFlight: number; shippedCount: number;
-    deliveredValue: number; cancelledValue: number; rtsValue: number; shippedValue: number; orderValue: number;
+    deliveredValue: number; cancelledValue: number; rtsValue: number; shippedValue: number; inProcessValue: number; orderValue: number;
   }) {
-    const { counts, rawOrders, inFlight, shippedCount, deliveredValue, cancelledValue, rtsValue, shippedValue, orderValue } = input;
+    const { counts, rawOrders, inFlight, shippedCount, deliveredValue, cancelledValue, rtsValue, shippedValue, inProcessValue, orderValue } = input;
     const share = (count: number) => rawOrders > 0 ? round(count / rawOrders, 4) : null;
     return {
       totalOrders: rawOrders,
@@ -340,7 +351,7 @@ export class CeoDashboardService {
         { key: 'CANCELLED', label: 'Cancelled', count: counts.cancelled, share: share(counts.cancelled), value: round(cancelledValue), note: 'lost at confirmation, never shipped' },
         { key: 'RTS', label: 'RTS / Returned', count: counts.rts, share: share(counts.rts), value: round(rtsValue), note: 'shipped then bounced — freight paid twice' },
         { key: 'SHIPPED', label: 'In transit', count: shippedCount, share: share(shippedCount), value: round(shippedValue), note: 'out for delivery' },
-        { key: 'IN_PROCESS', label: 'In process', count: inFlight, share: share(inFlight), value: null, note: 'placed, not yet dispatched' },
+        { key: 'IN_PROCESS', label: 'In process', count: inFlight, share: share(inFlight), value: round(inProcessValue), note: 'placed, not yet dispatched' },
       ],
     };
   }
