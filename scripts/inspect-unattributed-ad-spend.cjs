@@ -110,21 +110,13 @@ async function main() {
       }),
     ]);
 
-    console.log('CreativeStoreConfigs:', JSON.stringify(configs.map(c => ({ ...c, storeName: storeNameById.get(c.storeId.toLowerCase()) }))));
+    console.log(`CreativeStoreConfigs count=${configs.length}`);
     const storesWithProductsOrConfigs = new Set([
       ...allProducts.map(p => p.storeId.toLowerCase()),
       ...configs.map(c => c.storeId.toLowerCase()),
     ]);
-    console.log('RelevantStores:', JSON.stringify(
-      stores.filter(s => storesWithProductsOrConfigs.has(s.id.toLowerCase()) || s.teamId).map(s => ({
-        id: s.id,
-        shopId: s.shopId,
-        name: s.name,
-        teamId: s.teamId,
-        status: s.status,
-        enabled: s.enabled,
-      }))
-    ));
+    const relevantStores = stores.filter(s => storesWithProductsOrConfigs.has(s.id.toLowerCase()) || s.teamId);
+    console.log(`RelevantStores count=${relevantStores.length}`);
 
     const storeByAdId = new Map();
     for (const link of links) insertUnique(storeByAdId, link.adId,
@@ -165,7 +157,7 @@ async function main() {
         storesByCustomId.get(cid).add(p.storeId.toLowerCase());
       }
     }
-    console.log('ProductCatalogSummary:', JSON.stringify([...productCatalogSummary.values()]));
+    console.log(`ProductCatalogSummary count=${productCatalogSummary.size}`);
 
     // Sibling campaign / adset / adId mappings across all spendGroups
     const campaignSiblingsMap = new Map();
@@ -370,6 +362,7 @@ async function main() {
       console.log('UNASSIGNED_MAPPING_AD:', JSON.stringify(item));
     }
   }
+  await new Promise(r => setTimeout(r, 1500));
 }
 
 main()
