@@ -11,6 +11,8 @@ async function main() {
 
   for (const tenant of tenants) {
     const tenantId = tenant.id;
+    const rmCount = await prisma.reconcileMarketing.count({ where: { tenantId, OR: [{ spend: { gt: 0 } }, { leads: { gt: 0 } }] } });
+    if (rmCount === 0) continue;
     const stores = await prisma.posStore.findMany({
       where: { tenantId },
       select: { id: true, shopId: true, name: true, teamId: true, status: true, enabled: true },
@@ -23,20 +25,19 @@ async function main() {
       where: { tenantId },
       select: { codePrefix: true, storeId: true, active: true },
     });
-    const orderCounts = await prisma.$queryRawUnsafe(`
-      SELECT "storeId", COUNT(*)::int AS cnt
-      FROM pos_orders
-      WHERE "tenantId" = $1::uuid
-      GROUP BY "storeId"
-    `, tenantId);
-    const orderCountByStore = new Map(orderCounts.map(r => [r.storeId.toLowerCase(), r.cnt]));
+    const orderCounts = await prisma.posOrder.groupBy({
+      by: ['shopId'],
+      where: { tenantId },
+      _count: { _all: true },
+    });
+    const orderCountByShopId = new Map(orderCounts.map(r => [String(r.shopId), r._count._all]));
     const prodCountByStore = new Map();
     for (const p of products) {
       const sid = p.storeId.toLowerCase();
       prodCountByStore.set(sid, (prodCountByStore.get(sid) || 0) + 1);
     }
 
-    console.log(`\n=== TENANT: ${tenant.name} (${tenant.id}) | stores=${stores.length} | products=${products.length} | configs=${configs.length} ===`);
+    console.log(`\n=== TENANT: ${tenant.name} (${tenant.id}) | rmCount=${rmCount} | stores=${stores.length} | products=${products.length} | configs=${configs.length} ===`);
 
     // Check duplicate store names
     const byNormName = new Map();
@@ -50,7 +51,7 @@ async function main() {
         teamId: s.teamId,
         status: s.status,
         enabled: s.enabled,
-        orders: orderCountByStore.get(s.id.toLowerCase()) || 0,
+        orders: orderCountByShopId.get(String(s.shopId)) || 0,
         products: prodCountByStore.get(s.id.toLowerCase()) || 0,
       });
     }
@@ -70,7 +71,7 @@ async function main() {
     for (const kw of keywords) {
       const matchingStores = stores.filter(s => normKey(s.name).includes(kw)).map(s => ({
         id: s.id, name: s.name, shopId: s.shopId, teamId: s.teamId,
-        orders: orderCountByStore.get(s.id.toLowerCase()) || 0,
+        orders: orderCountByShopId.get(String(s.shopId)) || 0,
         products: prodCountByStore.get(s.id.toLowerCase()) || 0,
       }));
       const matchingProds = products.filter(p =>
