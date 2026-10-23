@@ -3,6 +3,18 @@ import { resolve } from 'path';
 import { PrismaClient, RbacWorkspace, RoleScope } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import Redis from 'ioredis';
+import {
+  loadSalesStoreAttribution,
+  partitionTeamAdSpend,
+} from '../src/modules/analytics/utils/team-ad-spend';
+import {
+  resolveStoreAttribution,
+  UNATTRIBUTED_STORE_KEY,
+} from '../src/modules/analytics/utils/store-attribution';
+import {
+  isBusinessReportExcludedStore,
+  isSuperAdminOnlyTeamId,
+} from '../src/common/utils/super-admin-only-teams';
 
 function loadEnvFile(filePath: string) {
   if (!existsSync(filePath)) {
@@ -1932,12 +1944,735 @@ async function backfill2026OrderCogsAndReports() {
   }
 }
 
+async function backfillAdSpendStoreAndTeamAttribution() {
+  console.log('Starting Ad Spend Store, Team & Product Mapping Attribution Backfill...');
+  const startedAt = Date.now();
+  const NEXT_BIG_MOVE_TENANT_ID = 'd917e03f-bc56-4371-a844-66cf2aee6270';
+  const ZENITH_TEAM_ID = '83bf4287-bfee-4c22-93a0-7d34a97f7703';
+  const WETRADE_TEAM_ID = 'df2b59d1-9434-44d0-8b68-7e93e668ccda';
+  const OGIMI_TEAM_ID = '00000000-0000-4000-8000-000000000003';
+  const KANGEN_TEAM_ID = '00000000-0000-4000-8000-000000000004';
+  const EVAH_TEAM_ID = '00000000-0000-4000-8000-000000000005';
+
+  try {
+    const nbmTenant = await prisma.tenant.findUnique({ where: { id: NEXT_BIG_MOVE_TENANT_ID } });
+    if (nbmTenant) {
+      // 1. Upsert the 3 Super-Admin-only teams: Ogimi (TEAM3), Kangen (TEAM4), Evah (TEAM5)
+      const superAdminTeams = [
+        { id: OGIMI_TEAM_ID, name: 'Ogimi', teamCode: 'TEAM3', description: 'Ogimi Team (Super Admin only)' },
+        { id: KANGEN_TEAM_ID, name: 'Kangen', teamCode: 'TEAM4', description: 'Kangen Team (Super Admin only)' },
+        { id: EVAH_TEAM_ID, name: 'Evah', teamCode: 'TEAM5', description: 'Evah Team (Super Admin only)' },
+      ];
+      for (const t of superAdminTeams) {
+        await prisma.team.upsert({
+          where: { id: t.id },
+          update: {
+            tenantId: NEXT_BIG_MOVE_TENANT_ID,
+            name: t.name,
+            teamCode: t.teamCode,
+            description: t.description,
+            status: 'ACTIVE',
+          },
+          create: {
+            id: t.id,
+            tenantId: NEXT_BIG_MOVE_TENANT_ID,
+            name: t.name,
+            teamCode: t.teamCode,
+            description: t.description,
+            status: 'ACTIVE',
+          },
+        });
+      }
+      console.log('✓ Ensured Super-Admin-only teams: Ogimi (TEAM3), Kangen (TEAM4), Evah (TEAM5)');
+
+      // 2. Reassign Ogimi Wellness store (23d5232f-dbc0-48cb-9160-d5793c5057aa) and its POS orders to Ogimi (TEAM3)
+      await prisma.$executeRawUnsafe(`
+        UPDATE pos_stores
+        SET "teamId" = '${OGIMI_TEAM_ID}', status = 'ACTIVE', enabled = true, "updatedAt" = NOW()
+        WHERE id = '23d5232f-dbc0-48cb-9160-d5793c5057aa'
+      `);
+      await prisma.$executeRawUnsafe(`
+        UPDATE pos_orders
+        SET "teamId" = '${OGIMI_TEAM_ID}'
+        WHERE "tenantId" = '${NEXT_BIG_MOVE_TENANT_ID}'
+          AND "shopId" = '715088566'
+          AND "teamId" IS DISTINCT FROM '${OGIMI_TEAM_ID}'
+      `);
+
+      // 3. Upsert the 6 new brand stores + pos_shop_ownerships + default pos_products + positive COGS
+      const newBrandStores = [
+        {
+          id: '00000000-0000-4000-8000-000000000014',
+          name: 'Kangen',
+          shopId: 'kangen_store',
+          shopName: 'Kangen',
+          teamId: KANGEN_TEAM_ID,
+          productId: '00000000-0000-4000-8000-000000000114',
+          variationId: 'kangen-default',
+          productName: 'Kangen',
+          customId: 'kangen',
+          defaultCogs: 350.0,
+        },
+        {
+          id: '00000000-0000-4000-8000-000000000015',
+          name: 'Evah Fragrances',
+          shopId: 'evah_fragrances_store',
+          shopName: 'Evah Fragrances',
+          teamId: EVAH_TEAM_ID,
+          productId: '00000000-0000-4000-8000-000000000115',
+          variationId: 'evah-default',
+          productName: 'Evah Fragrances',
+          customId: 'evah fragrances',
+          defaultCogs: 250.0,
+        },
+        {
+          id: '00000000-0000-4000-8000-000000000016',
+          name: 'Garahe Hacks',
+          shopId: 'garahe_hacks_store',
+          shopName: 'Garahe Hacks',
+          teamId: ZENITH_TEAM_ID,
+          productId: '00000000-0000-4000-8000-000000000116',
+          variationId: 'headlight-cleaner',
+          productName: 'Headlight Cleaner',
+          customId: 'headlight cleaner',
+          defaultCogs: 185.0,
+        },
+        {
+          id: '00000000-0000-4000-8000-000000000017',
+          name: 'ScentGems',
+          shopId: 'scentgems_store',
+          shopName: 'ScentGems',
+          teamId: ZENITH_TEAM_ID,
+          productId: '00000000-0000-4000-8000-000000000117',
+          variationId: 'andrea-secret',
+          productName: 'Andrea Secret',
+          customId: 'andrea secret',
+          defaultCogs: 220.0,
+        },
+        {
+          id: '00000000-0000-4000-8000-000000000018',
+          name: 'Petal Theory',
+          shopId: 'petal_theory_store',
+          shopName: 'Petal Theory',
+          teamId: ZENITH_TEAM_ID,
+          productId: '00000000-0000-4000-8000-000000000118',
+          variationId: 'petal-theory',
+          productName: 'Petal Theory',
+          customId: 'petal theory',
+          defaultCogs: 210.0,
+        },
+        {
+          id: '00000000-0000-4000-8000-000000000019',
+          name: 'Tails & Toys',
+          shopId: 'tails_and_toys_store',
+          shopName: 'Tails & Toys',
+          teamId: WETRADE_TEAM_ID,
+          productId: '00000000-0000-4000-8000-000000000119',
+          variationId: 'cat-yoyo-toy',
+          productName: 'Cat Yoyo Toy',
+          customId: 'cat yoyo toy',
+          defaultCogs: 145.0,
+        },
+      ];
+
+      for (const s of newBrandStores) {
+        await prisma.posStore.upsert({
+          where: { id: s.id },
+          update: {
+            tenantId: NEXT_BIG_MOVE_TENANT_ID,
+            teamId: s.teamId,
+            name: s.name,
+            shopId: s.shopId,
+            shopName: s.shopName,
+            status: 'ACTIVE',
+            enabled: true,
+          },
+          create: {
+            id: s.id,
+            tenantId: NEXT_BIG_MOVE_TENANT_ID,
+            teamId: s.teamId,
+            name: s.name,
+            shopId: s.shopId,
+            shopName: s.shopName,
+            apiKey: 'historical_ad_store',
+            status: 'ACTIVE',
+            enabled: true,
+          },
+        });
+
+        await prisma.$executeRawUnsafe(`
+          INSERT INTO pos_shop_ownerships ("shopId", "tenantId", "storeId", "updatedAt")
+          VALUES ('${s.shopId}', '${NEXT_BIG_MOVE_TENANT_ID}', '${s.id}', NOW())
+          ON CONFLICT ("shopId") DO UPDATE
+          SET "tenantId" = EXCLUDED."tenantId", "storeId" = EXCLUDED."storeId", "updatedAt" = NOW()
+        `);
+
+        await prisma.posProduct.upsert({
+          where: {
+            storeId_variationId: {
+              storeId: s.id,
+              variationId: s.variationId,
+            },
+          },
+          update: {
+            tenantId: NEXT_BIG_MOVE_TENANT_ID,
+            teamId: s.teamId,
+            name: s.productName,
+            customId: s.customId,
+            mapping: s.customId,
+          },
+          create: {
+            id: s.productId,
+            tenantId: NEXT_BIG_MOVE_TENANT_ID,
+            teamId: s.teamId,
+            storeId: s.id,
+            posProductId: s.variationId,
+            variationId: s.variationId,
+            name: s.productName,
+            customId: s.customId,
+            mapping: s.customId,
+          },
+        });
+
+        await prisma.$executeRawUnsafe(`
+          INSERT INTO pos_product_cogs (id, "tenantId", "teamId", "productId", "storeId", cogs, "startDate", "endDate", "createdAt", "updatedAt")
+          SELECT gen_random_uuid(), '${NEXT_BIG_MOVE_TENANT_ID}', '${s.teamId}', p.id, '${s.id}', ${s.defaultCogs}, NULL, NULL, NOW(), NOW()
+          FROM pos_products p
+          WHERE p."storeId" = '${s.id}' AND p."variationId" = '${s.variationId}'
+            AND NOT EXISTS (
+              SELECT 1 FROM pos_product_cogs c WHERE c."productId" = p.id AND c.cogs > 0
+            )
+        `);
+      }
+      console.log('✓ Ensured 6 brand stores (Kangen, Evah Fragrances, Garahe Hacks, ScentGems, Petal Theory, Tails & Toys)');
+    }
+
+    // 4. Resolve store, team, and mapping attribution across all tenants
+    const tenants = await prisma.tenant.findMany({ select: { id: true, name: true } });
+    const norm = (val?: string | null) => String(val || '').trim().toLowerCase();
+
+    for (const tenant of tenants) {
+      const [activeStores, teams, rmRows, maiRows, products, creatives, storeConfigs] = await Promise.all([
+        prisma.posStore.findMany({
+          where: {
+            tenantId: tenant.id,
+            status: 'ACTIVE',
+            OR: [{ enabled: true }, { enabled: null }],
+          },
+          select: { id: true, shopId: true, name: true, shopName: true, teamId: true },
+        }),
+        prisma.team.findMany({
+          where: { tenantId: tenant.id, status: 'ACTIVE' },
+          select: { id: true, name: true, teamCode: true },
+        }),
+        prisma.reconcileMarketing.findMany({
+          where: { tenantId: tenant.id },
+          select: {
+            id: true,
+            date: true,
+            adId: true,
+            adName: true,
+            campaignId: true,
+            campaignName: true,
+            mapping: true,
+            shops: true,
+            teamId: true,
+            teamCode: true,
+            spend: true,
+            leads: true,
+            purchasesPos: true,
+            codPos: true,
+            matchedOrders: true,
+          },
+        }),
+        prisma.metaAdInsight.findMany({
+          where: { tenantId: tenant.id },
+          select: {
+            id: true,
+            adId: true,
+            adName: true,
+            campaignId: true,
+            campaignName: true,
+            accountId: true,
+            teamId: true,
+            teamCode: true,
+            mapping: true,
+            spend: true,
+          },
+        }),
+        prisma.posProduct.findMany({
+          where: { tenantId: tenant.id },
+          select: { id: true, storeId: true, variationId: true, customId: true, name: true, mapping: true },
+        }),
+        prisma.creative.findMany({
+          where: { tenantId: tenant.id },
+          select: { code: true, posCustomId: true, posVariationId: true, storeConfig: { select: { storeId: true } } },
+        }),
+        prisma.creativeStoreConfig.findMany({
+          where: { tenantId: tenant.id, active: true },
+          select: { codePrefix: true, storeId: true },
+        }),
+      ]);
+
+      if (activeStores.length === 0 || rmRows.length === 0) continue;
+
+      const storeById = new Map(activeStores.map((s) => [s.id.toLowerCase(), s]));
+      const storeByShopId = new Map(activeStores.map((s) => [s.shopId, s]));
+      const teamCodeById = new Map(teams.map((t) => [t.id.toLowerCase(), t.teamCode || null]));
+
+      // Default product variation per store (for pv:: key construction when needed)
+      const defaultVariationByStoreId = new Map<string, string>();
+      const variationsByStoreId = new Map<string, Array<{ variationId: string; name: string; customId: string }>>();
+      for (const p of products) {
+        const sId = p.storeId.toLowerCase();
+        const vId = (p.variationId || '').trim();
+        if (!vId || !storeById.has(sId)) continue;
+        if (!defaultVariationByStoreId.has(sId)) defaultVariationByStoreId.set(sId, vId);
+        const list = variationsByStoreId.get(sId) || [];
+        list.push({ variationId: vId, name: norm(p.name), customId: norm(p.customId) });
+        variationsByStoreId.set(sId, list);
+      }
+
+      const buildFallbackMappingForStore = (storeId: string, adText: string): string => {
+        const sId = storeId.toLowerCase();
+        const vars = variationsByStoreId.get(sId) || [];
+        if (vars.length === 1) {
+          return `pv::${sId}::${vars[0].variationId}`.toLowerCase();
+        }
+        const hay = norm(adText);
+        if (hay && vars.length > 1) {
+          const matched = vars.find(
+            (v) => (v.customId && hay.includes(v.customId)) || (v.name && v.name.length >= 4 && hay.includes(v.name)),
+          );
+          if (matched) return `pv::${sId}::${matched.variationId}`.toLowerCase();
+        }
+        return `ua::${sId}`.toLowerCase();
+      };
+
+      const index = await loadSalesStoreAttribution(prisma, tenant.id, rmRows as any, activeStores);
+
+      // Account lookup from meta_ad_insights
+      const accountIdByAdId = new Map<string, string>();
+      const accountIdByCampaignId = new Map<string, string>();
+      for (const m of maiRows) {
+        if (m.adId && m.accountId) accountIdByAdId.set(m.adId, m.accountId);
+        if (m.campaignId && m.accountId) accountIdByCampaignId.set(m.campaignId, m.accountId);
+      }
+
+      // Brand / campaign explicit override rules for Next Big Move
+      const resolveExplicitBrandOverride = (row: {
+        adId?: string | null;
+        adName?: string | null;
+        campaignId?: string | null;
+        campaignName?: string | null;
+        mapping?: string | null;
+        shops?: unknown;
+        accountId?: string | null;
+      }): string | null => {
+        if (tenant.id !== NEXT_BIG_MOVE_TENANT_ID) return null;
+        const shopsArr = Array.isArray(row.shops) ? row.shops.map(String) : [];
+        if (shopsArr.includes('715088566')) return '23d5232f-dbc0-48cb-9160-d5793c5057aa';
+        if (shopsArr.includes('kangen_store')) return '00000000-0000-4000-8000-000000000014';
+        if (shopsArr.includes('evah_fragrances_store')) return '00000000-0000-4000-8000-000000000015';
+
+        const text = `${norm(row.campaignName)} | ${norm(row.adName)} | ${norm(row.mapping)}`;
+        const accId = row.accountId || (row.adId ? accountIdByAdId.get(row.adId) : undefined) || (row.campaignId ? accountIdByCampaignId.get(row.campaignId) : undefined) || '';
+
+        if (text.includes('ogimi')) return '23d5232f-dbc0-48cb-9160-d5793c5057aa'; // Ogimi Wellness
+        if (text.includes('kangen') || accId === '2560293900989953') return '00000000-0000-4000-8000-000000000014'; // Kangen
+        if (text.includes('evah') || accId === '1487235986020067') return '00000000-0000-4000-8000-000000000015'; // Evah Fragrances
+        if (text.includes('headlightcleaner') || text.includes('headlight cleaner')) return '00000000-0000-4000-8000-000000000016'; // Garahe Hacks
+        if (text.includes('andrea secret') || text.includes('scentgems')) return '00000000-0000-4000-8000-000000000017'; // ScentGems
+        if (text.includes('petal theory')) return '00000000-0000-4000-8000-000000000018'; // Petal Theory
+        if (text.includes('cat yoyo') || text.includes('tails & toys') || text.includes('tails and toys')) return '00000000-0000-4000-8000-000000000019'; // Tails & Toys
+        if (text.includes('anik anik engagement')) return '250d2a13-0244-4200-a346-9510c2378171'; // Axle Gear
+        if (text.includes('3 kid chart') || text.includes('vallejo')) return '5b86e613-05f3-4d33-b4dd-56916721c216'; // Kiddie Wonders PH
+        if (norm(row.campaignName) === 'new sales campaign' && norm(row.adName) === 'new sales campaign') {
+          return '98056b3d-fb9d-45e9-ad5f-785c77444034'; // Agriblast PH
+        }
+        return null;
+      };
+
+      // Keyword-based fallback for active stores in Next Big Move
+      const resolveKeywordStore = (text: string): string | null => {
+        const t = norm(text);
+        if (!t) return null;
+        for (const s of activeStores) {
+          const sName = norm(s.name);
+          const sShopName = norm(s.shopName);
+          if (sName.length >= 4 && t.includes(sName)) return s.id.toLowerCase();
+          if (sShopName.length >= 4 && t.includes(sShopName)) return s.id.toLowerCase();
+        }
+        if (tenant.id === NEXT_BIG_MOVE_TENANT_ID) {
+          if (t.includes('smile') || t.includes('oral') || t.includes('breath') || t.includes('teeth')) return '2998bcd6-c878-40f6-ad19-1c29fb9f69f6'; // SmileOrganics
+          if (t.includes('barebody') || t.includes('bare body')) return '2bb11c9e-d41b-4cd5-8f57-f5b6d8a22458'; // Barebody.ph
+          if (t.includes('kiddie') || t.includes('kid') || t.includes('busy book') || t.includes('montessori')) return '5b86e613-05f3-4d33-b4dd-56916721c216'; // Kiddie Wonders PH
+          if (t.includes('radiance')) return '11edbb22-f08e-456d-92be-d62f42670d0f'; // Radiance Sphere
+          if (t.includes('luntian')) return '972d13d9-7251-4e78-9d23-9e5fb20b7061'; // Luntian
+          if (t.includes('luxe')) return '5d4f7b8e-705c-401c-8222-3e271659cf55'; // Luxe Essential
+          if (t.includes('tactical')) return 'e31d81c1-72b0-4058-b78c-d54f74263f73'; // Tactical Minds
+          if (t.includes('axle') || t.includes('wiper') || t.includes('car')) return '250d2a13-0244-4200-a346-9510c2378171'; // Axle Gear
+          if (t.includes('agriblast') || t.includes('fertilizer') || t.includes('plant')) return '98056b3d-fb9d-45e9-ad5f-785c77444034'; // Agriblast PH
+          if (t.includes('bahay')) return '0560ff14-563a-4782-a309-838a5743f0d5'; // Bahay Trends
+          if (t.includes('kusina')) return 'd6e7b31a-4821-4625-9333-1989b44cf408'; // Kusina Hacks
+          if (t.includes('homeliving') || t.includes('home living')) return 'd2d8ff80-66d8-4a12-a844-5df8c139463e'; // HomeLiving PH
+          if (t.includes('book hub') || t.includes('book')) return '8f9caa4b-b047-4d21-9839-72208b53ecd5'; // The Book Hub
+          if (t.includes('zenith') || t.includes('tai sui') || t.includes('taisui') || t.includes('bracelet') || t.includes('feng shui')) return '64df6bb0-2582-47cd-882a-76b5da8c2c91'; // Zenith
+        }
+        return null;
+      };
+
+      // Build vote maps from Pass 1
+      const addVote = (map: Map<string, Map<string, number>>, key: string | null | undefined, storeId: string, weight = 1) => {
+        const k = norm(key);
+        if (!k || !storeById.has(storeId)) return;
+        let bucket = map.get(k);
+        if (!bucket) {
+          bucket = new Map();
+          map.set(k, bucket);
+        }
+        bucket.set(storeId, (bucket.get(storeId) || 0) + weight);
+      };
+      const topVote = (map: Map<string, Map<string, number>>, key: string | null | undefined): string | null => {
+        const k = norm(key);
+        if (!k) return null;
+        const bucket = map.get(k);
+        if (!bucket || bucket.size === 0) return null;
+        let bestStore: string | null = null;
+        let bestScore = -1;
+        for (const [sId, score] of bucket.entries()) {
+          if (score > bestScore) {
+            bestScore = score;
+            bestStore = sId;
+          }
+        }
+        return bestStore;
+      };
+
+      const votesByAdId = new Map<string, Map<string, number>>();
+      const votesByCampaignId = new Map<string, Map<string, number>>();
+      const votesByCampaignName = new Map<string, Map<string, number>>();
+      const votesByAccountId = new Map<string, Map<string, number>>();
+      const votesByTeamId = new Map<string, Map<string, number>>();
+      const tenantStoreVotes = new Map<string, number>();
+
+      for (const row of rmRows) {
+        const explicitOverride = resolveExplicitBrandOverride(row);
+        const std = explicitOverride || resolveStoreAttribution(row as any, index);
+        if (std && std !== UNATTRIBUTED_STORE_KEY && storeById.has(std)) {
+          const weight = Math.max(1, Number(row.spend || 0) + Number(row.purchasesPos || 0) * 10);
+          addVote(votesByAdId, row.adId, std, weight);
+          addVote(votesByCampaignId, row.campaignId, std, weight);
+          addVote(votesByCampaignName, row.campaignName, std, weight);
+          const accId = (row.adId ? accountIdByAdId.get(row.adId) : undefined) || (row.campaignId ? accountIdByCampaignId.get(row.campaignId) : undefined);
+          addVote(votesByAccountId, accId, std, weight);
+          const st = storeById.get(std);
+          if (!isBusinessReportExcludedStore(st)) {
+            addVote(votesByTeamId, row.teamId || st?.teamId, std, weight);
+            tenantStoreVotes.set(std, (tenantStoreVotes.get(std) || 0) + weight);
+          }
+        }
+      }
+
+      let defaultTenantStoreId = activeStores.find((s) => !isBusinessReportExcludedStore(s))?.id.toLowerCase() || activeStores[0].id.toLowerCase();
+      let bestTenantScore = -1;
+      for (const [sId, score] of tenantStoreVotes.entries()) {
+        if (score > bestTenantScore) {
+          bestTenantScore = score;
+          defaultTenantStoreId = sId;
+        }
+      }
+
+      // Pass 2: Resolve every reconcile_marketing row
+      const rmUpdates: Array<{
+        id: string;
+        teamId: string | null;
+        teamCode: string | null;
+        shops: string[];
+        mapping: string;
+      }> = [];
+      const affectedDates = new Set<string>();
+
+      for (const row of rmRows) {
+        let resolvedStoreId: string | null = resolveExplicitBrandOverride(row);
+
+        if (!resolvedStoreId) {
+          const std = resolveStoreAttribution(row as any, index);
+          if (std && std !== UNATTRIBUTED_STORE_KEY && storeById.has(std)) {
+            resolvedStoreId = std;
+          }
+        }
+
+        // Fallback 1: exact adId vote
+        if (!resolvedStoreId && row.adId) {
+          resolvedStoreId = topVote(votesByAdId, row.adId);
+        }
+
+        // Fallback 2: matchedOrders shopIds
+        if (!resolvedStoreId && Array.isArray(row.matchedOrders) && row.matchedOrders.length > 0) {
+          const orderShopCounts = new Map<string, number>();
+          for (const mo of row.matchedOrders as any[]) {
+            const sId = mo?.shopId ? storeByShopId.get(String(mo.shopId))?.id.toLowerCase() : null;
+            if (sId && storeById.has(sId)) {
+              orderShopCounts.set(sId, (orderShopCounts.get(sId) || 0) + 1);
+            }
+          }
+          let bestCount = 0;
+          for (const [sId, cnt] of orderShopCounts.entries()) {
+            if (cnt > bestCount) {
+              bestCount = cnt;
+              resolvedStoreId = sId;
+            }
+          }
+        }
+
+        // Fallback 3: row.shops array (disambiguated by campaign/account/keyword if multiple)
+        if (!resolvedStoreId && Array.isArray(row.shops) && row.shops.length > 0) {
+          const shopStoreCandidates = (row.shops as any[])
+            .map((raw) => storeByShopId.get(String(raw))?.id.toLowerCase())
+            .filter((sId): sId is string => Boolean(sId && storeById.has(sId)));
+          if (shopStoreCandidates.length === 1) {
+            resolvedStoreId = shopStoreCandidates[0];
+          } else if (shopStoreCandidates.length > 1) {
+            const kwStore = resolveKeywordStore(`${row.campaignName || ''} ${row.adName || ''} ${row.mapping || ''}`);
+            const campStore = topVote(votesByCampaignId, row.campaignId) || topVote(votesByCampaignName, row.campaignName);
+            if (kwStore && shopStoreCandidates.includes(kwStore)) resolvedStoreId = kwStore;
+            else if (campStore && shopStoreCandidates.includes(campStore)) resolvedStoreId = campStore;
+            else resolvedStoreId = shopStoreCandidates[0];
+          }
+        }
+
+        // Fallback 4: creative code / prefix / product keyword
+        if (!resolvedStoreId) {
+          const text = `${row.campaignName || ''} ${row.adName || ''} ${row.mapping || ''}`;
+          resolvedStoreId = resolveKeywordStore(text);
+        }
+
+        // Fallback 5: campaignId or campaignName votes
+        if (!resolvedStoreId) {
+          resolvedStoreId = topVote(votesByCampaignId, row.campaignId) || topVote(votesByCampaignName, row.campaignName);
+        }
+
+        // Fallback 6: Meta accountId votes
+        if (!resolvedStoreId) {
+          const accId = (row.adId ? accountIdByAdId.get(row.adId) : undefined) || (row.campaignId ? accountIdByCampaignId.get(row.campaignId) : undefined);
+          resolvedStoreId = topVote(votesByAccountId, accId);
+        }
+
+        // Fallback 7: teamId dominant store or tenant dominant store
+        if (!resolvedStoreId) {
+          resolvedStoreId = topVote(votesByTeamId, row.teamId) || defaultTenantStoreId;
+        }
+
+        const targetStore = storeById.get(resolvedStoreId)!;
+        const isSuperAdminStore = isBusinessReportExcludedStore(targetStore);
+        const targetTeamId = isSuperAdminStore
+          ? targetStore.teamId
+          : row.teamId && !isSuperAdminOnlyTeamId(row.teamId)
+            ? row.teamId
+            : targetStore.teamId;
+        const targetTeamCode = targetTeamId ? teamCodeById.get(targetTeamId.toLowerCase()) || row.teamCode : row.teamCode;
+
+        let candidateShops: string[] =
+          Array.isArray(row.shops) && row.shops.length > 0 ? (row.shops as any[]).map(String) : [targetStore.shopId];
+        let candidateMapping: string =
+          typeof row.mapping === 'string' && row.mapping.trim().length > 0
+            ? row.mapping
+            : buildFallbackMappingForStore(targetStore.id, `${row.campaignName || ''} ${row.adName || ''}`);
+
+        // If row belongs to one of the 6 new brand stores and had a null/generic mapping, use its product mapping key
+        if (
+          targetStore.id.startsWith('00000000-0000-4000-8000-00000000001') &&
+          (!row.mapping || norm(row.mapping) === norm(row.campaignName) || row.mapping.startsWith('ua::'))
+        ) {
+          candidateMapping = buildFallbackMappingForStore(targetStore.id, `${row.campaignName || ''} ${row.adName || ''}`);
+        }
+
+        // Verify resolveStoreAttribution on candidateRow
+        let checkAttr = resolveStoreAttribution(
+          { adId: row.adId, adName: row.adName, shops: candidateShops, mapping: candidateMapping },
+          index,
+        );
+        if (checkAttr !== targetStore.id.toLowerCase()) {
+          candidateShops = [targetStore.shopId];
+          checkAttr = resolveStoreAttribution(
+            { adId: row.adId, adName: row.adName, shops: candidateShops, mapping: candidateMapping },
+            index,
+          );
+        }
+        if (checkAttr !== targetStore.id.toLowerCase()) {
+          candidateMapping = buildFallbackMappingForStore(targetStore.id, `${row.campaignName || ''} ${row.adName || ''}`);
+          checkAttr = resolveStoreAttribution(
+            { adId: row.adId, adName: row.adName, shops: candidateShops, mapping: candidateMapping },
+            index,
+          );
+        }
+
+        const currentShopsJson = JSON.stringify(Array.isArray(row.shops) ? row.shops : []);
+        const nextShopsJson = JSON.stringify(candidateShops);
+        if (
+          row.teamId !== targetTeamId ||
+          row.teamCode !== targetTeamCode ||
+          row.mapping !== candidateMapping ||
+          currentShopsJson !== nextShopsJson
+        ) {
+          rmUpdates.push({
+            id: row.id,
+            teamId: targetTeamId || null,
+            teamCode: targetTeamCode || null,
+            shops: candidateShops,
+            mapping: candidateMapping,
+          });
+          const dateStr = row.date instanceof Date ? row.date.toISOString().slice(0, 10) : String(row.date).slice(0, 10);
+          affectedDates.add(dateStr);
+        }
+      }
+
+      // Execute reconcile_marketing updates in batches
+      for (let i = 0; i < rmUpdates.length; i += 250) {
+        const batch = rmUpdates.slice(i, i + 250);
+        await prisma.$transaction(
+          batch.map((u) =>
+            prisma.reconcileMarketing.update({
+              where: { id: u.id },
+              data: {
+                teamId: u.teamId,
+                teamCode: u.teamCode,
+                shops: u.shops,
+                mapping: u.mapping,
+              },
+            }),
+          ),
+        );
+      }
+
+      // Also align meta_ad_insights teamId, teamCode, and mapping so future reconciliations preserve attribution
+      let updatedMaiCount = 0;
+      const maiUpdates: Array<{ id: string; teamId: string | null; teamCode: string | null; mapping: string | null }> = [];
+      for (const m of maiRows) {
+        const overrideStoreId = resolveExplicitBrandOverride(m);
+        const votedStoreId =
+          overrideStoreId ||
+          topVote(votesByAdId, m.adId) ||
+          topVote(votesByCampaignId, m.campaignId) ||
+          topVote(votesByCampaignName, m.campaignName) ||
+          resolveKeywordStore(`${m.campaignName || ''} ${m.adName || ''} ${m.mapping || ''}`) ||
+          topVote(votesByAccountId, m.accountId) ||
+          topVote(votesByTeamId, m.teamId) ||
+          defaultTenantStoreId;
+        const st = storeById.get(votedStoreId);
+        if (!st) continue;
+        const isSuperAdminStore = isBusinessReportExcludedStore(st);
+        const targetTeamId = isSuperAdminStore
+          ? st.teamId
+          : m.teamId && !isSuperAdminOnlyTeamId(m.teamId)
+            ? m.teamId
+            : st.teamId;
+        const targetTeamCode = targetTeamId ? teamCodeById.get(targetTeamId.toLowerCase()) || m.teamCode : m.teamCode;
+        const targetMapping =
+          m.mapping && m.mapping.trim().length > 0
+            ? m.mapping
+            : buildFallbackMappingForStore(st.id, `${m.campaignName || ''} ${m.adName || ''}`);
+
+        if (m.teamId !== targetTeamId || m.teamCode !== targetTeamCode || (!m.mapping && targetMapping)) {
+          maiUpdates.push({
+            id: m.id,
+            teamId: targetTeamId || null,
+            teamCode: targetTeamCode || null,
+            mapping: targetMapping,
+          });
+        }
+      }
+
+      for (let i = 0; i < maiUpdates.length; i += 250) {
+        const batch = maiUpdates.slice(i, i + 250);
+        await prisma.$transaction(
+          batch.map((u) =>
+            prisma.metaAdInsight.update({
+              where: { id: u.id },
+              data: {
+                teamId: u.teamId,
+                teamCode: u.teamCode,
+                mapping: u.mapping,
+              },
+            }),
+          ),
+        );
+        updatedMaiCount += batch.length;
+      }
+
+      // Verify post-backfill attribution on tenant
+      const verifyRmRows = await prisma.reconcileMarketing.findMany({
+        where: { tenantId: tenant.id },
+        select: {
+          id: true,
+          date: true,
+          adId: true,
+          adName: true,
+          mapping: true,
+          shops: true,
+          teamId: true,
+          spend: true,
+          leads: true,
+        },
+      });
+      const verifyIndex = await loadSalesStoreAttribution(prisma, tenant.id, verifyRmRows as any, activeStores);
+      const verifyAllocation = partitionTeamAdSpend(
+        verifyRmRows as any,
+        activeStores,
+        verifyIndex,
+        [],
+        new Date('2020-01-01T00:00:00.000Z'),
+      );
+      let unattributedRows = 0;
+      let unattributedSpend = 0;
+      let nullMappingRows = 0;
+      for (const r of verifyAllocation.rows) {
+        const sp = Number(r.row.spend || 0);
+        const ld = Number(r.row.leads || 0);
+        if (r.storeId === UNATTRIBUTED_STORE_KEY && (sp > 0 || ld > 0)) {
+          unattributedRows++;
+          unattributedSpend += sp;
+        }
+        if (!r.row.mapping) nullMappingRows++;
+      }
+
+      console.log(
+        `✓ Ad Spend Attribution [${tenant.name}]: updatedRM=${rmUpdates.length}, updatedMAI=${updatedMaiCount}, affectedDates=${affectedDates.size}, unattributedAdRows=${unattributedRows}, unattributedAdSpend=${unattributedSpend.toFixed(2)}, unassignedTeamSpend=${verifyAllocation.coverage.current.unassignedSpend.toFixed(2)}, nullMappingRows=${nullMappingRows}`,
+      );
+    }
+
+    // 5. Clear Redis analytics cache and bump version so Business Report & Teams reflect changes immediately
+    const host = process.env.REDIS_HOST || 'localhost';
+    const port = parseInt(process.env.REDIS_PORT || '6379', 10);
+    const keyPrefix = process.env.CACHE_PREFIX || 'erp:';
+    const password = process.env.REDIS_PASSWORD || undefined;
+    const redis = new Redis({ host, port, keyPrefix, password, lazyConnect: true, maxRetriesPerRequest: 2 });
+    try {
+      await redis.connect();
+      for (const tenant of tenants) {
+        const nextVersion = await redis.incrby(`analytics:${tenant.id}:version`, 10);
+        console.log(`✓ Bumped Redis analytics:${tenant.id}:version to ${nextVersion}`);
+      }
+    } catch (redisErr: any) {
+      console.warn('Warning: could not bump Redis analytics version after ad spend backfill:', redisErr?.message || redisErr);
+    } finally {
+      redis.disconnect();
+    }
+
+    console.log(`✓ Completed Ad Spend Store, Team & Product Mapping Attribution Backfill in ${Date.now() - startedAt}ms`);
+  } catch (err: any) {
+    console.error('Warning during Ad Spend Attribution Backfill:', err?.message || err);
+  }
+}
+
 async function main() {
   console.log('Starting database seed...');
   await ensureSuperAdmin();
   await seedPermissions();
   await seedRoles();
   await ensureDefaultTeamsAndBackfill();
+  await backfillAdSpendStoreAndTeamAttribution();
   await backfill2026OrderCogsAndReports();
   console.log('Seed completed successfully!');
 }

@@ -58,9 +58,21 @@ export function resolveStoreAttribution(
     else candidates.add(value);
   };
   const fromMap = (map: ReadonlyMap<string, string | null>, key: string) => {
-    if (map.has(key)) add(map.get(key));
+    if (map.has(key)) {
+      const mapped = map.get(key);
+      if (mapped) add(mapped);
+      else if (candidates.size === 0) ambiguous = true;
+    }
   };
   const shops = Array.isArray(row.shops) ? row.shops : [];
+  const mapping = typeof row.mapping === 'string' ? row.mapping : null;
+  const precise = parseProductMappingKey(mapping) ?? parseUnassignedMappingKey(mapping);
+  if (shops.length === 1 && precise && index.validStoreIds.has(precise.storeId)) {
+    const singleShop = typeof shops[0] === 'string' || typeof shops[0] === 'number' ? String(shops[0]) : '';
+    if (singleShop && index.storeByShopId.get(singleShop) === precise.storeId) {
+      return precise.storeId;
+    }
+  }
   for (const raw of shops) {
     const shop = typeof raw === 'string' || typeof raw === 'number' ? String(raw) : '';
     if (!shop) ambiguous = true;
@@ -72,8 +84,6 @@ export function resolveStoreAttribution(
     fromMap(index.storeByCreativeCode, code.code);
     fromMap(index.storeByCodePrefix, code.prefix);
   }
-  const mapping = typeof row.mapping === 'string' ? row.mapping : null;
-  const precise = parseProductMappingKey(mapping) ?? parseUnassignedMappingKey(mapping);
   if (precise) add(precise.storeId);
   else {
     const label = mapping?.trim().toLowerCase();

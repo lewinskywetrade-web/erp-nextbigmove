@@ -23,6 +23,10 @@ import { loadSalesStoreAttribution, partitionTeamAdSpend } from './utils/team-ad
 import {
   UNATTRIBUTED_STORE_KEY,
 } from './utils/store-attribution';
+import {
+  isBusinessReportExcludedStore,
+  isSuperAdminOnlyTeamId,
+} from '../../common/utils/super-admin-only-teams';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -1090,9 +1094,9 @@ export class SalesAnalyticsService {
     const includeNull = normalizedMappings.includes(this.normalize('__null__'));
 
     const tenantId = this.teamContext.getTenantId();
-    const teamIds = params.teamIds || [];
-    const teamWhere = await this.analyticsTeamWhere(db, tenantId, teamIds);
-    const activeStores = await db.posStore.findMany({
+    const requestedTeamIds = params.teamIds || [];
+    const rawTeamWhere = await this.analyticsTeamWhere(db, tenantId, requestedTeamIds);
+    const rawActiveStores = await db.posStore.findMany({
       where: {
         tenantId,
         status: 'ACTIVE',
@@ -1100,6 +1104,31 @@ export class SalesAnalyticsService {
       },
       select: { id: true, shopId: true, teamId: true },
     });
+    const hasExcludedStores = rawActiveStores.some((store) => isBusinessReportExcludedStore(store));
+    const activeStores = hasExcludedStores
+      ? rawActiveStores.filter((store) => !isBusinessReportExcludedStore(store))
+      : rawActiveStores;
+    const businessReportTeamIds = hasExcludedStores
+      ? Array.from(
+          new Set(
+            activeStores
+              .map((store) => store.teamId)
+              .filter((id): id is string => Boolean(id) && !isSuperAdminOnlyTeamId(id)),
+          ),
+        ).sort()
+      : [];
+    const teamIds = hasExcludedStores
+      ? requestedTeamIds.length > 0
+        ? requestedTeamIds.filter((id) => !isSuperAdminOnlyTeamId(id))
+        : businessReportTeamIds
+      : requestedTeamIds;
+    const teamWhere = hasExcludedStores
+      ? teamIds.length > 0
+        ? { teamId: { in: teamIds } }
+        : requestedTeamIds.length > 0
+          ? { teamId: { in: [] as string[] } }
+          : rawTeamWhere
+      : rawTeamWhere;
     const activeShopIds = Array.from(new Set(activeStores.map((store) => store.shopId)));
 
     const mappingFilter =
@@ -1171,7 +1200,7 @@ export class SalesAnalyticsService {
       analyticsScope: 'tenant',
       teamIds,
       activeShopIds: [...activeShopIds].sort(),
-      adTeamStores: teamIds.length ? activeStores.map(store => `${store.id}:${store.shopId}:${store.teamId ?? ''}`).sort() : [],
+      adTeamStores: requestedTeamIds.length ? activeStores.map(store => `${store.id}:${store.shopId}:${store.teamId ?? ''}`).sort() : [],
       start: startStr,
       end: endStr,
       mappings: normalizedMappings.sort(),
@@ -1616,12 +1645,15 @@ export class SalesAnalyticsService {
     let teamSpendCoverage: ReturnType<typeof partitionTeamAdSpend>['coverage'] | null = null;
     let additionalNullSpendMapping = false;
     let spendUpdatedAt: Date | null = null;
-    if (teamIds.length) {
-      const spendRows = await db.reconcileMarketing.findMany({
+    if (requestedTeamIds.length) {
+      const rawSpendRows = await db.reconcileMarketing.findMany({
         where: { tenantId, date: { gte: prevStartDate_dt, lte: endDate_dt }, ...mappingFilter },
         select: { teamId: true, adId: true, adName: true, mapping: true, shops: true,
           date: true, spend: true, leads: true, updatedAt: true },
       });
+      const spendRows = hasExcludedStores
+        ? rawSpendRows.filter((row) => !isSuperAdminOnlyTeamId(row.teamId))
+        : rawSpendRows;
       const spendIndex = await loadSalesStoreAttribution(db, tenantId, spendRows, activeStores);
       const allocation = partitionTeamAdSpend(spendRows, activeStores, spendIndex, teamIds, startDate_dt);
       teamSpendCoverage = allocation.coverage;
@@ -1776,7 +1808,7 @@ export class SalesAnalyticsService {
         start_date: startStr,
         end_date: endStr,
         mappings: normalizedMappings,
-        team_ids: teamIds,
+        team_ids: requestedTeamIds,
       },
       rangeDays,
       lastUpdatedAt: spendUpdatedAt && (!lastUpdatedAgg?._max?.updatedAt || spendUpdatedAt > lastUpdatedAgg._max.updatedAt) ? spendUpdatedAt : lastUpdatedAgg?._max?.updatedAt || null,
@@ -1828,11 +1860,25 @@ export class SalesAnalyticsService {
     const selectedStoreIds = mappings.map((m) => this.normalize(m)).filter((v) => v.length > 0);
     const tenantId = this.teamContext.getTenantId();
 
-    const teamIds = params.teamIds || [];
-    const teamWhere = await this.analyticsTeamWhere(this.prisma, tenantId, teamIds);
+    const requestedTeamIds = params.teamIds || [];
+    const rawTeamWhere = await this.analyticsTeamWhere(this.prisma, tenantId, requestedTeamIds);
     const activeStoreWhere = { tenantId, status: 'ACTIVE' as const, OR: [{ enabled: true }, { enabled: null }] };
     // Keep all tenant shops as negative ownership witnesses even in one team.
-    const scopeStores = await this.prisma.posStore.findMany({ where: activeStoreWhere, select: { id: true, shopId: true, name: true, teamId: true } });
+    const rawScopeStores = await this.prisma.posStore.findMany({ where: activeStoreWhere, select: { id: true, shopId: true, name: true, teamId: true } });
+    const hasExcludedStores = rawScopeStores.some((store) => isBusinessReportExcludedStore(store));
+    const scopeStores = hasExcludedStores
+      ? rawScopeStores.filter((store) => !isBusinessReportExcludedStore(store))
+      : rawScopeStores;
+    const teamIds = hasExcludedStores
+      ? requestedTeamIds.filter((id) => !isSuperAdminOnlyTeamId(id))
+      : requestedTeamIds;
+    const teamWhere = hasExcludedStores
+      ? teamIds.length > 0
+        ? { teamId: { in: teamIds } }
+        : requestedTeamIds.length > 0
+          ? { teamId: { in: [] as string[] } }
+          : rawTeamWhere
+      : rawTeamWhere;
     const scopeKey = (stores: typeof scopeStores) => stores.map(store => `${store.id}:${store.shopId}:${store.name}:${store.teamId ?? ''}`).sort();
     const cacheVersion = await this.analyticsCache.getVersion(tenantId);
     const cacheKeyPayload = {
@@ -1884,7 +1930,7 @@ export class SalesAnalyticsService {
     // projection deliberately excludes snapshots, names and customer details.
     const snapshot = await this.prisma.$transaction(async (tx) => {
       await tx.$executeRaw`SET TRANSACTION READ ONLY`;
-      const [rows, tenantStores] = await Promise.all([
+      const [rawRows, rawTenantStores] = await Promise.all([
         tx.reconcileMarketing.findMany({
           where: { tenantId, date: { gte: prevStartDate_dt, lte: endDate_dt } },
           select: Object.fromEntries([
@@ -1896,7 +1942,13 @@ export class SalesAnalyticsService {
           select: { id: true, shopId: true, name: true, teamId: true },
         }),
       ]);
-      await this.analyticsTeamWhere(tx, tenantId, teamIds);
+      const tenantStores = hasExcludedStores
+        ? rawTenantStores.filter((store) => !isBusinessReportExcludedStore(store))
+        : rawTenantStores;
+      const rows = hasExcludedStores
+        ? rawRows.filter((row) => !isSuperAdminOnlyTeamId(row.teamId))
+        : rawRows;
+      await this.analyticsTeamWhere(tx, tenantId, requestedTeamIds);
       // Team membership belongs to each historical RM/order record. A later
       // store reassignment must not erase earlier team-owned activity.
       const index = await loadSalesStoreAttribution(tx, tenantId, rows as any, tenantStores);
@@ -2084,7 +2136,7 @@ export class SalesAnalyticsService {
       prevCounts,
       prevKpis,
       filters: { mappings: optionKeys, mappingsDisplayMap },
-      selected: { start_date: startStr, end_date: endStr, mappings: selectedStoreIds, team_ids: teamIds },
+      selected: { start_date: startStr, end_date: endStr, mappings: selectedStoreIds, team_ids: requestedTeamIds },
       rangeDays,
       lastUpdatedAt,
       products,

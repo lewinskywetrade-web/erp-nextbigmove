@@ -2,7 +2,7 @@ name: Deploy
 
 on:
   push:
-    branches: [ "main", "fix/erp-positive-cogs" ]
+    branches: [ "main" ]
 
 jobs:
   deploy:
@@ -21,15 +21,7 @@ jobs:
         run: |
           ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
 
-      - name: Inspect unattributed ad spend
-        env:
-          SSH_HOST: ${{ secrets.SSH_HOST }}
-          SSH_USER: ${{ secrets.SSH_USER }}
-        run: |
-          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$SSH_USER@$SSH_HOST" "cd /opt/erp && docker compose -f docker-compose.prod.yml --env-file .env.prod exec -T api node -" < scripts/inspect-unattributed-ad-spend.cjs
-
       - name: Deploy on droplet
-        if: github.ref == 'refs/heads/main'
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}

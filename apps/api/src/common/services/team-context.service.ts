@@ -1,6 +1,7 @@
 import { Injectable, ForbiddenException } from '@nestjs/common';
 import { ClsService } from 'nestjs-cls';
 import { PrismaService } from '../prisma/prisma.service';
+import { isSuperAdminOnlyTeamId } from '../utils/super-admin-only-teams';
 
 @Injectable()
 export class TeamContextService {
@@ -67,7 +68,11 @@ export class TeamContextService {
       },
     });
 
-    return memberships.map((m) => m.teamId);
+    const role = this.cls.get('userRole');
+    const teamIds = memberships.map((m) => m.teamId);
+    return role === 'SUPER_ADMIN'
+      ? teamIds
+      : teamIds.filter((id) => !isSuperAdminOnlyTeamId(id));
   }
 
   /**
@@ -113,6 +118,10 @@ export class TeamContextService {
     // SUPER_ADMIN bypasses all checks
     if (role === 'SUPER_ADMIN') {
       return true;
+    }
+
+    if (isSuperAdminOnlyTeamId(teamId)) {
+      return false;
     }
 
     // If no team specified, check tenant-wide access
@@ -173,11 +182,13 @@ export class TeamContextService {
     }
 
     const isAdmin = hasTenantWideAccess;
+    const sanitizedTeamId = isSuperAdminOnlyTeamId(teamId) ? null : teamId;
+    const sanitizedTeamIds = (teamIds || []).filter((id) => !isSuperAdminOnlyTeamId(id));
 
     return {
       tenantId,
-      teamId,
-      teamIds: teamIds || [],
+      teamId: sanitizedTeamId,
+      teamIds: sanitizedTeamIds,
       userId,
       role,
       isAdmin,
@@ -192,12 +203,16 @@ export class TeamContextService {
    * - For team members: only allow their teams
    */
   async validateAndGetTeamId(payloadTeamId: string | undefined | null): Promise<string | null> {
-    const { teamId, isAdmin, userTeams, tenantHasTeams } = await this.getContext();
+    const { teamId, role, isAdmin, userTeams, tenantHasTeams } = await this.getContext();
 
     const candidate = payloadTeamId !== undefined ? payloadTeamId : teamId;
 
     if (!tenantHasTeams) {
       return null;
+    }
+
+    if (role !== 'SUPER_ADMIN' && isSuperAdminOnlyTeamId(candidate)) {
+      throw new ForbiddenException('You do not have access to this team');
     }
 
     // Admins can use any team or null

@@ -4,6 +4,7 @@ import { ClsService } from 'nestjs-cls';
 import { CreateTeamDto } from './dto/create-team.dto';
 import { UpdateTeamDto } from './dto/update-team.dto';
 import { AddTeamMemberDto } from './dto/add-team-member.dto';
+import { isSuperAdminOnlyTeam } from '../../common/utils/super-admin-only-teams';
 
 @Injectable()
 export class TeamService {
@@ -27,6 +28,8 @@ export class TeamService {
    * Returns all teams for admins, only member teams for regular users
    */
   async getMyTeams(userId: string, tenantId: string) {
+    const role = this.cls.get('userRole');
+    const isSuperAdmin = role === 'SUPER_ADMIN';
     const teams = await this.prisma.team.findMany({
       where: {
         tenantId,
@@ -47,7 +50,7 @@ export class TeamService {
       },
     });
 
-    return teams;
+    return isSuperAdmin ? teams : teams.filter((team) => !isSuperAdminOnlyTeam(team));
   }
 
   async createTeam(dto: CreateTeamDto) {
@@ -118,7 +121,7 @@ export class TeamService {
     const isAdmin = isLegacyAdmin || hasTenantWideAccess;
 
     // Admins see all teams; others only their memberships
-    return this.prisma.team.findMany({
+    const teams = await this.prisma.team.findMany({
       where: {
         tenantId,
         ...(isAdmin
@@ -134,6 +137,8 @@ export class TeamService {
       },
       orderBy: { createdAt: 'desc' },
     });
+
+    return isLegacyAdmin ? teams : teams.filter((team) => !isSuperAdminOnlyTeam(team));
   }
 
   async updateTeam(id: string, dto: UpdateTeamDto) {

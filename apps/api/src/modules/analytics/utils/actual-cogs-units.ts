@@ -1,5 +1,9 @@
 import { Prisma } from '@prisma/client';
 import { UNATTRIBUTED_STORE_KEY } from './store-attribution';
+import {
+  isBusinessReportExcludedStore,
+  isSuperAdminOnlyTeamId,
+} from '../../../common/utils/super-admin-only-teams';
 
 export const ACTUAL_COGS_UNITS_POLICY = 'SUPER_ADMIN_COGS_LINKED_UNITS_V2';
 const PAGE_SIZE = 1000;
@@ -125,6 +129,13 @@ function unavailable(response: BaseResponse, reason: string) {
 /** Pure allocation: duplicates in one bucket count once; conflicting buckets
  * are unavailable instead of assigning the same order to several products. */
 export function allocateCogsUnits(response: BaseResponse, scope: Scope, mode: Mode, stores: Store[], orders: SavedOrder[], reportRows: ReportRow[], snapshotAt: string) {
+  stores = stores.filter((store) => !isBusinessReportExcludedStore(store));
+  orders = orders.filter(
+    (order) =>
+      !isSuperAdminOnlyTeamId(order.teamId) &&
+      !isBusinessReportExcludedStore({ shopId: order.shopId, teamId: order.teamId }),
+  );
+  reportRows = reportRows.filter((row) => !isSuperAdminOnlyTeamId(row.teamId));
   const products = response.products;
   const keys = products.map(row => mode === 'store' ? row.store_id ?? UNATTRIBUTED_STORE_KEY : bucketKey(row.mapping));
   const selectedKeys = new Set(keys);
@@ -287,10 +298,11 @@ export async function enrichActualCogsUnits(prisma: any, response: BaseResponse,
     return await prisma.$transaction(async (db: any) => {
       await db.$executeRaw`SET TRANSACTION READ ONLY`;
       await db.$executeRaw`SET LOCAL statement_timeout = '10000ms'`;
-      const stores: Store[] = await db.posStore.findMany({
+      const rawStores: Store[] = await db.posStore.findMany({
         where: { tenantId: scope.tenantId, status: 'ACTIVE', OR: [{ enabled: true }, { enabled: null }] },
         select: { id: true, shopId: true },
       });
+      const stores = rawStores.filter((store) => !isBusinessReportExcludedStore(store));
       const shopIds = [...new Set(stores.map(store => store.shopId))];
       const [budget] = await db.$queryRaw(Prisma.sql`SELECT count(*)::text AS orders,
         coalesce(sum(CASE WHEN jsonb_typeof(o."orderSnapshot"->'items')='array'

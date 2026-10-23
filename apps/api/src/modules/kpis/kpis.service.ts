@@ -10,6 +10,7 @@ import {
   MarketingKpiScopeType,
 } from "@prisma/client";
 import { buildAdNameCreatorLabels } from '../../common/utils/ad-name-creator';
+import { isSuperAdminOnlyTeam } from '../../common/utils/super-admin-only-teams';
 import { PrismaService } from "../../common/prisma/prisma.service";
 import { TeamContextService } from "../../common/services/team-context.service";
 import { CreateMarketingCategoryTargetDto } from "./dto/create-marketing-category-target.dto";
@@ -359,10 +360,12 @@ export class KpisService {
       orderBy: { name: "asc" },
     });
 
+    const isSuperAdmin = context.role === "SUPER_ADMIN";
+
     return {
       context,
       teams: teams
-        .filter((team) => Boolean(team.teamCode))
+        .filter((team) => Boolean(team.teamCode) && (isSuperAdmin || !isSuperAdminOnlyTeam(team)))
         .map((team) => ({
           id: team.id,
           name: team.name,
