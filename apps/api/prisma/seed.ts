@@ -2245,7 +2245,7 @@ async function backfillAdSpendStoreAndTeamAttribution() {
     const norm = (val?: string | null) => String(val || '').trim().toLowerCase();
 
     for (const tenant of tenants) {
-      const [activeStores, teams, rmRows, maiRows, products, creatives, storeConfigs] = await Promise.all([
+      let [activeStores, teams, rmRows, maiRows, products, creatives, storeConfigs] = await Promise.all([
         prisma.posStore.findMany({
           where: {
             tenantId: tenant.id,
@@ -2253,10 +2253,12 @@ async function backfillAdSpendStoreAndTeamAttribution() {
             OR: [{ enabled: true }, { enabled: null }],
           },
           select: { id: true, shopId: true, name: true, shopName: true, teamId: true },
+          orderBy: { createdAt: 'asc' },
         }),
         prisma.team.findMany({
           where: { tenantId: tenant.id, status: 'ACTIVE' },
           select: { id: true, name: true, teamCode: true },
+          orderBy: { createdAt: 'asc' },
         }),
         prisma.reconcileMarketing.findMany({
           where: { tenantId: tenant.id },
@@ -2309,6 +2311,58 @@ async function backfillAdSpendStoreAndTeamAttribution() {
 
       if (activeStores.length === 0 || rmRows.length === 0) continue;
 
+      // Ensure at least one active team exists for this tenant
+      if (teams.length === 0) {
+        const createdTeam = await prisma.team.create({
+          data: {
+            tenantId: tenant.id,
+            name: `${tenant.name} Team`,
+            teamCode: 'TEAM1',
+            description: `Default team for ${tenant.name}`,
+            status: 'ACTIVE',
+          },
+          select: { id: true, name: true, teamCode: true },
+        });
+        teams = [createdTeam];
+      }
+      const defaultTeam = teams.find((t) => !isSuperAdminOnlyTeamId(t.id)) || teams[0];
+      const validTeamIds = new Set(teams.map((t) => t.id.toLowerCase()));
+
+      // Deduplicate any active stores that share the same shopId within the tenant
+      const storesByShopIdGroup = new Map<string, typeof activeStores>();
+      for (const s of activeStores) {
+        const grp = storesByShopIdGroup.get(s.shopId) || [];
+        grp.push(s);
+        storesByShopIdGroup.set(s.shopId, grp);
+      }
+      const dedupedActiveStores: typeof activeStores = [];
+      for (const [, grp] of Array.from(storesByShopIdGroup.entries())) {
+        const primary = grp[0];
+        dedupedActiveStores.push(primary);
+        if (grp.length > 1) {
+          for (const dup of grp.slice(1)) {
+            await prisma.$executeRawUnsafe(`
+              UPDATE creative_store_configs SET "storeId" = '${primary.id}' WHERE "storeId" = '${dup.id}';
+            `);
+            await prisma.$executeRawUnsafe(`
+              UPDATE pos_stores SET status = 'INACTIVE', enabled = false, "updatedAt" = NOW() WHERE id = '${dup.id}';
+            `);
+          }
+        }
+      }
+      activeStores = dedupedActiveStores;
+
+      // Ensure every active store has a valid teamId
+      for (const s of activeStores) {
+        if (!s.teamId || !validTeamIds.has(s.teamId.toLowerCase())) {
+          await prisma.posStore.update({
+            where: { id: s.id },
+            data: { teamId: defaultTeam.id },
+          });
+          s.teamId = defaultTeam.id;
+        }
+      }
+
       const storeById = new Map(activeStores.map((s) => [s.id.toLowerCase(), s]));
       const storeByShopId = new Map(activeStores.map((s) => [s.shopId, s]));
       const teamCodeById = new Map(teams.map((t) => [t.id.toLowerCase(), t.teamCode || null]));
@@ -2319,7 +2373,7 @@ async function backfillAdSpendStoreAndTeamAttribution() {
       for (const p of products) {
         const sId = p.storeId.toLowerCase();
         const vId = (p.variationId || '').trim();
-        if (!vId || !storeById.has(sId)) continue;
+        if (!vId || vId.includes('::') || !storeById.has(sId)) continue;
         if (!defaultVariationByStoreId.has(sId)) defaultVariationByStoreId.set(sId, vId);
         const list = variationsByStoreId.get(sId) || [];
         list.push({ variationId: vId, name: norm(p.name), customId: norm(p.customId) });
@@ -2368,6 +2422,19 @@ async function backfillAdSpendStoreAndTeamAttribution() {
               ? link.creative.storeConfig.storeId
               : null,
           );
+        }
+        // Clean up any creative_meta_ad_links that resolved to null (unconfigured or disabled store)
+        const brokenAdIds: string[] = [];
+        for (const [adIdKey, mappedStoreId] of Array.from(storeByAdId.entries())) {
+          if (!mappedStoreId || !validStoreIds.has(mappedStoreId)) {
+            brokenAdIds.push(adIdKey);
+            storeByAdId.delete(adIdKey);
+          }
+        }
+        if (brokenAdIds.length > 0) {
+          await prisma.creativeMetaAdLink.deleteMany({
+            where: { tenantId: tenant.id, adId: { in: brokenAdIds } },
+          });
         }
         const storeByCreativeCode = new Map<string, string | null>();
         for (const c of creatives) {
@@ -2659,10 +2726,10 @@ async function backfillAdSpendStoreAndTeamAttribution() {
         if (!targetStore) continue;
         const isSuperAdminStore = isBusinessReportExcludedStore(targetStore);
         const targetTeamId = isSuperAdminStore
-          ? targetStore.teamId
-          : row.teamId && !isSuperAdminOnlyTeamId(row.teamId)
+          ? targetStore.teamId || defaultTeam.id
+          : row.teamId && !isSuperAdminOnlyTeamId(row.teamId) && validTeamIds.has(row.teamId.toLowerCase())
             ? row.teamId
-            : targetStore.teamId;
+            : targetStore.teamId || defaultTeam.id;
         const targetTeamCode = targetTeamId ? teamCodeById.get(targetTeamId.toLowerCase()) || row.teamCode : row.teamCode;
 
         let candidateShops: string[] =
@@ -2694,6 +2761,16 @@ async function backfillAdSpendStoreAndTeamAttribution() {
         }
         if (checkAttr !== targetStore.id.toLowerCase()) {
           candidateMapping = buildFallbackMappingForStore(targetStore.id, `${row.campaignName || ''} ${row.adName || ''}`);
+          checkAttr = resolveStoreAttributionLocal(
+            { adId: row.adId, adName: row.adName, shops: candidateShops, mapping: candidateMapping },
+            index,
+          );
+        }
+        if (checkAttr !== targetStore.id.toLowerCase() && row.adId && index.storeByAdId.has(row.adId)) {
+          await prisma.creativeMetaAdLink.deleteMany({
+            where: { tenantId: tenant.id, adId: row.adId },
+          });
+          index.storeByAdId.delete(row.adId);
           checkAttr = resolveStoreAttributionLocal(
             { adId: row.adId, adName: row.adName, shops: candidateShops, mapping: candidateMapping },
             index,
@@ -2763,10 +2840,10 @@ async function backfillAdSpendStoreAndTeamAttribution() {
         if (!st) continue;
         const isSuperAdminStore = isBusinessReportExcludedStore(st);
         const targetTeamId = isSuperAdminStore
-          ? st.teamId
-          : m.teamId && !isSuperAdminOnlyTeamId(m.teamId)
+          ? st.teamId || defaultTeam.id
+          : m.teamId && !isSuperAdminOnlyTeamId(m.teamId) && validTeamIds.has(m.teamId.toLowerCase())
             ? m.teamId
-            : st.teamId;
+            : st.teamId || defaultTeam.id;
         const targetTeamCode = targetTeamId ? teamCodeById.get(targetTeamId.toLowerCase()) || m.teamCode : m.teamCode;
         const targetMapping =
           m.mapping && m.mapping.trim().length > 0
@@ -2805,6 +2882,7 @@ async function backfillAdSpendStoreAndTeamAttribution() {
       }
 
       // Verify post-backfill attribution on tenant
+      const verifyIndex = await buildAttributionIndex();
       const verifyRmRows = await prisma.reconcileMarketing.findMany({
         where: { tenantId: tenant.id },
         select: {
@@ -2826,7 +2904,7 @@ async function backfillAdSpendStoreAndTeamAttribution() {
       for (const r of verifyRmRows) {
         const sp = Number(r.spend || 0);
         const ld = Number(r.leads || 0);
-        const resolvedStore = resolveStoreAttributionLocal(r as any, index);
+        const resolvedStore = resolveStoreAttributionLocal(r as any, verifyIndex);
         if (resolvedStore === UNATTRIBUTED_STORE_KEY && (sp > 0 || ld > 0)) {
           unattributedRows++;
           unattributedSpend += sp;
