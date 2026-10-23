@@ -35,21 +35,25 @@ export async function loadSalesStoreAttribution(
   for (const store of stores) insertUnique(storeByShopId, store.shopId, store.id);
   const adIds = [...new Set(rows.map(row => row.adId).filter(Boolean))];
   const codes = rows.map(row => creativeCodeParts(row.adName)).filter(Boolean);
+  const uniqueCodes = [...new Set(codes.map(code => code!.code))];
+  const uniquePrefixes = [...new Set(codes.map(code => code!.prefix))];
   const [links, products, creatives, configs] = await Promise.all([
     adIds.length ? db.creativeMetaAdLink.findMany({
-      where: { tenantId, adId: { in: adIds } },
+      where: adIds.length <= 10000 ? { tenantId, adId: { in: adIds } } : { tenantId },
       select: { adId: true, creative: { select: { tenantId: true, storeConfig: { select: { tenantId: true, storeId: true } } } } },
     }) : [],
     db.posProduct.findMany({
       where: { store: { is: { tenantId, status: 'ACTIVE', OR: [{ enabled: true }, { enabled: null }] } }, mapping: { not: null } },
       select: { storeId: true, mapping: true },
     }),
-    codes.length ? db.creative.findMany({
-      where: { tenantId, code: { in: [...new Set(codes.map(code => code!.code))] } },
+    uniqueCodes.length ? db.creative.findMany({
+      where: uniqueCodes.length <= 10000 ? { tenantId, code: { in: uniqueCodes } } : { tenantId },
       select: { code: true, storeConfig: { select: { tenantId: true, storeId: true } } },
     }) : [],
-    codes.length ? db.creativeStoreConfig.findMany({
-      where: { tenantId, active: true, storeId: { in: [...validStoreIds] }, codePrefix: { in: [...new Set(codes.map(code => code!.prefix))] } },
+    uniquePrefixes.length ? db.creativeStoreConfig.findMany({
+      where: uniquePrefixes.length <= 10000
+        ? { tenantId, active: true, storeId: { in: [...validStoreIds] }, codePrefix: { in: uniquePrefixes } }
+        : { tenantId, active: true, storeId: { in: [...validStoreIds] } },
       select: { codePrefix: true, storeId: true },
     }) : [],
   ]);

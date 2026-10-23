@@ -932,7 +932,7 @@ async function backfill2026OrderCogsAndReports() {
       WHERE NOT EXISTS (
         SELECT 1
         FROM pos_product_cogs u
-        WHERE u."tenantId" = earliest."tenantId"
+        WHERE u."tenantId" IS NOT DISTINCT FROM earliest."tenantId"
           AND u."productId" = earliest."productId"
           AND u."storeId" = earliest."storeId"
           AND u."startDate" IS NULL
@@ -1238,6 +1238,7 @@ async function backfill2026OrderCogsAndReports() {
       ? ['2026-10', '2026-09', '2026-08', '2026-07', '2026-06', '2026-05', '2026-04', '2026-03', '2026-02', '2026-01']
       : [];
     let updatedOrders = 0;
+    const updatedMonths = new Set<string>();
     for (const month of months) {
       const monthUpdated = await prisma.$executeRawUnsafe(`
         WITH tmp_var_cogs AS MATERIALIZED (
@@ -1435,6 +1436,7 @@ async function backfill2026OrderCogsAndReports() {
           AND (o.cogs <> ro.calc_cogs OR (ro.calc_qty > 0 AND o."totalQuantity" <> ro.calc_qty))
       `);
       updatedOrders += monthUpdated;
+      if (monthUpdated > 0) updatedMonths.add(month);
       console.log(`✓ Backfilled ${month}: ${monthUpdated} orders updated`);
     }
 
@@ -1657,21 +1659,26 @@ async function backfill2026OrderCogsAndReports() {
       updatedRemainingZeroOrders > 0 ||
       alignedConflictStoreOrders > 0 ||
       consolidatedDuplicateStoreCogs > 0;
-    const monthRanges: Array<[string, string]> = shouldReconcileRollups
-      ? [
-          ['2026-10-01', '2026-11-01'],
-          ['2026-09-01', '2026-10-01'],
-          ['2026-08-01', '2026-09-01'],
-          ['2026-07-01', '2026-08-01'],
-          ['2026-06-01', '2026-07-01'],
-          ['2026-05-01', '2026-06-01'],
-          ['2026-04-01', '2026-05-01'],
-          ['2026-03-01', '2026-04-01'],
-          ['2026-02-01', '2026-03-01'],
-          ['2026-01-01', '2026-02-01'],
-          ['2025-01-01', '2026-01-01'],
-        ]
-      : [];
+    const allMonthRanges: Array<[string, string]> = [
+      ['2026-10-01', '2026-11-01'],
+      ['2026-09-01', '2026-10-01'],
+      ['2026-08-01', '2026-09-01'],
+      ['2026-07-01', '2026-08-01'],
+      ['2026-06-01', '2026-07-01'],
+      ['2026-05-01', '2026-06-01'],
+      ['2026-04-01', '2026-05-01'],
+      ['2026-03-01', '2026-04-01'],
+      ['2026-02-01', '2026-03-01'],
+      ['2026-01-01', '2026-02-01'],
+      ['2025-01-01', '2026-01-01'],
+    ];
+    const fullRollupNeeded =
+      updatedRemainingZeroOrders > 0 ||
+      alignedConflictStoreOrders > 0 ||
+      consolidatedDuplicateStoreCogs > 0;
+    const monthRanges: Array<[string, string]> = fullRollupNeeded
+      ? allMonthRanges
+      : allMonthRanges.filter(([mStart]) => updatedMonths.has(mStart.slice(0, 7)));
 
     for (const [mStart, mEnd] of monthRanges) {
       const rmCount = await prisma.$executeRawUnsafe(`
@@ -2342,16 +2349,13 @@ async function backfillAdSpendStoreAndTeamAttribution() {
         };
         const idxStoreByShopId = new Map<string, string | null>();
         for (const s of activeStores) insertUnique(idxStoreByShopId, s.shopId, s.id);
-        const adIds = Array.from(new Set(rmRows.map((r) => r.adId).filter((v): v is string => Boolean(v))));
-        const links = adIds.length
-          ? await prisma.creativeMetaAdLink.findMany({
-              where: { tenantId: tenant.id, adId: { in: adIds } },
-              select: {
-                adId: true,
-                creative: { select: { tenantId: true, storeConfig: { select: { tenantId: true, storeId: true } } } },
-              },
-            })
-          : [];
+        const links = await prisma.creativeMetaAdLink.findMany({
+          where: { tenantId: tenant.id },
+          select: {
+            adId: true,
+            creative: { select: { tenantId: true, storeConfig: { select: { tenantId: true, storeId: true } } } },
+          },
+        });
         const storeByAdId = new Map<string, string | null>();
         for (const link of links) {
           insertUnique(
@@ -2666,22 +2670,29 @@ async function backfillAdSpendStoreAndTeamAttribution() {
         }
       }
 
-      // Execute reconcile_marketing updates in batches
-      for (let i = 0; i < rmUpdates.length; i += 250) {
-        const batch = rmUpdates.slice(i, i + 250);
-        await prisma.$transaction(
-          batch.map((u) =>
-            prisma.reconcileMarketing.update({
-              where: { id: u.id },
-              data: {
-                teamId: u.teamId,
-                teamCode: u.teamCode,
-                shops: u.shops,
-                mapping: u.mapping,
-              },
-            }),
-          ),
-        );
+      // Execute reconcile_marketing updates in fast SQL VALUES batches
+      const sqlEsc = (val: string | null | undefined) =>
+        val === null || val === undefined ? 'NULL' : `'${String(val).replace(/'/g, "''")}'`;
+
+      for (let i = 0; i < rmUpdates.length; i += 1000) {
+        const batch = rmUpdates.slice(i, i + 1000);
+        const valuesSql = batch
+          .map(
+            (u) =>
+              `(${sqlEsc(u.id)}::uuid, ${u.teamId ? `${sqlEsc(u.teamId)}::uuid` : 'NULL::uuid'}, ${sqlEsc(u.teamCode)}, ${sqlEsc(JSON.stringify(u.shops))}::jsonb, ${sqlEsc(u.mapping)})`,
+          )
+          .join(',\n');
+        await prisma.$executeRawUnsafe(`
+          UPDATE reconcile_marketing AS rm
+          SET
+            "teamId" = v.team_id,
+            "teamCode" = v.team_code,
+            shops = v.shops,
+            mapping = v.mapping,
+            "updatedAt" = NOW()
+          FROM (VALUES ${valuesSql}) AS v(id, team_id, team_code, shops, mapping)
+          WHERE rm.id = v.id
+        `);
       }
 
       // Also align meta_ad_insights teamId, teamCode, and mapping so future reconciliations preserve attribution
@@ -2722,20 +2733,24 @@ async function backfillAdSpendStoreAndTeamAttribution() {
         }
       }
 
-      for (let i = 0; i < maiUpdates.length; i += 250) {
-        const batch = maiUpdates.slice(i, i + 250);
-        await prisma.$transaction(
-          batch.map((u) =>
-            prisma.metaAdInsight.update({
-              where: { id: u.id },
-              data: {
-                teamId: u.teamId,
-                teamCode: u.teamCode,
-                mapping: u.mapping,
-              },
-            }),
-          ),
-        );
+      for (let i = 0; i < maiUpdates.length; i += 1000) {
+        const batch = maiUpdates.slice(i, i + 1000);
+        const valuesSql = batch
+          .map(
+            (u) =>
+              `(${sqlEsc(u.id)}::uuid, ${u.teamId ? `${sqlEsc(u.teamId)}::uuid` : 'NULL::uuid'}, ${sqlEsc(u.teamCode)}, ${sqlEsc(u.mapping)})`,
+          )
+          .join(',\n');
+        await prisma.$executeRawUnsafe(`
+          UPDATE meta_ad_insights AS mai
+          SET
+            "teamId" = v.team_id,
+            "teamCode" = v.team_code,
+            mapping = v.mapping,
+            "updatedAt" = NOW()
+          FROM (VALUES ${valuesSql}) AS v(id, team_id, team_code, mapping)
+          WHERE mai.id = v.id
+        `);
         updatedMaiCount += batch.length;
       }
 
