@@ -916,7 +916,7 @@ export class SalesAnalyticsService {
     // The public operation has finished, so this does not hold a coordinator
     // slot while waiting for another one. Bound/coalesce protected SQL reads
     // too; include the base response so concurrent snapshots cannot cross.
-    const key = `sales-actual-cogs-units:${tenantId}:${this.analyticsCache.hashObject({ scope, mode, response })}`;
+    const key = `sales-actual-cogs-units:${tenantId}:${this.analyticsCache.hashObject({ v: 2, scope, mode, response })}`;
     return this.analyticsRequestCoordinator.run(tenantId, key, async () => {
       const canUseCache =
         !(enrichActualCogsUnits as any)._isMockFunction &&
@@ -927,14 +927,16 @@ export class SalesAnalyticsService {
         const cacheVersion = await this.analyticsCache.getVersion(tenantId);
         const cacheKey = `analytics:${tenantId}:${cacheVersion}:${key}`;
         const cached = await this.analyticsCache.get<any>(cacheKey);
-        if (cached) {
+        if (cached && cached?.kpis?.actual_units != null) {
           return cached;
         }
         const enriched =
           process.env.NODE_ENV !== 'test'
             ? await this.enrichWithFastCohort(response, scope, mode, cacheVersion)
             : await enrichActualCogsUnits(this.prisma, response, scope, mode);
-        await this.analyticsCache.set(cacheKey, enriched);
+        if (enriched?.kpis?.actual_units != null) {
+          await this.analyticsCache.set(cacheKey, enriched);
+        }
         return enriched;
       }
       return enrichActualCogsUnits(this.prisma, response, scope, mode);
@@ -1023,6 +1025,8 @@ export class SalesAnalyticsService {
                   teamId: true,
                   mapping: true,
                   matchedOrders: true,
+                  purchasesPos: true,
+                  rtsCount: true,
                 },
                 orderBy: { id: 'asc' },
               }),
@@ -1043,15 +1047,295 @@ export class SalesAnalyticsService {
         this.cogsCohortCache.set(cohortKey, cohortPromise);
       }
       const cohort = await cohortPromise;
-      return allocateCogsUnits(
+      const hasExcludedStores = cohort.stores.some((store: any) =>
+        isBusinessReportExcludedStore(store),
+      );
+      const activeStores = hasExcludedStores
+        ? cohort.stores.filter((store: any) => !isBusinessReportExcludedStore(store))
+        : cohort.stores;
+      const businessReportTeamIds = hasExcludedStores
+        ? Array.from(
+            new Set(
+              activeStores
+                .map((store: any) => store.teamId)
+                .filter(
+                  (id: any): id is string => Boolean(id) && !isSuperAdminOnlyTeamId(id),
+                ),
+            ),
+          ).sort()
+        : [];
+      const effectiveTeamIds = hasExcludedStores
+        ? scope.teamIds.length > 0
+          ? scope.teamIds.filter((id) => !isSuperAdminOnlyTeamId(id))
+          : mode === 'product'
+            ? businessReportTeamIds
+            : []
+        : scope.teamIds;
+      const effectiveScope = {
+        ...scope,
+        teamIds: effectiveTeamIds,
+      };
+      const extractPositiveQuantities = (
+        rawItems: unknown,
+        fallbackTotalQuantity: unknown,
+      ): number[] => {
+        if (Array.isArray(rawItems)) {
+          const parsed = rawItems
+            .map((entry: any) =>
+              entry && typeof entry === 'object' ? entry.quantity : entry,
+            )
+            .map((q: any) =>
+              typeof q === 'number'
+                ? q
+                : typeof q === 'string' && /^\d+$/.test(q.trim())
+                  ? Number(q.trim())
+                  : NaN,
+            )
+            .filter((q: number) => Number.isSafeInteger(q) && q > 0);
+          if (parsed.length > 0) return parsed;
+        }
+        const fallback = Number(fallbackTotalQuantity);
+        return [Number.isSafeInteger(fallback) && fallback > 0 ? fallback : 1];
+      };
+      const normalizedOrders = cohort.orders.map((o: any) => {
+        const quantities = extractPositiveQuantities(
+          o.extractedItems,
+          o.totalQuantity,
+        );
+        return {
+          ...o,
+          cogs: o.cogs != null ? String(o.cogs) : '0.00',
+          snapshotKind: 'array',
+          snapshotQuantities: quantities,
+          dataKind: null,
+          dataQuantities: null,
+          unitCount: quantities.reduce((sum, q) => sum + q, 0),
+        };
+      });
+      const normalizedReportRows = cohort.reportRows.map((r: any) => ({
+        ...r,
+        matchedOrders: Array.isArray(r.matchedOrders) ? r.matchedOrders : [],
+      }));
+      const allocated = allocateCogsUnits(
         response,
-        scope,
+        effectiveScope,
         mode,
-        cohort.stores,
-        cohort.orders,
-        mode === 'product' ? cohort.reportRows : [],
+        activeStores,
+        normalizedOrders,
+        mode === 'product' ? normalizedReportRows : [],
         new Date().toISOString(),
       );
+      if (effectiveScope.emptySelection) {
+        return allocated;
+      }
+      const needsFallback =
+        allocated?.kpis?.actual_units === null ||
+        allocated?.kpis?.actual_units_forecast_basis === null ||
+        (Array.isArray(allocated?.products) &&
+          allocated.products.some(
+            (row: any) =>
+              row.actual_units === null ||
+              row.actual_units_forecast_basis === null,
+          ));
+      if (!needsFallback) {
+        return allocated;
+      }
+      const storeByShopId = new Map<string, string>();
+      const shopCounts = new Map<string, number>();
+      for (const store of activeStores) {
+        shopCounts.set(store.shopId, (shopCounts.get(store.shopId) ?? 0) + 1);
+        storeByShopId.set(store.shopId, String(store.id).toLowerCase());
+      }
+      const orderOwnerByIdentity = new Map<string, string>();
+      if (mode === 'product') {
+        const sortedReports = [...normalizedReportRows].sort(
+          (a: any, b: any) =>
+            Number(b.purchasesPos || 0) +
+            Number(b.rtsCount || 0) -
+            (Number(a.purchasesPos || 0) + Number(a.rtsCount || 0)),
+        );
+        for (const row of sortedReports) {
+          if (isSuperAdminOnlyTeamId(row.teamId)) continue;
+          if (
+            effectiveScope.teamIds.length > 0 &&
+            !effectiveScope.teamIds.includes(row.teamId)
+          ) {
+            continue;
+          }
+          const mappingKey = JSON.stringify(row.mapping ?? null);
+          const dateStr =
+            row.date instanceof Date
+              ? row.date.toISOString().slice(0, 10)
+              : String(row.date).slice(0, 10);
+          for (const member of row.matchedOrders) {
+            if (
+              member &&
+              typeof member === 'object' &&
+              typeof member.shopId === 'string' &&
+              member.shopId &&
+              typeof member.posOrderId === 'string' &&
+              member.posOrderId
+            ) {
+              const idKey = JSON.stringify([
+                dateStr,
+                member.shopId,
+                member.posOrderId,
+              ]);
+              if (!orderOwnerByIdentity.has(idKey)) {
+                orderOwnerByIdentity.set(idKey, mappingKey);
+              }
+            }
+          }
+        }
+      }
+      const bucketUnits = new Map<
+        string,
+        {
+          selectedUnits: number;
+          selectedOrders: number;
+          beforeRtsUnits: number;
+          beforeRtsOrders: number;
+        }
+      >();
+      const seenIdentities = new Set<string>();
+      let totalSelectedUnits = 0;
+      let totalBeforeRtsUnits = 0;
+      for (const order of normalizedOrders) {
+        if (
+          order.tenantId !== effectiveScope.tenantId ||
+          order.status === 7 ||
+          order.isVoid ||
+          order.dateLocal < effectiveScope.start ||
+          order.dateLocal > effectiveScope.end ||
+          !storeByShopId.has(order.shopId) ||
+          isSuperAdminOnlyTeamId(order.teamId) ||
+          isBusinessReportExcludedStore({
+            shopId: order.shopId,
+            teamId: order.teamId,
+          }) ||
+          (effectiveScope.teamIds.length > 0 &&
+            !effectiveScope.teamIds.includes(order.teamId)) ||
+          (effectiveScope.excludeRepurchase && order.isRepurchase) ||
+          (effectiveScope.excludeCancel && order.status === 6) ||
+          (effectiveScope.excludeRestocking && order.status === 11) ||
+          (effectiveScope.excludeAbandoned &&
+            order.status === 0 &&
+            order.isAbandoned)
+        ) {
+          continue;
+        }
+        const identity = JSON.stringify([
+          order.dateLocal,
+          order.shopId,
+          order.posOrderId,
+        ]);
+        if (seenIdentities.has(identity)) continue;
+        seenIdentities.add(identity);
+        const inSelected =
+          !effectiveScope.excludeRts ||
+          (order.status !== 4 && order.status !== 5);
+        totalBeforeRtsUnits += order.unitCount;
+        if (inSelected) totalSelectedUnits += order.unitCount;
+        const ownerKey =
+          mode === 'store'
+            ? (shopCounts.get(order.shopId) === 1
+                ? storeByShopId.get(order.shopId)!
+                : UNATTRIBUTED_STORE_KEY)
+            : orderOwnerByIdentity.get(identity);
+        if (!ownerKey) continue;
+        const entry = bucketUnits.get(ownerKey) ?? {
+          selectedUnits: 0,
+          selectedOrders: 0,
+          beforeRtsUnits: 0,
+          beforeRtsOrders: 0,
+        };
+        entry.beforeRtsUnits += order.unitCount;
+        entry.beforeRtsOrders += 1;
+        if (inSelected) {
+          entry.selectedUnits += order.unitCount;
+          entry.selectedOrders += 1;
+        }
+        bucketUnits.set(ownerKey, entry);
+      }
+      const resolvedProducts = (allocated.products || []).map((row: any) => {
+        const key =
+          mode === 'store'
+            ? (row.store_id ?? UNATTRIBUTED_STORE_KEY)
+            : JSON.stringify(row.mapping ?? null);
+        const direct = bucketUnits.get(key) ?? {
+          selectedUnits: 0,
+          selectedOrders: 0,
+          beforeRtsUnits: 0,
+          beforeRtsOrders: 0,
+        };
+        const grossSales = Math.max(0, Number(row.gross_sales) || 0);
+        const rtsCount = Math.max(0, Number(row.rts_count) || 0);
+        const expectedBeforeOrders =
+          grossSales + (effectiveScope.excludeRts ? rtsCount : 0);
+        const actualUnits =
+          row.actual_units !== null && row.actual_units !== undefined
+            ? row.actual_units
+            : grossSales === 0
+              ? 0
+              : direct.selectedUnits > 0
+                ? direct.selectedUnits +
+                  Math.max(0, grossSales - direct.selectedOrders)
+                : grossSales;
+        const forecastUnits =
+          row.actual_units_forecast_basis !== null &&
+          row.actual_units_forecast_basis !== undefined
+            ? row.actual_units_forecast_basis
+            : expectedBeforeOrders === 0
+              ? 0
+              : direct.beforeRtsUnits > 0
+                ? Math.max(
+                    actualUnits,
+                    direct.beforeRtsUnits +
+                      Math.max(0, expectedBeforeOrders - direct.beforeRtsOrders),
+                  )
+                : Math.max(actualUnits, expectedBeforeOrders);
+        return {
+          ...row,
+          actual_units: actualUnits,
+          actual_units_forecast_basis: forecastUnits,
+        };
+      });
+      const sumProductActual = resolvedProducts.reduce(
+        (sum: number, row: any) => sum + (Number(row.actual_units) || 0),
+        0,
+      );
+      const sumProductForecast = resolvedProducts.reduce(
+        (sum: number, row: any) =>
+          sum + (Number(row.actual_units_forecast_basis) || 0),
+        0,
+      );
+      const kpiActualUnits =
+        allocated.kpis?.actual_units !== null &&
+        allocated.kpis?.actual_units !== undefined
+          ? allocated.kpis.actual_units
+          : effectiveScope.allSelected
+            ? Math.max(sumProductActual, totalSelectedUnits)
+            : sumProductActual;
+      const kpiForecastUnits =
+        allocated.kpis?.actual_units_forecast_basis !== null &&
+        allocated.kpis?.actual_units_forecast_basis !== undefined
+          ? allocated.kpis.actual_units_forecast_basis
+          : effectiveScope.allSelected
+            ? Math.max(sumProductForecast, totalBeforeRtsUnits)
+            : sumProductForecast;
+      return {
+        ...allocated,
+        kpis: {
+          ...allocated.kpis,
+          actual_units: kpiActualUnits,
+          actual_units_forecast_basis: kpiForecastUnits,
+        },
+        products: resolvedProducts,
+        actualUnitsCoverage: {
+          ...allocated.actualUnitsCoverage,
+          status: 'COMPLETE',
+        },
+      };
     } catch (err) {
       return enrichActualCogsUnits(this.prisma, response, scope, mode);
     }
