@@ -33,6 +33,34 @@ async function main() {
   const tenants = await prisma.tenant.findMany({ select: { id: true, name: true } });
   for (const tenant of tenants) {
     const tenantId = tenant.id;
+    const spendGroups = await prisma.$queryRawUnsafe(`
+      SELECT
+        ad_id AS "adId",
+        ad_name AS "adName",
+        campaign_id AS "campaignId",
+        campaign_name AS "campaignName",
+        adset_id AS "adsetId",
+        account_id AS "accountId",
+        team_id AS "teamId",
+        team_code AS "teamCode",
+        mapping,
+        shops::text AS "shopsJson",
+        MIN(date)::text AS "minDate",
+        MAX(date)::text AS "maxDate",
+        COUNT(*)::int AS "days",
+        SUM(spend)::float8 AS "totalSpend",
+        SUM(CASE WHEN date >= '2026-10-01' AND date <= '2026-10-20' THEN spend ELSE 0 END)::float8 AS "octSpend",
+        SUM(leads)::int AS "totalLeads",
+        SUM(purchases_pos)::int AS "totalPurchases"
+      FROM reconcile_marketing
+      WHERE tenant_id = $1
+        AND (spend > 0 OR leads > 0)
+      GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+      ORDER BY "totalSpend" DESC
+    `, tenantId);
+
+    if (spendGroups.length === 0) continue;
+
     const stores = await prisma.posStore.findMany({
       where: { tenantId },
       select: { id: true, shopId: true, name: true, teamId: true, status: true, enabled: true },
@@ -47,41 +75,12 @@ async function main() {
       select: { accountId: true, name: true, teamId: true },
     });
 
-    const spendRows = await prisma.reconcileMarketing.findMany({
-      where: {
-        tenantId,
-        OR: [{ spend: { gt: 0 } }, { leads: { gt: 0 } }],
-      },
-      select: {
-        id: true,
-        date: true,
-        adId: true,
-        adName: true,
-        campaignId: true,
-        campaignName: true,
-        adsetId: true,
-        accountId: true,
-        teamId: true,
-        teamCode: true,
-        mapping: true,
-        shops: true,
-        spend: true,
-        leads: true,
-        purchasesPos: true,
-        codPos: true,
-      },
-      orderBy: { date: 'desc' },
-    });
-
-    if (spendRows.length === 0) continue;
-
-    console.log(`\n=== TENANT: ${tenant.name} (${tenantId}) | spendRows=${spendRows.length} | activeStores=${activeStores.length} ===`);
-    console.log('ActiveStores:', JSON.stringify(activeStores));
+    console.log(`\n=== TENANT: ${tenant.name} (${tenantId}) | spendGroups=${spendGroups.length} | activeStores=${activeStores.length} ===`);
     console.log('Teams:', JSON.stringify(teams));
     console.log('AdAccounts:', JSON.stringify(adAccounts));
 
     const validStoreIds = new Set(activeStores.map(s => s.id.toLowerCase()));
-    const storeNameById = new Map(stores.map(s => [s.id.toLowerCase(), `${s.name} (${s.status})`]));
+    const storeNameById = new Map(stores.map(s => [s.id.toLowerCase(), `${s.name} (shopId=${s.shopId}, team=${s.teamId}, status=${s.status})`]));
     const insertUnique = (map, key, store) => {
       const value = store ? store.toLowerCase() : null;
       const scoped = value && validStoreIds.has(value) ? value : null;
@@ -92,59 +91,40 @@ async function main() {
     const storeByShopId = new Map();
     for (const store of activeStores) insertUnique(storeByShopId, store.shopId, store.id);
 
-    const adIds = [...new Set(spendRows.map(r => r.adId).filter(Boolean))];
-    const codes = spendRows.map(r => creativeCodeParts(r.adName)).filter(Boolean);
-
-    const [links, products, allProductsWithCustomId, creatives, configs] = await Promise.all([
-      adIds.length ? prisma.creativeMetaAdLink.findMany({
-        where: { tenantId, adId: { in: adIds } },
+    const [links, allProducts, creatives, configs] = await Promise.all([
+      prisma.creativeMetaAdLink.findMany({
+        where: { tenantId },
         select: { adId: true, creative: { select: { code: true, posCustomId: true, posVariationId: true, tenantId: true, storeConfig: { select: { tenantId: true, storeId: true } } } } },
-      }) : [],
-      prisma.posProduct.findMany({
-        where: { store: { is: { tenantId, status: 'ACTIVE', OR: [{ enabled: true }, { enabled: null }] } }, mapping: { not: null } },
-        select: { storeId: true, mapping: true },
       }),
       prisma.posProduct.findMany({
         where: { store: { is: { tenantId, status: 'ACTIVE', OR: [{ enabled: true }, { enabled: null }] } } },
         select: { id: true, storeId: true, customId: true, mapping: true, name: true, variationId: true },
       }),
-      codes.length ? prisma.creative.findMany({
-        where: { tenantId, code: { in: [...new Set(codes.map(c => c.code))] } },
+      prisma.creative.findMany({
+        where: { tenantId },
         select: { code: true, posCustomId: true, posVariationId: true, storeConfig: { select: { tenantId: true, storeId: true } } },
-      }) : [],
-       prisma.creativeStoreConfig.findMany({
+      }),
+      prisma.creativeStoreConfig.findMany({
         where: { tenantId },
         select: { codePrefix: true, storeId: true, active: true },
       }),
     ]);
 
     console.log('CreativeStoreConfigs:', JSON.stringify(configs.map(c => ({ ...c, storeName: storeNameById.get(c.storeId.toLowerCase()) }))));
-    console.log('AllProducts:', JSON.stringify(allProductsWithCustomId.map(p => ({
-      storeId: p.storeId,
-      storeName: storeNameById.get(p.storeId.toLowerCase()),
-      customId: p.customId,
-      mapping: p.mapping,
-      name: p.name,
-      variationId: p.variationId,
-    }))));
-
-    // Also index sibling ads by campaignId and adsetId across all reconcile_marketing rows
-    const campaignMappings = new Map();
-    const adsetMappings = new Map();
-    for (const r of spendRows) {
-      if (r.campaignId && (r.mapping || (Array.isArray(r.shops) && r.shops.length > 0))) {
-        const set = campaignMappings.get(r.campaignId) || new Set();
-        if (r.mapping) set.add(`map:${r.mapping}`);
-        if (Array.isArray(r.shops)) r.shops.forEach(s => set.add(`shop:${s}`));
-        campaignMappings.set(r.campaignId, set);
-      }
-      if (r.adsetId && (r.mapping || (Array.isArray(r.shops) && r.shops.length > 0))) {
-        const set = adsetMappings.get(r.adsetId) || new Set();
-        if (r.mapping) set.add(`map:${r.mapping}`);
-        if (Array.isArray(r.shops)) r.shops.forEach(s => set.add(`shop:${s}`));
-        adsetMappings.set(r.adsetId, set);
-      }
-    }
+    const storesWithProductsOrConfigs = new Set([
+      ...allProducts.map(p => p.storeId.toLowerCase()),
+      ...configs.map(c => c.storeId.toLowerCase()),
+    ]);
+    console.log('RelevantStores:', JSON.stringify(
+      stores.filter(s => storesWithProductsOrConfigs.has(s.id.toLowerCase()) || s.teamId).map(s => ({
+        id: s.id,
+        shopId: s.shopId,
+        name: s.name,
+        teamId: s.teamId,
+        status: s.status,
+        enabled: s.enabled,
+      }))
+    ));
 
     const storeByAdId = new Map();
     for (const link of links) insertUnique(storeByAdId, link.adId,
@@ -158,46 +138,73 @@ async function main() {
       insertUnique(storeByCodePrefix, config.codePrefix.toUpperCase(), config.storeId);
     }
     const storeByLabel = new Map();
-    for (const product of products) {
-      const label = product.mapping?.trim().toLowerCase();
-      if (label) insertUnique(storeByLabel, label, product.storeId);
-    }
-
-    // Also build helper maps for diagnosis:
-    // 1. stores by customId
     const storesByCustomId = new Map();
     const storesByMappingLabel = new Map();
-    for (const p of allProductsWithCustomId) {
+    for (const p of allProducts) {
+      const label = p.mapping?.trim().toLowerCase();
+      if (label) {
+        insertUnique(storeByLabel, label, p.storeId);
+        if (!storesByMappingLabel.has(label)) storesByMappingLabel.set(label, new Set());
+        storesByMappingLabel.get(label).add(p.storeId.toLowerCase());
+      }
       const cid = (p.customId || '').trim().toLowerCase();
       if (cid) {
         if (!storesByCustomId.has(cid)) storesByCustomId.set(cid, new Set());
         storesByCustomId.get(cid).add(p.storeId.toLowerCase());
       }
-      const mp = (p.mapping || '').trim().toLowerCase();
-      if (mp) {
-        if (!storesByMappingLabel.has(mp)) storesByMappingLabel.set(mp, new Set());
-        storesByMappingLabel.get(mp).add(p.storeId.toLowerCase());
+    }
+
+    // Sibling campaign / adset / adId mappings across all spendGroups
+    const campaignSiblingsMap = new Map();
+    const adsetSiblingsMap = new Map();
+    const adIdSiblingsMap = new Map();
+    for (const r of spendGroups) {
+      let parsedShops = [];
+      try { parsedShops = r.shopsJson ? JSON.parse(r.shopsJson) : []; } catch {}
+      r.shops = Array.isArray(parsedShops) ? parsedShops : [];
+      const hints = [];
+      if (r.mapping) hints.push(`map:${r.mapping}`);
+      for (const s of r.shops) hints.push(`shop:${s}`);
+      if (hints.length > 0) {
+        if (r.campaignId) {
+          const set = campaignSiblingsMap.get(r.campaignId) || new Set();
+          hints.forEach(h => set.add(h));
+          campaignSiblingsMap.set(r.campaignId, set);
+        }
+        if (r.adsetId) {
+          const set = adsetSiblingsMap.get(r.adsetId) || new Set();
+          hints.forEach(h => set.add(h));
+          adsetSiblingsMap.set(r.adsetId, set);
+        }
+        if (r.adId) {
+          const set = adIdSiblingsMap.get(r.adId) || new Set();
+          hints.forEach(h => set.add(h));
+          adIdSiblingsMap.set(r.adId, set);
+        }
       }
     }
 
-    // Diagnose every row using current resolveStoreAttribution
     const storeTeams = new Map(activeStores.map(s => [s.id.toLowerCase(), s.teamId || null]));
-    const unattributedGroups = new Map();
-    const unassignedMappingGroups = new Map();
-    const unassignedTeamGroups = new Map();
+    const unattributedList = [];
+    const unassignedTeamList = [];
+    const unassignedMappingList = [];
 
     let totalSpend = 0;
+    let totalOctSpend = 0;
     let unattributedStoreSpend = 0;
+    let unattributedOctStoreSpend = 0;
     let unassignedTeamSpend = 0;
+    let unassignedOctTeamSpend = 0;
     let unassignedMappingSpend = 0;
 
-    for (const row of spendRows) {
-      const spend = Number(row.spend || 0);
+    for (const row of spendGroups) {
+      const spend = Number(row.totalSpend || 0);
+      const octSpend = Number(row.octSpend || 0);
       totalSpend += spend;
+      totalOctSpend += octSpend;
 
-      // Exact reproduction of resolveStoreAttribution:
       let storeId = '__unattributed__';
-      let reason = [];
+      const reason = [];
       const candidates = new Set();
       let ambiguous = creativeCodes(row.adName).length > 1;
       if (ambiguous) reason.push('multiple_creative_codes');
@@ -250,68 +257,41 @@ async function main() {
 
       const explicitTeam = typeof row.teamId === 'string' && row.teamId.length > 0 ? row.teamId : null;
       const teamId = explicitTeam || (storeId === '__unattributed__' ? null : storeTeams.get(storeId) || null);
-      const dateStr = row.date.toISOString().slice(0, 10);
 
-      if (storeId === '__unattributed__') {
+      if (storeId === '__unattributed__' && (spend > 0 || row.totalLeads > 0)) {
         unattributedStoreSpend += spend;
-        const gKey = `${row.adId}|${row.adName}|${row.campaignName}|${row.mapping}|${JSON.stringify(row.shops)}`;
-        const g = unattributedGroups.get(gKey) || {
+        unattributedOctStoreSpend += octSpend;
+        unattributedList.push({
           adId: row.adId,
           adName: row.adName,
           campaignId: row.campaignId,
           campaignName: row.campaignName,
+          adsetId: row.adsetId,
           accountId: row.accountId,
           teamId: row.teamId,
           teamCode: row.teamCode,
           mapping: row.mapping,
           shops: row.shops,
-          minDate: dateStr,
-          maxDate: dateStr,
-          days: 0,
-          totalSpend: 0,
-          totalLeads: 0,
-          totalPurchases: 0,
+          minDate: row.minDate,
+          maxDate: row.maxDate,
+          days: row.days,
+          totalSpend: Number(spend.toFixed(2)),
+          octSpend: Number(octSpend.toFixed(2)),
+          totalLeads: row.totalLeads,
+          totalPurchases: row.totalPurchases,
           reasons: reason,
           customIdStores: row.mapping ? [...(storesByCustomId.get(row.mapping.trim().toLowerCase()) || [])].map(id => `${id}:${storeNameById.get(id)}`) : [],
           mappingLabelStores: row.mapping ? [...(storesByMappingLabel.get(row.mapping.trim().toLowerCase()) || [])].map(id => `${id}:${storeNameById.get(id)}`) : [],
-          campaignSiblings: row.campaignId ? [...(campaignMappings.get(row.campaignId) || [])] : [],
-          adsetSiblings: row.adsetId ? [...(adsetMappings.get(row.adsetId) || [])] : [],
-        };
-        if (dateStr < g.minDate) g.minDate = dateStr;
-        if (dateStr > g.maxDate) g.maxDate = dateStr;
-        g.days += 1;
-        g.totalSpend += spend;
-        g.totalLeads += Number(row.leads || 0);
-        g.totalPurchases += Number(row.purchasesPos || 0);
-        unattributedGroups.set(gKey, g);
+          adIdSiblings: row.adId ? [...(adIdSiblingsMap.get(row.adId) || [])] : [],
+          adsetSiblings: row.adsetId ? [...(adsetSiblingsMap.get(row.adsetId) || [])] : [],
+          campaignSiblings: row.campaignId ? [...(campaignSiblingsMap.get(row.campaignId) || [])] : [],
+        });
       }
 
-      if (!teamId) {
+      if (!teamId && (spend > 0 || row.totalLeads > 0)) {
         unassignedTeamSpend += spend;
-        const gKey = `${row.adId}|${row.adName}|${row.campaignName}|${row.accountId}`;
-        const g = unassignedTeamGroups.get(gKey) || {
-          adId: row.adId,
-          adName: row.adName,
-          campaignName: row.campaignName,
-          accountId: row.accountId,
-          mapping: row.mapping,
-          storeId,
-          minDate: dateStr,
-          maxDate: dateStr,
-          days: 0,
-          totalSpend: 0,
-        };
-        if (dateStr < g.minDate) g.minDate = dateStr;
-        if (dateStr > g.maxDate) g.maxDate = dateStr;
-        g.days += 1;
-        g.totalSpend += spend;
-        unassignedTeamGroups.set(gKey, g);
-      }
-
-      if (!row.mapping || row.mapping.startsWith('ua::')) {
-        unassignedMappingSpend += spend;
-        const gKey = `${row.adId}|${row.adName}|${row.campaignName}|${row.mapping}`;
-        const g = unassignedMappingGroups.get(gKey) || {
+        unassignedOctTeamSpend += octSpend;
+        unassignedTeamList.push({
           adId: row.adId,
           adName: row.adName,
           campaignName: row.campaignName,
@@ -319,49 +299,66 @@ async function main() {
           mapping: row.mapping,
           shops: row.shops,
           storeId,
-          minDate: dateStr,
-          maxDate: dateStr,
-          days: 0,
-          totalSpend: 0,
-        };
-        if (dateStr < g.minDate) g.minDate = dateStr;
-        if (dateStr > g.maxDate) g.maxDate = dateStr;
-        g.days += 1;
-        g.totalSpend += spend;
-        unassignedMappingGroups.set(gKey, g);
+          minDate: row.minDate,
+          maxDate: row.maxDate,
+          days: row.days,
+          totalSpend: Number(spend.toFixed(2)),
+          octSpend: Number(octSpend.toFixed(2)),
+        });
+      }
+
+      if ((!row.mapping || row.mapping.startsWith('ua::')) && spend > 0) {
+        unassignedMappingSpend += spend;
+        unassignedMappingList.push({
+          adId: row.adId,
+          adName: row.adName,
+          campaignName: row.campaignName,
+          accountId: row.accountId,
+          mapping: row.mapping,
+          shops: row.shops,
+          storeId,
+          minDate: row.minDate,
+          maxDate: row.maxDate,
+          days: row.days,
+          totalSpend: Number(spend.toFixed(2)),
+          octSpend: Number(octSpend.toFixed(2)),
+          adIdSiblings: row.adId ? [...(adIdSiblingsMap.get(row.adId) || [])] : [],
+          adsetSiblings: row.adsetId ? [...(adsetSiblingsMap.get(row.adsetId) || [])] : [],
+          campaignSiblings: row.campaignId ? [...(campaignSiblingsMap.get(row.campaignId) || [])] : [],
+        });
       }
     }
 
     console.log('SUMMARY:', JSON.stringify({
       totalSpend: totalSpend.toFixed(2),
+      totalOctSpend: totalOctSpend.toFixed(2),
       unattributedStoreSpend: unattributedStoreSpend.toFixed(2),
-      unattributedStoreDistinctAds: unattributedGroups.size,
+      unattributedOctStoreSpend: unattributedOctStoreSpend.toFixed(2),
+      unattributedStoreGroups: unattributedList.length,
       unassignedTeamSpend: unassignedTeamSpend.toFixed(2),
-      unassignedTeamDistinctAds: unassignedTeamGroups.size,
+      unassignedOctTeamSpend: unassignedOctTeamSpend.toFixed(2),
+      unassignedTeamGroups: unassignedTeamList.length,
       unassignedMappingSpend: unassignedMappingSpend.toFixed(2),
-      unassignedMappingDistinctAds: unassignedMappingGroups.size,
+      unassignedMappingGroups: unassignedMappingList.length,
     }));
 
-    const sortedUnattributed = [...unattributedGroups.values()].sort((a, b) => b.totalSpend - a.totalSpend);
-    console.log(`TOP UNATTRIBUTED STORE ADS (${sortedUnattributed.length} total):`);
-    for (const item of sortedUnattributed.slice(0, 150)) {
-      console.log('UNATTR_STORE_AD:', JSON.stringify({ ...item, totalSpend: Number(item.totalSpend.toFixed(2)) }));
+    console.log(`ALL UNATTRIBUTED STORE AD GROUPS (${unattributedList.length}):`);
+    for (const item of unattributedList) {
+      console.log('UNATTR_STORE_AD:', JSON.stringify(item));
     }
 
-    const sortedUnassignedTeam = [...unassignedTeamGroups.values()].sort((a, b) => b.totalSpend - a.totalSpend);
-    console.log(`TOP UNASSIGNED TEAM ADS (${sortedUnassignedTeam.length} total):`);
-    for (const item of sortedUnassignedTeam.slice(0, 100)) {
-      console.log('UNASSIGNED_TEAM_AD:', JSON.stringify({ ...item, totalSpend: Number(item.totalSpend.toFixed(2)) }));
+    console.log(`ALL UNASSIGNED TEAM AD GROUPS (${unassignedTeamList.length}):`);
+    for (const item of unassignedTeamList) {
+      console.log('UNASSIGNED_TEAM_AD:', JSON.stringify(item));
     }
 
-    const sortedUnassignedMapping = [...unassignedMappingGroups.values()].sort((a, b) => b.totalSpend - a.totalSpend);
-    console.log(`TOP UNASSIGNED MAPPING ADS (${sortedUnassignedMapping.length} total):`);
-    for (const item of sortedUnassignedMapping.slice(0, 100)) {
-      console.log('UNASSIGNED_MAPPING_AD:', JSON.stringify({ ...item, totalSpend: Number(item.totalSpend.toFixed(2)) }));
+    console.log(`TOP UNASSIGNED MAPPING AD GROUPS (${unassignedMappingList.length}):`);
+    for (const item of unassignedMappingList.slice(0, 150)) {
+      console.log('UNASSIGNED_MAPPING_AD:', JSON.stringify(item));
     }
   }
 }
 
 main()
-  .catch(e => { console.error(e); process.exit(1); })
+  .catch(e => { console.error('SCRIPT_ERROR:', e); process.exit(1); })
   .finally(() => prisma.$disconnect());
