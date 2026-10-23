@@ -1628,7 +1628,7 @@ export default function SalesAnalyticsPage() {
         )}
         {showUnits && dimension === 'store' && data?.coverage && (
           data.coverage.ambiguousOrderCount > 0 || data.coverage.unattributedAdRows > 0 || data.coverage.previousUnattributedAdRows > 0 ||
-          data.coverage.unknownSelectedStoreCount > 0 || data.coverage.zeroCogsOrderCount > 0 || data.coverage.hasCanonicalDifferences
+          data.coverage.unknownSelectedStoreCount > 0 || data.coverage.zeroCogsOrderCount > 0
         ) && (
           <AlertBanner
             tone="warning"
@@ -1642,8 +1642,6 @@ export default function SalesAnalyticsPage() {
                 ? 'Some ad spend in the current or previous period has no unique store owner and remains under Unattributed; individual store margins may therefore exclude that spend.' : '',
               data.coverage.unknownSelectedStoreCount > 0
                 ? 'A selected store is outside the active reporting population.' : '',
-              data.coverage.hasCanonicalDifferences
-                ? 'Saved-order components differ from reconciled totals, which can include report lag and fee rounding. This view uses the saved orders and fee formulas per shop and day.' : '',
             ].filter(Boolean).join(' ')}
             className="mt-4"
           />
