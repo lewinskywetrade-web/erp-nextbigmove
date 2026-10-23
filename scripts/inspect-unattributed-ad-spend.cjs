@@ -341,7 +341,6 @@ async function main() {
         stillUnattributed.push({
           adId: row.adId,
           adName: row.adName,
-          campaignId: row.campaignId,
           campaignName: row.campaignName,
           accountId: row.accountId,
           teamId: row.teamId,
@@ -355,7 +354,6 @@ async function main() {
           totalSpend: Number(row.totalSpend.toFixed(2)),
           octSpend: Number(row.octSpend.toFixed(2)),
           totalLeads: row.totalLeads,
-          acctCandidateStores: [...(accountStores.get(row.accountId) || [])].map(id => storeNameById.get(id)),
         });
       }
 
@@ -389,18 +387,49 @@ async function main() {
 
     console.log('TIER_STATS:', JSON.stringify(tierStats));
     console.log(`STILL_UNATTRIBUTED_COUNT=${stillUnattributed.length} | STILL_UNASSIGNED_TEAM_COUNT=${stillUnassignedTeam.length} (spend=${stillUnassignedTeamSpend.toFixed(2)})`);
-    for (const item of stillUnattributed) {
-      console.log('STILL_UNATTR_AD:', JSON.stringify(item));
-    }
-    for (const item of stillUnassignedTeam) {
-      console.log('STILL_UNASSIGNED_TEAM:', JSON.stringify(item));
-    }
     console.log(`OCT_SPECIAL_ADS (${octUnattributedCurrent.length}):`);
     for (const item of octUnattributedCurrent) {
       console.log('OCT_AD:', JSON.stringify(item));
     }
+
+    // Group stillUnattributed by (mapping || campaignName || adName) + accountId + finalTeamId
+    const unattrPatterns = new Map();
+    for (const item of stillUnattributed) {
+      const pKey = `${item.mapping || ''}|${item.campaignName || ''}|${item.accountId || ''}|${item.finalTeamId || ''}`;
+      const existing = unattrPatterns.get(pKey) || {
+        mapping: item.mapping,
+        campaignName: item.campaignName,
+        sampleAdName: item.adName,
+        sampleAdId: item.adId,
+        accountId: item.accountId,
+        teamCode: item.teamCode,
+        finalTeamId: item.finalTeamId,
+        minDate: item.minDate,
+        maxDate: item.maxDate,
+        adCount: 0,
+        totalSpend: 0,
+        octSpend: 0,
+        totalLeads: 0,
+      };
+      if (item.minDate < existing.minDate) existing.minDate = item.minDate;
+      if (item.maxDate > existing.maxDate) existing.maxDate = item.maxDate;
+      existing.adCount += 1;
+      existing.totalSpend += item.totalSpend;
+      existing.octSpend += item.octSpend;
+      existing.totalLeads += item.totalLeads;
+      unattrPatterns.set(pKey, existing);
+    }
+    const sortedPatterns = [...unattrPatterns.values()].sort((a, b) => b.totalSpend - a.totalSpend);
+    console.log(`STILL_UNATTRIBUTED_PATTERNS (${sortedPatterns.length}):`);
+    for (const pat of sortedPatterns) {
+      console.log('UNATTR_PAT:', JSON.stringify({ ...pat, totalSpend: Number(pat.totalSpend.toFixed(2)), octSpend: Number(pat.octSpend.toFixed(2)) }));
+    }
+
+    // Also check if any inactive/disabled stores exist in pos_stores
+    const inactiveStores = stores.filter(s => !(s.status === 'ACTIVE' && (s.enabled === true || s.enabled === null)));
+    console.log(`INACTIVE_STORES (${inactiveStores.length}):`, JSON.stringify(inactiveStores));
   }
-  await new Promise(r => setTimeout(r, 1500));
+  await new Promise(r => setTimeout(r, 2000));
 }
 
 main()
