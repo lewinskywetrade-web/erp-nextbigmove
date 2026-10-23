@@ -35,14 +35,14 @@ async function main() {
     const tenantId = tenant.id;
     const spendGroups = await prisma.$queryRawUnsafe(`
       SELECT
-        ad_id AS "adId",
-        ad_name AS "adName",
-        campaign_id AS "campaignId",
-        campaign_name AS "campaignName",
-        adset_id AS "adsetId",
-        account_id AS "accountId",
-        team_id AS "teamId",
-        team_code AS "teamCode",
+        "adId",
+        "adName",
+        "campaignId",
+        "campaignName",
+        "adsetId",
+        "accountId",
+        "teamId",
+        "teamCode",
         mapping,
         shops::text AS "shopsJson",
         MIN(date)::text AS "minDate",
@@ -51,9 +51,9 @@ async function main() {
         SUM(spend)::float8 AS "totalSpend",
         SUM(CASE WHEN date >= '2026-10-01' AND date <= '2026-10-20' THEN spend ELSE 0 END)::float8 AS "octSpend",
         SUM(leads)::int AS "totalLeads",
-        SUM(purchases_pos)::int AS "totalPurchases"
+        SUM("purchasesPos")::int AS "totalPurchases"
       FROM reconcile_marketing
-      WHERE tenant_id = $1
+      WHERE "tenantId" = $1::uuid
         AND (spend > 0 OR leads > 0)
       GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
       ORDER BY "totalSpend" DESC
@@ -131,16 +131,28 @@ async function main() {
       link.creative?.tenantId === tenantId && link.creative?.storeConfig?.tenantId === tenantId
         ? link.creative.storeConfig.storeId : null);
     const storeByCreativeCode = new Map();
-    for (const creative of creatives) insertUnique(storeByCreativeCode, creative.code.toUpperCase(),
+    for (const creative of creatives) if (creative.code) insertUnique(storeByCreativeCode, creative.code.toUpperCase(),
       creative.storeConfig?.tenantId === tenantId ? creative.storeConfig.storeId : null);
     const storeByCodePrefix = new Map();
-    for (const config of configs.filter(c => c.active && validStoreIds.has(c.storeId.toLowerCase()))) {
-      insertUnique(storeByCodePrefix, config.codePrefix.toUpperCase(), config.storeId);
+    for (const config of configs.filter(c => c.active && c.storeId && validStoreIds.has(c.storeId.toLowerCase()))) {
+      if (config.codePrefix) insertUnique(storeByCodePrefix, config.codePrefix.toUpperCase(), config.storeId);
     }
     const storeByLabel = new Map();
     const storesByCustomId = new Map();
     const storesByMappingLabel = new Map();
+    const productCatalogSummary = new Map();
     for (const p of allProducts) {
+      const catKey = `${p.storeId}|${p.customId || ''}|${p.mapping || ''}`;
+      if (!productCatalogSummary.has(catKey)) {
+        productCatalogSummary.set(catKey, {
+          storeId: p.storeId,
+          storeName: storeNameById.get(p.storeId.toLowerCase()),
+          customId: p.customId,
+          mapping: p.mapping,
+          sampleName: p.name,
+          sampleVariationId: p.variationId,
+        });
+      }
       const label = p.mapping?.trim().toLowerCase();
       if (label) {
         insertUnique(storeByLabel, label, p.storeId);
@@ -153,6 +165,7 @@ async function main() {
         storesByCustomId.get(cid).add(p.storeId.toLowerCase());
       }
     }
+    console.log('ProductCatalogSummary:', JSON.stringify([...productCatalogSummary.values()]));
 
     // Sibling campaign / adset / adId mappings across all spendGroups
     const campaignSiblingsMap = new Map();
