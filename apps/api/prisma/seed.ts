@@ -1217,26 +1217,29 @@ async function backfill2026OrderCogsAndReports() {
     `);
     console.log('✓ Ensured sales analytics performance indexes');
 
-    const pendingOrderBackfillCheck = await prisma.$queryRawUnsafe<Array<{ cnt: number }>>(`
-      SELECT COUNT(*)::int AS cnt
+    const pendingOrderBackfillCheck = await prisma.$queryRawUnsafe<Array<{ m: string; cnt: number }>>(`
+      SELECT SUBSTRING("dateLocal", 1, 7) AS m, COUNT(*)::int AS cnt
       FROM pos_orders
       WHERE cogs <= 0 OR "totalQuantity" <= 0
+      GROUP BY 1
     `);
-    const pendingZeroOrders = pendingOrderBackfillCheck[0]?.cnt ?? 0;
-    const hasChangesRequiringBackfill =
-      pendingZeroOrders > 0 ||
+    const pendingZeroOrders = pendingOrderBackfillCheck.reduce((acc, r) => acc + (r.cnt || 0), 0);
+    const pendingZeroMonths = new Set(pendingOrderBackfillCheck.map((r) => r.m));
+    const catalogChanged =
       consolidatedDuplicateStoreCogs > 0 ||
       disabledDuplicateStores > 0 ||
       alignedConflictStoreOrders > 0 ||
       deletedZeroRows > 0 ||
       insertedBaselineFromDated > 0 ||
       propagatedCatalogBaselines > 0;
+    const hasChangesRequiringBackfill = pendingZeroOrders > 0 || catalogChanged;
 
-    // 6. Backfill all 2026 orders (dateLocal >= '2026-01-01', non-void, status <> 7)
+    // 6. Backfill 2026 orders (dateLocal >= '2026-01-01', non-void, status <> 7)
     //    using materialized CTE lookup tables and hash joins per month so execution is connection-pool safe.
-    const months = hasChangesRequiringBackfill
-      ? ['2026-10', '2026-09', '2026-08', '2026-07', '2026-06', '2026-05', '2026-04', '2026-03', '2026-02', '2026-01']
-      : [];
+    const all2026Months = ['2026-10', '2026-09', '2026-08', '2026-07', '2026-06', '2026-05', '2026-04', '2026-03', '2026-02', '2026-01'];
+    const months = catalogChanged
+      ? all2026Months
+      : all2026Months.filter((m) => pendingZeroMonths.has(m));
     let updatedOrders = 0;
     const updatedMonths = new Set<string>();
     for (const month of months) {
@@ -1441,7 +1444,7 @@ async function backfill2026OrderCogsAndReports() {
     }
 
     // 6b. Catch-all pass for ANY remaining order in pos_orders (e.g. 2025 or any date/status) with cogs <= 0 or totalQuantity <= 0
-    const updatedRemainingZeroOrders = !hasChangesRequiringBackfill ? 0 : await prisma.$executeRawUnsafe(`
+    const updatedRemainingZeroOrders = (!catalogChanged && pendingZeroOrders <= updatedOrders) ? 0 : await prisma.$executeRawUnsafe(`
       WITH tmp_var_cogs AS MATERIALIZED (
         SELECT DISTINCT ON (s."tenantId", s."shopId", p."variationId")
           s."tenantId",
@@ -2401,6 +2404,38 @@ async function backfillAdSpendStoreAndTeamAttribution() {
         if (m.campaignId && m.accountId) accountIdByCampaignId.set(m.campaignId, m.accountId);
       }
 
+      const findStoreId = (
+        matcher: (s: { id: string; shopId: string; name: string; shopName: string | null; teamId: string | null }) => boolean,
+      ): string | null => {
+        const found = activeStores.find(matcher);
+        return found ? found.id.toLowerCase() : null;
+      };
+
+      const ogimiStoreId =
+        findStoreId((s) => s.shopId === '715088566' || norm(s.name).includes('ogimi') || norm(s.shopName).includes('ogimi')) ||
+        '23d5232f-dbc0-48cb-9160-d5793c5057aa';
+      const kangenStoreId =
+        findStoreId((s) => s.shopId === 'kangen_store' || norm(s.name) === 'kangen') ||
+        '00000000-0000-4000-8000-000000000014';
+      const evahStoreId =
+        findStoreId((s) => s.shopId === 'evah_fragrances_store' || norm(s.name).includes('evah')) ||
+        '00000000-0000-4000-8000-000000000015';
+      const garaheStoreId =
+        findStoreId((s) => s.shopId === 'garahe_hacks_store' || norm(s.name).includes('garahe')) ||
+        '00000000-0000-4000-8000-000000000016';
+      const scentgemsStoreId =
+        findStoreId((s) => s.shopId === 'scentgems_store' || norm(s.name).includes('scentgems')) ||
+        '00000000-0000-4000-8000-000000000017';
+      const petalStoreId =
+        findStoreId((s) => s.shopId === 'petal_theory_store' || norm(s.name).includes('petal theory')) ||
+        '00000000-0000-4000-8000-000000000018';
+      const tailsStoreId =
+        findStoreId((s) => s.shopId === 'tails_and_toys_store' || norm(s.name).includes('tails')) ||
+        '00000000-0000-4000-8000-000000000019';
+      const axleStoreId = findStoreId((s) => s.shopId === '715030833' || norm(s.name).includes('axle'));
+      const kiddieStoreId = findStoreId((s) => s.shopId === '1942328959' || norm(s.name).includes('kiddie'));
+      const agriblastStoreId = findStoreId((s) => s.shopId === '1942313724' || norm(s.name).includes('agriblast'));
+
       // Brand / campaign explicit override rules for Next Big Move
       const resolveExplicitBrandOverride = (row: {
         adId?: string | null;
@@ -2413,29 +2448,33 @@ async function backfillAdSpendStoreAndTeamAttribution() {
       }): string | null => {
         if (tenant.id !== NEXT_BIG_MOVE_TENANT_ID) return null;
         const shopsArr = Array.isArray(row.shops) ? row.shops.map(String) : [];
-        if (shopsArr.includes('715088566')) return '23d5232f-dbc0-48cb-9160-d5793c5057aa';
-        if (shopsArr.includes('kangen_store')) return '00000000-0000-4000-8000-000000000014';
-        if (shopsArr.includes('evah_fragrances_store')) return '00000000-0000-4000-8000-000000000015';
+        if (shopsArr.includes('715088566') && storeById.has(ogimiStoreId)) return ogimiStoreId;
+        if (shopsArr.includes('kangen_store') && storeById.has(kangenStoreId)) return kangenStoreId;
+        if (shopsArr.includes('evah_fragrances_store') && storeById.has(evahStoreId)) return evahStoreId;
 
         const text = `${norm(row.campaignName)} | ${norm(row.adName)} | ${norm(row.mapping)}`;
-        const accId = row.accountId || (row.adId ? accountIdByAdId.get(row.adId) : undefined) || (row.campaignId ? accountIdByCampaignId.get(row.campaignId) : undefined) || '';
+        const accId =
+          row.accountId ||
+          (row.adId ? accountIdByAdId.get(row.adId) : undefined) ||
+          (row.campaignId ? accountIdByCampaignId.get(row.campaignId) : undefined) ||
+          '';
 
-        if (text.includes('ogimi')) return '23d5232f-dbc0-48cb-9160-d5793c5057aa'; // Ogimi Wellness
-        if (text.includes('kangen') || accId === '2560293900989953') return '00000000-0000-4000-8000-000000000014'; // Kangen
-        if (text.includes('evah') || accId === '1487235986020067') return '00000000-0000-4000-8000-000000000015'; // Evah Fragrances
-        if (text.includes('headlightcleaner') || text.includes('headlight cleaner')) return '00000000-0000-4000-8000-000000000016'; // Garahe Hacks
-        if (text.includes('andrea secret') || text.includes('scentgems')) return '00000000-0000-4000-8000-000000000017'; // ScentGems
-        if (text.includes('petal theory')) return '00000000-0000-4000-8000-000000000018'; // Petal Theory
-        if (text.includes('cat yoyo') || text.includes('tails & toys') || text.includes('tails and toys')) return '00000000-0000-4000-8000-000000000019'; // Tails & Toys
-        if (text.includes('anik anik engagement')) return '250d2a13-0244-4200-a346-9510c2378171'; // Axle Gear
-        if (text.includes('3 kid chart') || text.includes('vallejo')) return '5b86e613-05f3-4d33-b4dd-56916721c216'; // Kiddie Wonders PH
-        if (norm(row.campaignName) === 'new sales campaign' && norm(row.adName) === 'new sales campaign') {
-          return '98056b3d-fb9d-45e9-ad5f-785c77444034'; // Agriblast PH
+        if (text.includes('ogimi') && storeById.has(ogimiStoreId)) return ogimiStoreId;
+        if ((text.includes('kangen') || accId === '2560293900989953') && storeById.has(kangenStoreId)) return kangenStoreId;
+        if ((text.includes('evah') || accId === '1487235986020067') && storeById.has(evahStoreId)) return evahStoreId;
+        if ((text.includes('headlightcleaner') || text.includes('headlight cleaner')) && storeById.has(garaheStoreId)) return garaheStoreId;
+        if ((text.includes('andrea secret') || text.includes('scentgems')) && storeById.has(scentgemsStoreId)) return scentgemsStoreId;
+        if (text.includes('petal theory') && storeById.has(petalStoreId)) return petalStoreId;
+        if ((text.includes('cat yoyo') || text.includes('tails & toys') || text.includes('tails and toys')) && storeById.has(tailsStoreId)) return tailsStoreId;
+        if (text.includes('anik anik engagement') && axleStoreId) return axleStoreId;
+        if ((text.includes('3 kid chart') || text.includes('vallejo')) && kiddieStoreId) return kiddieStoreId;
+        if (norm(row.campaignName) === 'new sales campaign' && norm(row.adName) === 'new sales campaign' && agriblastStoreId) {
+          return agriblastStoreId;
         }
         return null;
       };
 
-      // Keyword-based fallback for active stores in Next Big Move
+      // Keyword-based fallback for active stores
       const resolveKeywordStore = (text: string): string | null => {
         const t = norm(text);
         if (!t) return null;
@@ -2446,20 +2485,30 @@ async function backfillAdSpendStoreAndTeamAttribution() {
           if (sShopName.length >= 4 && t.includes(sShopName)) return s.id.toLowerCase();
         }
         if (tenant.id === NEXT_BIG_MOVE_TENANT_ID) {
-          if (t.includes('smile') || t.includes('oral') || t.includes('breath') || t.includes('teeth')) return '2998bcd6-c878-40f6-ad19-1c29fb9f69f6'; // SmileOrganics
-          if (t.includes('barebody') || t.includes('bare body')) return '2bb11c9e-d41b-4cd5-8f57-f5b6d8a22458'; // Barebody.ph
-          if (t.includes('kiddie') || t.includes('kid') || t.includes('busy book') || t.includes('montessori')) return '5b86e613-05f3-4d33-b4dd-56916721c216'; // Kiddie Wonders PH
-          if (t.includes('radiance')) return '11edbb22-f08e-456d-92be-d62f42670d0f'; // Radiance Sphere
-          if (t.includes('luntian')) return '972d13d9-7251-4e78-9d23-9e5fb20b7061'; // Luntian
-          if (t.includes('luxe')) return '5d4f7b8e-705c-401c-8222-3e271659cf55'; // Luxe Essential
-          if (t.includes('tactical')) return 'e31d81c1-72b0-4058-b78c-d54f74263f73'; // Tactical Minds
-          if (t.includes('axle') || t.includes('wiper') || t.includes('car')) return '250d2a13-0244-4200-a346-9510c2378171'; // Axle Gear
-          if (t.includes('agriblast') || t.includes('fertilizer') || t.includes('plant')) return '98056b3d-fb9d-45e9-ad5f-785c77444034'; // Agriblast PH
-          if (t.includes('bahay')) return '0560ff14-563a-4782-a309-838a5743f0d5'; // Bahay Trends
-          if (t.includes('kusina')) return 'd6e7b31a-4821-4625-9333-1989b44cf408'; // Kusina Hacks
-          if (t.includes('homeliving') || t.includes('home living')) return 'd2d8ff80-66d8-4a12-a844-5df8c139463e'; // HomeLiving PH
-          if (t.includes('book hub') || t.includes('book')) return '8f9caa4b-b047-4d21-9839-72208b53ecd5'; // The Book Hub
-          if (t.includes('zenith') || t.includes('tai sui') || t.includes('taisui') || t.includes('bracelet') || t.includes('feng shui')) return '64df6bb0-2582-47cd-882a-76b5da8c2c91'; // Zenith
+          if (t.includes('smile') || t.includes('oral') || t.includes('breath') || t.includes('teeth')) {
+            return findStoreId((s) => norm(s.name).includes('smile'));
+          }
+          if (t.includes('barebody') || t.includes('bare body')) {
+            return findStoreId((s) => norm(s.name).includes('barebody'));
+          }
+          if (t.includes('kiddie') || t.includes('kid') || t.includes('busy book') || t.includes('montessori')) {
+            return kiddieStoreId;
+          }
+          if (t.includes('radiance')) return findStoreId((s) => norm(s.name).includes('radiance'));
+          if (t.includes('luntian')) return findStoreId((s) => norm(s.name).includes('luntian'));
+          if (t.includes('luxe')) return findStoreId((s) => norm(s.name).includes('luxe'));
+          if (t.includes('tactical')) return findStoreId((s) => norm(s.name).includes('tactical'));
+          if (t.includes('axle') || t.includes('wiper') || t.includes('car')) return axleStoreId;
+          if (t.includes('agriblast') || t.includes('fertilizer') || t.includes('plant')) return agriblastStoreId;
+          if (t.includes('bahay')) return findStoreId((s) => norm(s.name).includes('bahay'));
+          if (t.includes('kusina')) return findStoreId((s) => norm(s.name).includes('kusina'));
+          if (t.includes('homeliving') || t.includes('home living')) return findStoreId((s) => norm(s.name).includes('home'));
+          if (t.includes('book hub') || t.includes('book')) return findStoreId((s) => norm(s.name).includes('book'));
+          if (t.includes('foldix')) return findStoreId((s) => norm(s.name).includes('foldix'));
+          if (t.includes('baby bliss') || t.includes('babybliss')) return findStoreId((s) => norm(s.name).includes('baby'));
+          if (t.includes('zenith') || t.includes('tai sui') || t.includes('taisui') || t.includes('bracelet') || t.includes('feng shui')) {
+            return findStoreId((s) => norm(s.name).includes('zenith'));
+          }
         }
         return null;
       };
@@ -2602,11 +2651,12 @@ async function backfillAdSpendStoreAndTeamAttribution() {
         }
 
         // Fallback 7: teamId dominant store or tenant dominant store
-        if (!resolvedStoreId) {
+        if (!resolvedStoreId || !storeById.has(resolvedStoreId)) {
           resolvedStoreId = topVote(votesByTeamId, row.teamId) || defaultTenantStoreId;
         }
 
-        const targetStore = storeById.get(resolvedStoreId)!;
+        const targetStore = (resolvedStoreId ? storeById.get(resolvedStoreId) : undefined) || storeById.get(defaultTenantStoreId) || activeStores[0];
+        if (!targetStore) continue;
         const isSuperAdminStore = isBusinessReportExcludedStore(targetStore);
         const targetTeamId = isSuperAdminStore
           ? targetStore.teamId
