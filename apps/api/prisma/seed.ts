@@ -3,18 +3,6 @@ import { resolve } from 'path';
 import { PrismaClient, RbacWorkspace, RoleScope } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import Redis from 'ioredis';
-import {
-  loadSalesStoreAttribution,
-  partitionTeamAdSpend,
-} from '../src/modules/analytics/utils/team-ad-spend';
-import {
-  resolveStoreAttribution,
-  UNATTRIBUTED_STORE_KEY,
-} from '../src/modules/analytics/utils/store-attribution';
-import {
-  isBusinessReportExcludedStore,
-  isSuperAdminOnlyTeamId,
-} from '../src/common/utils/super-admin-only-teams';
 
 function loadEnvFile(filePath: string) {
   if (!existsSync(filePath)) {
@@ -1953,6 +1941,105 @@ async function backfillAdSpendStoreAndTeamAttribution() {
   const OGIMI_TEAM_ID = '00000000-0000-4000-8000-000000000003';
   const KANGEN_TEAM_ID = '00000000-0000-4000-8000-000000000004';
   const EVAH_TEAM_ID = '00000000-0000-4000-8000-000000000005';
+  const UNATTRIBUTED_STORE_KEY = '__unattributed__';
+  const SUPER_ADMIN_ONLY_TEAM_IDS = new Set([OGIMI_TEAM_ID, KANGEN_TEAM_ID, EVAH_TEAM_ID]);
+  const SUPER_ADMIN_ONLY_STORE_IDS = new Set([
+    '23d5232f-dbc0-48cb-9160-d5793c5057aa',
+    '00000000-0000-4000-8000-000000000014',
+    '00000000-0000-4000-8000-000000000015',
+  ]);
+  const SUPER_ADMIN_ONLY_SHOP_IDS = new Set(['715088566', 'kangen_store', 'evah_fragrances_store']);
+  const isSuperAdminOnlyTeamId = (teamId?: string | null) =>
+    Boolean(teamId && SUPER_ADMIN_ONLY_TEAM_IDS.has(String(teamId).trim()));
+  const isBusinessReportExcludedStore = (store?: { id?: string | null; shopId?: string | null; teamId?: string | null } | null) => {
+    if (!store) return false;
+    if (isSuperAdminOnlyTeamId(store.teamId)) return true;
+    if (store.id && SUPER_ADMIN_ONLY_STORE_IDS.has(String(store.id).trim())) return true;
+    if (store.shopId && SUPER_ADMIN_ONLY_SHOP_IDS.has(String(store.shopId).trim())) return true;
+    return false;
+  };
+  const CODE_SEGMENT_REGEX = /^[A-Z]{2,6}-[VI]\d{3,6}$/i;
+  const creativeCodes = (adName?: string | null): string[] => {
+    const seen = new Set<string>();
+    for (const part of String(adName || '').split('_')) {
+      const up = part.trim().toUpperCase();
+      if (CODE_SEGMENT_REGEX.test(up)) seen.add(up);
+    }
+    return Array.from(seen);
+  };
+  const creativeCodeParts = (adName?: string | null): { code: string; prefix: string } | null => {
+    const codes = creativeCodes(adName);
+    if (codes.length !== 1) return null;
+    const code = codes[0];
+    const sep = code.lastIndexOf('-');
+    if (sep <= 0) return null;
+    return { code, prefix: code.slice(0, sep) };
+  };
+  const parsePreciseStoreId = (mapping?: string | null): string | null => {
+    if (!mapping) return null;
+    const parts = mapping.split('::');
+    if (parts.length === 3 && parts[0] === 'pv' && parts[1]?.trim() && parts[2]?.trim()) {
+      return parts[1].trim().toLowerCase();
+    }
+    if (parts.length === 2 && parts[0] === 'ua' && parts[1]?.trim()) {
+      return parts[1].trim().toLowerCase();
+    }
+    return null;
+  };
+  const resolveStoreAttributionLocal = (
+    row: { adId?: string | null; adName?: string | null; mapping?: string | null; shops?: unknown },
+    index: {
+      validStoreIds: Set<string>;
+      storeByShopId: Map<string, string | null>;
+      storeByAdId: Map<string, string | null>;
+      storeByCreativeCode: Map<string, string | null>;
+      storeByCodePrefix: Map<string, string | null>;
+      storeByLabel: Map<string, string | null>;
+    },
+  ): string => {
+    if (row.adId && index.storeByAdId.has(row.adId)) {
+      const linked = index.storeByAdId.get(row.adId);
+      return linked && index.validStoreIds.has(linked) ? linked : UNATTRIBUTED_STORE_KEY;
+    }
+    const candidates = new Set<string>();
+    let ambiguous = creativeCodes(row.adName).length > 1;
+    const add = (value: string | null | undefined) => {
+      if (!value || !index.validStoreIds.has(value)) ambiguous = true;
+      else candidates.add(value);
+    };
+    const fromMap = (map: Map<string, string | null>, key: string) => {
+      if (map.has(key)) {
+        const mapped = map.get(key);
+        if (mapped) add(mapped);
+        else if (candidates.size === 0) ambiguous = true;
+      }
+    };
+    const shops = Array.isArray(row.shops) ? row.shops : [];
+    const mapping = typeof row.mapping === 'string' ? row.mapping : null;
+    const preciseStoreId = parsePreciseStoreId(mapping);
+    if (shops.length === 1 && preciseStoreId && index.validStoreIds.has(preciseStoreId)) {
+      const singleShop = typeof shops[0] === 'string' || typeof shops[0] === 'number' ? String(shops[0]) : '';
+      if (singleShop && index.storeByShopId.get(singleShop) === preciseStoreId) {
+        return preciseStoreId;
+      }
+    }
+    for (const raw of shops) {
+      const shop = typeof raw === 'string' || typeof raw === 'number' ? String(raw) : '';
+      if (!shop) ambiguous = true;
+      else add(index.storeByShopId.get(shop));
+    }
+    const code = creativeCodeParts(row.adName);
+    if (code) {
+      fromMap(index.storeByCreativeCode, code.code);
+      fromMap(index.storeByCodePrefix, code.prefix);
+    }
+    if (preciseStoreId) add(preciseStoreId);
+    else {
+      const label = mapping?.trim().toLowerCase();
+      if (label) fromMap(index.storeByLabel, label);
+    }
+    return !ambiguous && candidates.size === 1 ? Array.from(candidates)[0] : UNATTRIBUTED_STORE_KEY;
+  };
 
   try {
     const nbmTenant = await prisma.tenant.findUnique({ where: { id: NEXT_BIG_MOVE_TENANT_ID } });
@@ -2101,32 +2188,28 @@ async function backfillAdSpendStoreAndTeamAttribution() {
         });
 
         await prisma.$executeRawUnsafe(`
-          INSERT INTO pos_shop_ownerships ("shopId", "tenantId", "storeId", "updatedAt")
-          VALUES ('${s.shopId}', '${NEXT_BIG_MOVE_TENANT_ID}', '${s.id}', NOW())
+          INSERT INTO pos_shop_ownerships (id, "shopId", "tenantId", "storeId", "activatedAt", "createdAt", "updatedAt")
+          VALUES (gen_random_uuid(), '${s.shopId}', '${NEXT_BIG_MOVE_TENANT_ID}', '${s.id}', NOW(), NOW(), NOW())
           ON CONFLICT ("shopId") DO UPDATE
           SET "tenantId" = EXCLUDED."tenantId", "storeId" = EXCLUDED."storeId", "updatedAt" = NOW()
         `);
 
         await prisma.posProduct.upsert({
           where: {
-            storeId_variationId: {
-              storeId: s.id,
-              variationId: s.variationId,
-            },
+            id: s.productId,
           },
           update: {
-            tenantId: NEXT_BIG_MOVE_TENANT_ID,
-            teamId: s.teamId,
+            storeId: s.id,
+            productId: s.variationId,
+            variationId: s.variationId,
             name: s.productName,
             customId: s.customId,
             mapping: s.customId,
           },
           create: {
             id: s.productId,
-            tenantId: NEXT_BIG_MOVE_TENANT_ID,
-            teamId: s.teamId,
             storeId: s.id,
-            posProductId: s.variationId,
+            productId: s.variationId,
             variationId: s.variationId,
             name: s.productName,
             customId: s.customId,
@@ -2201,7 +2284,7 @@ async function backfillAdSpendStoreAndTeamAttribution() {
           },
         }),
         prisma.posProduct.findMany({
-          where: { tenantId: tenant.id },
+          where: { store: { is: { tenantId: tenant.id } } },
           select: { id: true, storeId: true, variationId: true, customId: true, name: true, mapping: true },
         }),
         prisma.creative.findMany({
@@ -2249,7 +2332,62 @@ async function backfillAdSpendStoreAndTeamAttribution() {
         return `ua::${sId}`.toLowerCase();
       };
 
-      const index = await loadSalesStoreAttribution(prisma, tenant.id, rmRows as any, activeStores);
+      const buildAttributionIndex = async () => {
+        const validStoreIds = new Set(activeStores.map((s) => s.id.toLowerCase()));
+        const insertUnique = (map: Map<string, string | null>, key: string, store: string | null | undefined) => {
+          const val = store?.toLowerCase();
+          const scoped = val && validStoreIds.has(val) ? val : null;
+          if (map.has(key) && map.get(key) !== scoped) map.set(key, null);
+          else map.set(key, scoped);
+        };
+        const idxStoreByShopId = new Map<string, string | null>();
+        for (const s of activeStores) insertUnique(idxStoreByShopId, s.shopId, s.id);
+        const adIds = Array.from(new Set(rmRows.map((r) => r.adId).filter((v): v is string => Boolean(v))));
+        const links = adIds.length
+          ? await prisma.creativeMetaAdLink.findMany({
+              where: { tenantId: tenant.id, adId: { in: adIds } },
+              select: {
+                adId: true,
+                creative: { select: { tenantId: true, storeConfig: { select: { tenantId: true, storeId: true } } } },
+              },
+            })
+          : [];
+        const storeByAdId = new Map<string, string | null>();
+        for (const link of links) {
+          insertUnique(
+            storeByAdId,
+            link.adId,
+            link.creative?.tenantId === tenant.id && link.creative?.storeConfig?.tenantId === tenant.id
+              ? link.creative.storeConfig.storeId
+              : null,
+          );
+        }
+        const storeByCreativeCode = new Map<string, string | null>();
+        for (const c of creatives) {
+          insertUnique(storeByCreativeCode, c.code.toUpperCase(), c.storeConfig?.storeId || null);
+        }
+        const storeByCodePrefix = new Map<string, string | null>();
+        for (const cfg of storeConfigs) {
+          insertUnique(storeByCodePrefix, cfg.codePrefix.toUpperCase(), cfg.storeId);
+        }
+        const storeByLabel = new Map<string, string | null>();
+        for (const p of products) {
+          const label = p.mapping?.trim().toLowerCase();
+          if (label && validStoreIds.has(p.storeId.toLowerCase())) {
+            insertUnique(storeByLabel, label, p.storeId);
+          }
+        }
+        return {
+          validStoreIds,
+          storeByShopId: idxStoreByShopId,
+          storeByAdId,
+          storeByCreativeCode,
+          storeByCodePrefix,
+          storeByLabel,
+        };
+      };
+
+      const index = await buildAttributionIndex();
 
       // Account lookup from meta_ad_insights
       const accountIdByAdId = new Map<string, string>();
@@ -2340,7 +2478,7 @@ async function backfillAdSpendStoreAndTeamAttribution() {
         if (!bucket || bucket.size === 0) return null;
         let bestStore: string | null = null;
         let bestScore = -1;
-        for (const [sId, score] of bucket.entries()) {
+        for (const [sId, score] of Array.from(bucket.entries())) {
           if (score > bestScore) {
             bestScore = score;
             bestStore = sId;
@@ -2358,7 +2496,7 @@ async function backfillAdSpendStoreAndTeamAttribution() {
 
       for (const row of rmRows) {
         const explicitOverride = resolveExplicitBrandOverride(row);
-        const std = explicitOverride || resolveStoreAttribution(row as any, index);
+        const std = explicitOverride || resolveStoreAttributionLocal(row as any, index);
         if (std && std !== UNATTRIBUTED_STORE_KEY && storeById.has(std)) {
           const weight = Math.max(1, Number(row.spend || 0) + Number(row.purchasesPos || 0) * 10);
           addVote(votesByAdId, row.adId, std, weight);
@@ -2376,7 +2514,7 @@ async function backfillAdSpendStoreAndTeamAttribution() {
 
       let defaultTenantStoreId = activeStores.find((s) => !isBusinessReportExcludedStore(s))?.id.toLowerCase() || activeStores[0].id.toLowerCase();
       let bestTenantScore = -1;
-      for (const [sId, score] of tenantStoreVotes.entries()) {
+      for (const [sId, score] of Array.from(tenantStoreVotes.entries())) {
         if (score > bestTenantScore) {
           bestTenantScore = score;
           defaultTenantStoreId = sId;
@@ -2397,7 +2535,7 @@ async function backfillAdSpendStoreAndTeamAttribution() {
         let resolvedStoreId: string | null = resolveExplicitBrandOverride(row);
 
         if (!resolvedStoreId) {
-          const std = resolveStoreAttribution(row as any, index);
+          const std = resolveStoreAttributionLocal(row as any, index);
           if (std && std !== UNATTRIBUTED_STORE_KEY && storeById.has(std)) {
             resolvedStoreId = std;
           }
@@ -2418,7 +2556,7 @@ async function backfillAdSpendStoreAndTeamAttribution() {
             }
           }
           let bestCount = 0;
-          for (const [sId, cnt] of orderShopCounts.entries()) {
+          for (const [sId, cnt] of Array.from(orderShopCounts.entries())) {
             if (cnt > bestCount) {
               bestCount = cnt;
               resolvedStoreId = sId;
@@ -2489,20 +2627,20 @@ async function backfillAdSpendStoreAndTeamAttribution() {
         }
 
         // Verify resolveStoreAttribution on candidateRow
-        let checkAttr = resolveStoreAttribution(
+        let checkAttr = resolveStoreAttributionLocal(
           { adId: row.adId, adName: row.adName, shops: candidateShops, mapping: candidateMapping },
           index,
         );
         if (checkAttr !== targetStore.id.toLowerCase()) {
           candidateShops = [targetStore.shopId];
-          checkAttr = resolveStoreAttribution(
+          checkAttr = resolveStoreAttributionLocal(
             { adId: row.adId, adName: row.adName, shops: candidateShops, mapping: candidateMapping },
             index,
           );
         }
         if (checkAttr !== targetStore.id.toLowerCase()) {
           candidateMapping = buildFallbackMappingForStore(targetStore.id, `${row.campaignName || ''} ${row.adName || ''}`);
-          checkAttr = resolveStoreAttribution(
+          checkAttr = resolveStoreAttributionLocal(
             { adId: row.adId, adName: row.adName, shops: candidateShops, mapping: candidateMapping },
             index,
           );
@@ -2616,29 +2754,27 @@ async function backfillAdSpendStoreAndTeamAttribution() {
           leads: true,
         },
       });
-      const verifyIndex = await loadSalesStoreAttribution(prisma, tenant.id, verifyRmRows as any, activeStores);
-      const verifyAllocation = partitionTeamAdSpend(
-        verifyRmRows as any,
-        activeStores,
-        verifyIndex,
-        [],
-        new Date('2020-01-01T00:00:00.000Z'),
-      );
       let unattributedRows = 0;
       let unattributedSpend = 0;
+      let unassignedTeamSpend = 0;
       let nullMappingRows = 0;
-      for (const r of verifyAllocation.rows) {
-        const sp = Number(r.row.spend || 0);
-        const ld = Number(r.row.leads || 0);
-        if (r.storeId === UNATTRIBUTED_STORE_KEY && (sp > 0 || ld > 0)) {
+      for (const r of verifyRmRows) {
+        const sp = Number(r.spend || 0);
+        const ld = Number(r.leads || 0);
+        const resolvedStore = resolveStoreAttributionLocal(r as any, index);
+        if (resolvedStore === UNATTRIBUTED_STORE_KEY && (sp > 0 || ld > 0)) {
           unattributedRows++;
           unattributedSpend += sp;
         }
-        if (!r.row.mapping) nullMappingRows++;
+        const effectiveTeam = r.teamId || (resolvedStore !== UNATTRIBUTED_STORE_KEY ? storeById.get(resolvedStore)?.teamId : null);
+        if (!effectiveTeam && sp > 0) {
+          unassignedTeamSpend += sp;
+        }
+        if (!r.mapping) nullMappingRows++;
       }
 
       console.log(
-        `✓ Ad Spend Attribution [${tenant.name}]: updatedRM=${rmUpdates.length}, updatedMAI=${updatedMaiCount}, affectedDates=${affectedDates.size}, unattributedAdRows=${unattributedRows}, unattributedAdSpend=${unattributedSpend.toFixed(2)}, unassignedTeamSpend=${verifyAllocation.coverage.current.unassignedSpend.toFixed(2)}, nullMappingRows=${nullMappingRows}`,
+        `✓ Ad Spend Attribution [${tenant.name}]: updatedRM=${rmUpdates.length}, updatedMAI=${updatedMaiCount}, affectedDates=${affectedDates.size}, unattributedAdRows=${unattributedRows}, unattributedAdSpend=${unattributedSpend.toFixed(2)}, unassignedTeamSpend=${unassignedTeamSpend.toFixed(2)}, nullMappingRows=${nullMappingRows}`,
       );
     }
 
