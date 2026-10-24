@@ -2991,6 +2991,93 @@ async function diagnoseActualUnitsCohort() {
   }
 }
 
+/** Read-only diagnostic: audits stored order COGS of stores whose name
+ * contains "JM" against the ERP product COGS catalog, replaying the same
+ * strict per-item rules as calculateSavedErpCogs (variation -> SKU -> parent,
+ * dated cost row preferred over undated default, exactly one positive row). */
+async function diagnoseJmStoreCogs() {
+  try {
+    const stores = await prisma.$queryRawUnsafe<any[]>(`
+      SELECT s.id, s."tenantId", s."shopId", s.name, s.status::text AS status, s.enabled,
+             t.name AS "tenantName", tm.name AS "teamName"
+      FROM pos_stores s JOIN tenants t ON t.id = s."tenantId" LEFT JOIN teams tm ON tm.id = s."teamId"
+      WHERE s.name ~* '(^|[^a-z])jm([^a-z]|$)' OR s.name ILIKE 'jm%'
+      ORDER BY s.name`);
+    console.log(`JM COGS audit: matched stores ${JSON.stringify(stores.map((s) => ({ name: s.name, shopId: s.shopId, tenant: s.tenantName, team: s.teamName, status: s.status, enabled: s.enabled })))}`);
+    const ident = (v: unknown) => (typeof v === 'string' || typeof v === 'number') ? (String(v).trim() || null) : null;
+    for (const store of stores) {
+      const products = await prisma.$queryRawUnsafe<any[]>(`
+        SELECT p.id, p."productId", p."variationId", p."customId", p.name FROM pos_products p WHERE p."storeId" = $1::uuid`, store.id);
+      const costs = await prisma.$queryRawUnsafe<any[]>(`
+        SELECT c."productId", c.cogs::text AS cogs, to_char(c."startDate", 'YYYY-MM-DD') AS "startDate",
+               to_char(c."endDate", 'YYYY-MM-DD') AS "endDate"
+        FROM pos_product_cogs c WHERE c."storeId" = $1::uuid`, store.id);
+      const productName = new Map(products.map((p) => [p.id, `${p.name}${p.customId ? ` [${p.customId}]` : ''}`]));
+      const costLines = products.map((p) => {
+        const rows = costs.filter((c) => c.productId === p.id);
+        return `${productName.get(p.id)} = ${rows.length ? rows.map((r) => `${r.cogs}${r.startDate ? `@${r.startDate}${r.endDate ? `..${r.endDate}` : ''}` : ''}`).join(', ') : 'NO COGS'}`;
+      });
+      console.log(`JM COGS audit [${store.name}] catalog (${products.length} products, ${products.filter((p) => !costs.some((c) => c.productId === p.id && Number(c.cogs) > 0)).length} without positive COGS):\n  ${costLines.slice(0, 60).join('\n  ')}`);
+      const orders = await prisma.$queryRawUnsafe<any[]>(`
+        SELECT o."posOrderId", o."dateLocal", o.status, o."isRepurchase", o."totalQuantity", o.cogs::text AS cogs,
+          CASE WHEN jsonb_typeof(o."orderSnapshot"->'items') = 'array' THEN o."orderSnapshot"->'items'
+               WHEN jsonb_typeof(o."itemData") = 'array' THEN o."itemData" ELSE NULL END AS items
+        FROM pos_orders o
+        WHERE o."tenantId" = $1::uuid AND o."shopId" = $2 AND o."dateLocal" >= '2026-01-01'
+          AND o."isVoid" = false AND o.status IS DISTINCT FROM 7`, store.tenantId, store.shopId);
+      const resolve = (item: any) => {
+        const variant = ident(item?.variation_id) ?? ident(item?.variationId);
+        const parent = ident(item?.product_id) ?? ident(item?.productId);
+        const displays = [item?.product_display_id, item?.productDisplayId, item?.variation_info?.product_display_id,
+          item?.variation_info?.display_id, item?.variation_info?.barcode].map(ident).filter(Boolean);
+        const modern = products.filter((p) => p.variationId && p.variationId !== p.productId);
+        const modernMatches = variant ? modern.filter((p) => p.variationId === variant) : modern.filter((p) => p.customId && displays.includes(p.customId));
+        const fallback = variant ? products.filter((p) => p.variationId === variant)
+          : displays.length ? products.filter((p) => p.customId && displays.includes(p.customId))
+            : parent ? products.filter((p) => p.productId === parent || p.customId === parent) : [];
+        const matches = modernMatches.length ? modernMatches : fallback;
+        return matches.length === 1 ? matches[0] : null;
+      };
+      const months = new Map<string, any>();
+      const mismatches: any[] = [];
+      const reasons: Record<string, number> = {};
+      for (const order of orders) {
+        const month = String(order.dateLocal).slice(0, 7);
+        const m = months.get(month) ?? { orders: 0, stored: 0, expected: 0, comparable: 0, storedComparable: 0, unresolved: 0, mismatched: 0 };
+        months.set(month, m);
+        m.orders++; m.stored += Number(order.cogs);
+        let expected = 0; let reason: string | null = null;
+        if (!Array.isArray(order.items) || !order.items.length) reason = 'no items';
+        else for (const item of order.items) {
+          const qty = typeof item?.quantity === 'number' ? item.quantity : /^\d+$/.test(String(item?.quantity ?? '')) ? Number(item.quantity) : NaN;
+          if (!Number.isSafeInteger(qty) || qty <= 0) { reason = 'bad quantity'; break; }
+          const product = resolve(item);
+          if (!product) { reason = 'product not matched'; break; }
+          const history = costs.filter((c) => c.productId === product.id);
+          const dated = history.filter((c) => c.startDate && c.startDate <= order.dateLocal && (!c.endDate || c.endDate >= order.dateLocal));
+          const defaults = history.filter((c) => !c.startDate && (!c.endDate || c.endDate >= order.dateLocal));
+          const applicable = dated.length ? dated : defaults;
+          if (applicable.length !== 1 || !(Number(applicable[0].cogs) > 0)) { reason = applicable.length > 1 ? 'multiple cost rows' : 'no positive cost'; break; }
+          expected += Number(applicable[0].cogs) * qty;
+        }
+        if (reason) { m.unresolved++; reasons[reason] = (reasons[reason] ?? 0) + 1; continue; }
+        m.comparable++; m.expected += expected; m.storedComparable += Number(order.cogs);
+        if (Math.abs(expected - Number(order.cogs)) > 0.005) {
+          m.mismatched++;
+          if (mismatches.length < 15) mismatches.push({ posOrderId: order.posOrderId, date: order.dateLocal, status: order.status, qty: order.totalQuantity, stored: order.cogs, expected: expected.toFixed(2) });
+        }
+      }
+      const summary = Array.from(months.entries()).sort().map(([month, m]) => ({ month, orders: m.orders, storedCogs: m.stored.toFixed(2),
+        comparableOrders: m.comparable, storedComparable: m.storedComparable.toFixed(2), expectedComparable: m.expected.toFixed(2),
+        mismatchedOrders: m.mismatched, unresolvedOrders: m.unresolved }));
+      console.log(`JM COGS audit [${store.name}] monthly: ${JSON.stringify(summary)}`);
+      console.log(`JM COGS audit [${store.name}] unresolved reasons: ${JSON.stringify(reasons)}; sample mismatches: ${JSON.stringify(mismatches)}`);
+    }
+  } catch (err: any) {
+    console.error('Warning during JM COGS audit:', err?.message || err);
+  }
+}
+
 async function main() {
   console.log('Starting database seed...');
   await ensureSuperAdmin();
@@ -3000,6 +3087,7 @@ async function main() {
   await backfillAdSpendStoreAndTeamAttribution();
   await backfill2026OrderCogsAndReports();
   await diagnoseActualUnitsCohort();
+  await diagnoseJmStoreCogs();
   console.log('Seed completed successfully!');
 }
 
