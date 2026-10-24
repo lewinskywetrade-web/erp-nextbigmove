@@ -976,74 +976,74 @@ export class SalesAnalyticsService {
           const oldestKey = this.cogsCohortCache.keys().next().value;
           if (oldestKey) this.cogsCohortCache.delete(oldestKey);
         }
-        cohortPromise = this.prisma.$transaction(
-          async (tx) => {
-            await tx.$executeRaw`SET TRANSACTION READ ONLY`;
-            const startDate = new Date(`${scope.start}T00:00:00.000Z`);
-            const endDate = new Date(`${scope.end}T00:00:00.000Z`);
-            const [stores, orders, reportRows] = await Promise.all([
-              tx.posStore.findMany({
-                where: {
-                  tenantId: scope.tenantId,
-                  status: 'ACTIVE',
-                  OR: [{ enabled: true }, { enabled: null }],
-                },
-                select: { id: true, shopId: true, name: true, teamId: true },
-                orderBy: { id: 'asc' },
-              }),
-              tx.$queryRaw<any[]>(Prisma.sql`
-                SELECT
-                  o.id,
-                  o."tenantId",
-                  o."shopId",
-                  o."posOrderId",
-                  o."dateLocal",
-                  o."teamId",
-                  o.status,
-                  o."isVoid",
-                  o."isRepurchase",
-                  o."isAbandoned",
-                  o.cogs,
-                  o."totalQuantity",
-                  erp_pos_order_extract_quantities(COALESCE(o."orderSnapshot"->'items', o."itemData")) AS "extractedItems"
-                FROM "pos_orders" o
-                WHERE o."tenantId" = ${scope.tenantId}::uuid
-                  AND o."dateLocal" >= ${scope.start}
-                  AND o."dateLocal" <= ${scope.end}
-                  AND o."isVoid" = false
-                  AND o.status IS DISTINCT FROM 7
-                ORDER BY o.id ASC
-              `),
-              tx.reconcileMarketing.findMany({
-                where: {
-                  tenantId: scope.tenantId,
-                  date: { gte: startDate, lte: endDate },
-                },
-                select: {
-                  id: true,
-                  date: true,
-                  teamId: true,
-                  mapping: true,
-                  matchedOrders: true,
-                  purchasesPos: true,
-                  rtsCount: true,
-                },
-                orderBy: { id: 'asc' },
-              }),
-            ]);
-            return {
-              stores,
-              orders,
-              reportRows,
-              expiresAt: Date.now() + 10 * 60 * 1000,
-            };
-          },
-          {
-            isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead,
-            maxWait: 5000,
-            timeout: 60000,
-          },
-        );
+        // Plain parallel reads (no interactive transaction): an interactive
+        // transaction's maxWait/timeout made this read fail under pool load,
+        // which silently fell back to the budgeted slow path and blank units.
+        const startDate = new Date(`${scope.start}T00:00:00.000Z`);
+        const endDate = new Date(`${scope.end}T00:00:00.000Z`);
+        const orderColumns = Prisma.sql`
+          o.id, o."tenantId", o."shopId", o."posOrderId", o."dateLocal", o."teamId",
+          o.status, o."isVoid", o."isRepurchase", o."isAbandoned",
+          o.cogs::text AS cogs, o."totalQuantity"`;
+        const orderWhere = Prisma.sql`
+          WHERE o."tenantId" = ${scope.tenantId}::uuid
+            AND o."dateLocal" >= ${scope.start}
+            AND o."dateLocal" <= ${scope.end}
+            AND o."isVoid" = false
+            AND o.status IS DISTINCT FROM 7`;
+        const loadOrders = async () => {
+          try {
+            return await this.prisma.$queryRaw<any[]>(Prisma.sql`
+              SELECT ${orderColumns},
+                erp_pos_order_extract_quantities(COALESCE(o."orderSnapshot"->'items', o."itemData")) AS "extractedItems"
+              FROM "pos_orders" o ${orderWhere}
+              ORDER BY o.id ASC`);
+          } catch (err: any) {
+            // Helper function missing/broken: extract quantities inline.
+            this.logger.warn(`Actual units fast cohort helper failed, using inline extraction: ${err?.message ?? err}`);
+            return this.prisma.$queryRaw<any[]>(Prisma.sql`
+              SELECT ${orderColumns},
+                CASE WHEN jsonb_typeof(COALESCE(o."orderSnapshot"->'items', o."itemData")) = 'array' THEN (
+                  SELECT jsonb_agg(jsonb_build_object('quantity', item->'quantity'))
+                  FROM jsonb_array_elements(COALESCE(o."orderSnapshot"->'items', o."itemData")) AS item
+                ) ELSE NULL END AS "extractedItems"
+              FROM "pos_orders" o ${orderWhere}
+              ORDER BY o.id ASC`);
+          }
+        };
+        cohortPromise = Promise.all([
+          this.prisma.posStore.findMany({
+            where: {
+              tenantId: scope.tenantId,
+              status: 'ACTIVE',
+              OR: [{ enabled: true }, { enabled: null }],
+            },
+            select: { id: true, shopId: true, name: true, teamId: true },
+            orderBy: { id: 'asc' },
+          }),
+          loadOrders(),
+          this.prisma.reconcileMarketing.findMany({
+            where: {
+              tenantId: scope.tenantId,
+              date: { gte: startDate, lte: endDate },
+            },
+            select: {
+              id: true,
+              date: true,
+              teamId: true,
+              mapping: true,
+              matchedOrders: true,
+              purchasesPos: true,
+              rtsCount: true,
+            },
+            orderBy: { id: 'asc' },
+          }),
+        ]).then(([stores, orders, reportRows]) => ({
+          stores,
+          orders,
+          reportRows,
+          expiresAt: Date.now() + 10 * 60 * 1000,
+        }));
         this.cogsCohortCache.set(cohortKey, cohortPromise);
       }
       const cohort = await cohortPromise;
@@ -1333,11 +1333,21 @@ export class SalesAnalyticsService {
         products: resolvedProducts,
         actualUnitsCoverage: {
           ...allocated.actualUnitsCoverage,
-          status: 'COMPLETE',
+          // Some rows were filled from direct POS quantities instead of the
+          // strict report-membership check; flag that honestly.
+          status: 'ESTIMATED',
+          estimatedFromDirectPosQuantities: true,
         },
       };
-    } catch (err) {
-      return enrichActualCogsUnits(this.prisma, response, scope, mode);
+    } catch (err: any) {
+      this.cogsCohortCache.delete(`${scope.tenantId}:${cacheVersion}:${scope.start}:${scope.end}`);
+      const reason = String(err?.message ?? err).slice(0, 300);
+      this.logger.error(`Actual units fast cohort failed (${scope.tenantId} ${scope.start}..${scope.end} ${mode}): ${reason}`);
+      const fallback: any = await enrichActualCogsUnits(this.prisma, response, scope, mode);
+      return {
+        ...fallback,
+        actualUnitsCoverage: { ...fallback?.actualUnitsCoverage, fastCohortError: reason },
+      };
     }
   }
 

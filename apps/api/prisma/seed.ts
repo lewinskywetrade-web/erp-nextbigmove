@@ -2945,6 +2945,52 @@ async function backfillAdSpendStoreAndTeamAttribution() {
   }
 }
 
+/** Read-only diagnostic: replays the Business Report "Actual Units" fast
+ * cohort read for the last 31 days per tenant and prints timing/shape so a
+ * blank Actual Units column can be explained from the deploy log. */
+async function diagnoseActualUnitsCohort() {
+  try {
+    const end = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+    const start = new Date(Date.now() + 8 * 3600 * 1000 - 30 * 86400 * 1000).toISOString().slice(0, 10);
+    const tenants = await prisma.$queryRawUnsafe<any[]>(`
+      SELECT t.id, t.name, count(o.id)::int AS orders
+      FROM tenants t JOIN pos_orders o ON o."tenantId" = t.id
+      WHERE o."dateLocal" BETWEEN $1 AND $2 AND o."isVoid" = false AND o.status IS DISTINCT FROM 7
+      GROUP BY t.id, t.name ORDER BY orders DESC LIMIT 6`, start, end);
+    for (const tenant of tenants) {
+      const startedAt = Date.now();
+      try {
+        const [shape] = await prisma.$queryRawUnsafe<any[]>(`
+          WITH c AS (
+            SELECT erp_pos_order_extract_quantities(COALESCE(o."orderSnapshot"->'items', o."itemData")) AS q,
+                   o."totalQuantity" AS tq
+            FROM pos_orders o
+            WHERE o."tenantId" = $1::uuid AND o."dateLocal" BETWEEN $2 AND $3
+              AND o."isVoid" = false AND o.status IS DISTINCT FROM 7
+          )
+          SELECT count(*)::int AS rows,
+            count(*) FILTER (WHERE q IS NULL)::int AS "nullItems",
+            count(*) FILTER (WHERE jsonb_typeof(q) = 'array' AND jsonb_array_length(q) = 0)::int AS "emptyItems",
+            count(*) FILTER (WHERE jsonb_typeof(q) = 'array' AND EXISTS (
+              SELECT 1 FROM jsonb_array_elements(q) e
+              WHERE NOT (COALESCE(e->>'quantity','') ~ '^[0-9]+$') OR (e->>'quantity')::numeric <= 0))::int AS "invalidQty",
+            COALESCE(sum(tq), 0)::bigint::text AS "sumTotalQuantity"
+          FROM c`, tenant.id, start, end);
+        const queryMs = Date.now() - startedAt;
+        const [rm] = await prisma.$queryRawUnsafe<any[]>(`
+          SELECT count(*)::int AS rows, COALESCE(sum(pg_column_size("matchedOrders")), 0)::bigint::text AS bytes
+          FROM reconcile_marketing WHERE "tenantId" = $1::uuid AND date BETWEEN $2::date AND $3::date`,
+          tenant.id, start, end);
+        console.log(`✓ Actual Units cohort [${tenant.name}] ${start}..${end}: ${JSON.stringify({ ...shape, queryMs, rmRows: rm?.rows, rmBytes: rm?.bytes })}`);
+      } catch (err: any) {
+        console.error(`✗ Actual Units cohort [${tenant.name}] failed after ${Date.now() - startedAt}ms: ${err?.message || err}`);
+      }
+    }
+  } catch (err: any) {
+    console.error('Warning during Actual Units cohort diagnostic:', err?.message || err);
+  }
+}
+
 async function main() {
   console.log('Starting database seed...');
   await ensureSuperAdmin();
@@ -2953,6 +2999,7 @@ async function main() {
   await ensureDefaultTeamsAndBackfill();
   await backfillAdSpendStoreAndTeamAttribution();
   await backfill2026OrderCogsAndReports();
+  await diagnoseActualUnitsCohort();
   console.log('Seed completed successfully!');
 }
 
