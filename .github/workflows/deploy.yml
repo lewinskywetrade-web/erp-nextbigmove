@@ -4,6 +4,10 @@ on:
   push:
     branches: [ "main" ]
 
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
 jobs:
   deploy:
     environment: erp-secrets
@@ -36,6 +40,16 @@ jobs:
             cd /opt/erp
             git rev-parse HEAD > /opt/erp/.prev_deploy_sha || true
 
+            # Keep the running image available even after the later image prune.
+            # API and worker normally share it; retain both if they differ.
+            for service in api worker; do
+              rollback_tag="erp-api:rollback-${service}-${DEPLOY_SHA:0:12}"
+              if ! docker image inspect "$rollback_tag" >/dev/null 2>&1; then
+                image_id=$(docker inspect --format '{{.Image}}' "erp-${service}-prod")
+                docker image tag "$image_id" "$rollback_tag"
+              fi
+            done
+
             max_attempts=4
             for attempt in $(seq 1 "$max_attempts"); do
               echo "Fetching main from GitHub (attempt $attempt/$max_attempts)..."
@@ -52,6 +66,7 @@ jobs:
             done
 
             git merge --ff-only "$DEPLOY_SHA"
+            [ "$(git rev-parse HEAD)" = "$DEPLOY_SHA" ] || { echo 'Refusing to deploy a stale workflow revision' >&2; exit 1; }
           REMOTE
 
           # Write env file from secret
@@ -101,3 +116,48 @@ jobs:
           # Now start all services
           ssh "$SSH_USER@$SSH_HOST" "cd /opt/erp && \
             docker compose -f docker-compose.prod.yml -f docker-compose.prod.override.yml --env-file .env.prod up -d"
+
+      - name: Verify API, worker and recovery schema
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+        run: |
+          ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$SSH_USER@$SSH_HOST" 'bash -s' <<'REMOTE'
+            set -euo pipefail
+            for attempt in $(seq 1 30); do
+              health=$(docker inspect --format '{{.State.Health.Status}}' erp-api-prod)
+              [ "$health" = healthy ] && break
+              [ "$attempt" -lt 30 ] || { echo 'API did not become healthy' >&2; exit 1; }
+              sleep 5
+            done
+            [ "$(docker inspect --format '{{.State.Running}}' erp-worker-prod)" = true ]
+            worker_started=$(docker inspect --format '{{.State.StartedAt}}' erp-worker-prod)
+            for attempt in $(seq 1 30); do
+              if docker logs --since "$worker_started" erp-worker-prod 2>&1 | grep 'Pancake worker running' >/dev/null; then break; fi
+              [ "$attempt" -lt 30 ] || { echo 'Worker did not finish application initialization' >&2; exit 1; }
+              sleep 5
+            done
+            [ "$(docker inspect --format '{{.Image}}' erp-api-prod)" = "$(docker inspect --format '{{.Image}}' erp-worker-prod)" ]
+            docker exec erp-api-prod node -e 'if(process.env.PROCESS_ROLE!=="api")process.exit(1)'
+            docker exec erp-worker-prod node -e 'if(process.env.PROCESS_ROLE!=="worker")process.exit(1)'
+            for sample in 1 2 3; do
+              [ "$sample" -eq 1 ] || sleep 60
+              docker exec -w /app/apps/api erp-api-prod node -e '
+              const {PrismaClient}=require("@prisma/client");
+              const db=new PrismaClient();
+              Promise.all([
+                db.posOrderSyncRecovery.groupBy({by:["state"],_count:{_all:true}}),
+                db.posOrderSourceVersion.count(),
+                db.posOrderSyncRecovery.groupBy({by:["lastErrorCode"],where:{state:"BLOCKED"},_count:{_all:true}}),
+                db.pancakeWebhookLog.count({where:{source:"PANCAKE_POS_RECOVERY",processStatus:"PROCESSED",processedAt:{gte:new Date(Date.now()-600000)}}})
+              ]).then(([recovery,versionedOrders,blocked,recoveredLast10m])=>console.log(JSON.stringify({
+                recoveryEnabled:process.env.POS_ORDER_RECOVERY_ENABLED!=="false",recovery,versionedOrders,blocked,recoveredLast10m
+              })))
+                .catch(()=>{console.error("Recovery schema verification failed");process.exitCode=1})
+                .finally(()=>db.$disconnect());'
+            done
+            [ "$(docker inspect --format '{{.State.Running}}' erp-worker-prod)" = true ]
+            [ "$(docker inspect --format '{{.State.StartedAt}}' erp-worker-prod)" = "$worker_started" ]
+            [ "$(docker inspect --format '{{.State.Health.Status}}' erp-api-prod)" = healthy ]
+            echo 'API healthy; worker running on matching image; recovery schema available'
+          REMOTE

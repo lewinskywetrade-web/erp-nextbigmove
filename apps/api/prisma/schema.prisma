@@ -1061,6 +1061,51 @@ model PancakeWebhookLogOrder {
   @@map("pancake_webhook_log_orders")
 }
 
+// Survives legitimate order deletion so delayed events cannot resurrect it.
+model PosOrderSourceVersion {
+  tenantId      String   @db.Uuid
+  shopId        String
+  posOrderId    String
+  sourceVersion String
+  deleted       Boolean  @default(false)
+  updatedAt     DateTime @default(now()) @updatedAt
+
+  @@id([tenantId, shopId, posOrderId])
+  @@map("pos_order_source_versions")
+}
+
+// Durable outbox keyed by original webhook tenant/scope. Canonical destination
+// ownership is re-resolved for every attempt; original receipts stay immutable.
+model PosOrderSyncRecovery {
+  id                  String    @id @default(uuid()) @db.Uuid
+  tenantId            String    @db.Uuid
+  storeId             String?   @db.Uuid
+  shopId              String
+  posOrderId          String
+  failedLogId         String    @db.Uuid
+  failedReceivedAt    DateTime
+  state               String    @default("PENDING")
+  attemptCount        Int       @default(0)
+  nextAttemptAt       DateTime  @default(now())
+  queueJobId          String?   @db.Uuid
+  queuedAt            DateTime?
+  leaseToken          String?   @db.Uuid
+  leaseUntil          DateTime?
+  lastErrorCode       String?
+  lastErrorAt         DateTime?
+  lastSourceVersion   String?
+  lastSourceStatus    Int?
+  recoveredAt        DateTime?
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @default(now()) @updatedAt
+
+  @@unique([tenantId, shopId, posOrderId])
+  @@index([state, nextAttemptAt])
+  @@index([state, leaseUntil])
+  @@index([shopId, posOrderId, failedReceivedAt], map: "pos_order_recovery_scope_failed_at_idx")
+  @@map("pos_order_sync_recoveries")
+}
+
 // ============================================================================
 // AUDIT LOG MODEL (Tenant-scoped)
 // ============================================================================

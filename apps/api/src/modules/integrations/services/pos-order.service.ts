@@ -12,6 +12,12 @@ import { WmsInventoryService } from '../../wms-inventory/wms-inventory.service';
 import { WmsOutboundRecordsService } from '../../wms-inventory/wms-outbound-records.service';
 import { COGS_REFRESH_PARENT_LOCK_SQL } from './product-cogs-recalculation.service';
 import { assertValidProductCogs, ERP_COGS_POLICY, MAX_PRODUCT_COGS } from '../product-cogs-validation';
+import {
+  incomingPancakeSourceVersion,
+  normalizePancakeSourceVersion,
+  PANCAKE_SOURCE_VERSION_KEY,
+  savedPancakeSourceVersion,
+} from './pos-order-freshness.util';
 import { WorkflowExecutionGateway } from '../../workflows/gateways/workflow-execution.gateway';
 import {
   ORDERS_STATUS_SUMMARY_UPDATED_EVENT,
@@ -63,6 +69,7 @@ interface PosOrderData {
   rtsReason?: { l1: string | null; l2: string | null; l3: string | null } | null;
   upsellBreakdown?: any | null;
   orderSnapshot?: {
+    _pancakeUpdatedAt?: string;
     customer: Record<string, any> | null;
     shipping_address: Record<string, any> | null;
     note: string | null;
@@ -107,6 +114,10 @@ export interface PosOrderUpsertOutcome {
   upsertStatus: PosOrderUpsertStatus;
   reason?: string;
   warning?: string;
+}
+
+export interface PosOrderUpsertOptions {
+  requireProjectionSuccess?: boolean;
 }
 
 export function shouldTreatNoProductSnapshotAsVoid(
@@ -688,10 +699,76 @@ export class PosOrderService {
       order.totalQuantity = fresh.totalQuantity;
       // Existing deletion/ownership transactions can lock an order before
       // changing stores. Retry rather than wait on them under catalog locks.
-      await tx.$queryRawUnsafe(`SELECT id FROM pos_orders
-        WHERE "tenantId"=$1::uuid AND "shopId"=$2 AND "posOrderId"=$3 FOR UPDATE NOWAIT`, tenantId, order.shopId, order.posOrderId);
+      await this.lockPosOrder(tx, tenantId, order.shopId, order.posOrderId);
       return persist(tx);
     }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10000, timeout: 20000 });
+  }
+
+  private async withLockedOrder<T>(tenantId: string, shopId: string, posOrderId: string,
+    persist: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+    return this.prisma.$transaction(async tx => {
+      await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '5000ms'");
+      await this.lockPosOrder(tx, tenantId, shopId, posOrderId);
+      return persist(tx);
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10000, timeout: 20000 });
+  }
+
+  private async lockPosOrder(tx: Prisma.TransactionClient, tenantId: string, shopId: string, posOrderId: string) {
+    // Includes absent rows and deletion tombstones. Never wait while holding
+    // catalog locks: an ownership/deletion transaction may use the reverse order.
+    const locks = await tx.$queryRawUnsafe<Array<{ acquired: boolean }>>(
+      'SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS acquired',
+      JSON.stringify(['pancake-order', tenantId, shopId, posOrderId]),
+    );
+    if (!locks[0]?.acquired) {
+      throw Object.assign(new Error('POS order source lock busy'), { code: '55P03' });
+    }
+    await tx.$queryRawUnsafe(`SELECT id FROM pos_orders
+      WHERE "tenantId"=$1::uuid AND "shopId"=$2 AND "posOrderId"=$3 FOR UPDATE NOWAIT`, tenantId, shopId, posOrderId);
+  }
+
+  private async sourceVersionSkipReason(
+    tx: Prisma.TransactionClient,
+    identity: { tenantId: string; shopId: string; posOrderId: string },
+    previous: { orderSnapshot: unknown; statusHistory: unknown } | null,
+    incomingVersion: string | null,
+    deleting = false,
+  ): Promise<string | null> {
+    const ledger = await tx.posOrderSourceVersion.findUnique({ where: { tenantId_shopId_posOrderId: identity } });
+    let savedVersion = savedPancakeSourceVersion(previous?.orderSnapshot, previous?.statusHistory);
+    if (ledger) {
+      const ledgerVersion = normalizePancakeSourceVersion(ledger.sourceVersion);
+      if (!ledgerVersion) throw new Error('Invalid saved POS source version');
+      if (!savedVersion || ledgerVersion > savedVersion) savedVersion = ledgerVersion;
+      if (ledger.deleted && !deleting && incomingVersion === ledgerVersion) return 'SOURCE_DELETED';
+    }
+    if (!incomingVersion && (savedVersion || deleting)) return 'SOURCE_VERSION_REQUIRED';
+    return incomingVersion && savedVersion && incomingVersion < savedVersion ? 'STALE_SOURCE_VERSION' : null;
+  }
+
+  private async saveSourceVersion(tx: Prisma.TransactionClient,
+    identity: { tenantId: string; shopId: string; posOrderId: string },
+    sourceVersion: string | null, deleted: boolean) {
+    if (!sourceVersion) return;
+    await tx.posOrderSourceVersion.upsert({
+      where: { tenantId_shopId_posOrderId: identity },
+      create: { ...identity, sourceVersion, deleted },
+      update: { sourceVersion, deleted },
+    });
+  }
+
+  private async withConcurrentCreateRetry<T>(write: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt += 1) {
+      try { return await write(); }
+      catch (error: any) {
+        if (error?.code !== 'P2002') throw error;
+        // A missing row cannot be row-locked. Create, never upsert, and retry
+        // the entire transaction to compare against the concurrent winner.
+        if (attempt >= 2) {
+          throw Object.assign(new Error('Concurrent POS order creation; retry with current source state'), { code: 'P2034' });
+        }
+      }
+    }
   }
 
   /**
@@ -1099,8 +1176,9 @@ export class PosOrderService {
     storeId: string,
     rawOrders: any[],
     teamId: string | null,
+    options: PosOrderUpsertOptions = {},
   ): Promise<{ upserted: number; outcomes: PosOrderUpsertOutcome[] }> {
-    return this.upsertPosOrdersInternal(tenantId, storeId, rawOrders, teamId, false);
+    return this.upsertPosOrdersInternal(tenantId, storeId, rawOrders, teamId, false, options);
   }
 
   private async upsertPosOrdersInternal(
@@ -1109,6 +1187,7 @@ export class PosOrderService {
     rawOrders: any[],
     teamId: string | null,
     throwOnFailure: boolean,
+    options: PosOrderUpsertOptions = {},
   ): Promise<{ upserted: number; outcomes: PosOrderUpsertOutcome[] }> {
     let upserted = 0;
     const outcomes: PosOrderUpsertOutcome[] = [];
@@ -1152,19 +1231,32 @@ export class PosOrderService {
         continue;
       }
 
+      const sourceVersion = incomingPancakeSourceVersion(rawOrder);
+      if (sourceVersion.invalid) {
+        if (throwOnFailure) throw new Error('Invalid Pancake updated_at source version');
+        outcomes.push({ shopId, orderId: posOrderId, status, upsertStatus: 'FAILED', reason: 'INVALID_SOURCE_VERSION' });
+        continue;
+      }
       const hasInvalidTag = this.hasTagNameInList(rawOrder?.tags, ['duplicate order', 'no product']);
-      if (status === 6 && hasInvalidTag) {
-        if (shopId && posOrderId) {
-          await this.prisma.posOrder.deleteMany({
-            where: { tenantId, shopId, posOrderId },
+      if (status === 6 && hasInvalidTag && shopId && posOrderId) {
+        const identity = { tenantId, shopId, posOrderId };
+        const skipped = await this.withLockedOrder(tenantId, shopId, posOrderId, async tx => {
+          const previous = await tx.posOrder.findUnique({
+            where: { tenantId_shopId_posOrderId: identity },
+            select: { id: true, orderSnapshot: true, statusHistory: true },
           });
-        }
+          const reason = await this.sourceVersionSkipReason(tx, identity, previous, sourceVersion.version, true);
+          if (reason) return reason;
+          await this.saveSourceVersion(tx, identity, sourceVersion.version, true);
+          // Do not delete a row inserted after an absent-row read by a writer
+          // outside this ingestion path. Existing rows are already locked.
+          if (previous) await tx.posOrder.deleteMany({ where: { id: previous.id, ...identity } });
+          return null;
+        });
         outcomes.push({
-          shopId,
-          orderId: posOrderId,
-          status,
-          upsertStatus: 'DELETED',
-          reason: 'STATUS_6_INVALID_TAG',
+          shopId, orderId: posOrderId, status,
+          upsertStatus: skipped ? 'SKIPPED' : 'DELETED',
+          reason: skipped ?? 'STATUS_6_INVALID_TAG',
         });
         continue;
       }
@@ -1185,58 +1277,42 @@ export class PosOrderService {
           rawOrder,
           initialValueOffer,
         );
-        if (!hasItemsPayload || rawOrder.status === undefined || rawOrder.status === null) {
-          const previous = await this.prisma.posOrder.findUnique({
-            where: {
-              tenantId_shopId_posOrderId: {
-                tenantId,
-                shopId: order.shopId,
-                posOrderId: order.posOrderId,
-              },
-            },
-            select: {
-              orderSnapshot: true,
-              itemData: true,
-              totalQuantity: true,
-              isVoid: true,
-              status: true,
-            },
-          });
-          const previousSnapshot = previous?.orderSnapshot && typeof previous.orderSnapshot === 'object'
-            && !Array.isArray(previous.orderSnapshot)
-            ? previous.orderSnapshot as Record<string, unknown>
-            : null;
-          if (!hasItemsPayload && !previous) order.cogsUnresolved = true;
-          if (!hasItemsPayload && order.orderSnapshot && previousSnapshot && Array.isArray(previousSnapshot.items)) {
-            order.orderSnapshot.items = previousSnapshot.items;
-            order.itemData = Array.isArray(previous?.itemData)
-              ? previous.itemData
-              : order.itemData;
-            order.totalQuantity = previous?.totalQuantity ?? order.totalQuantity;
-            order.isVoid = previous?.isVoid ?? order.isVoid;
-          }
-          if (rawOrder.status === undefined || rawOrder.status === null) {
-            order.status = previous?.status ?? order.status;
-          }
-        }
-        // Pancake emits variation replacements as two separate snapshots: the
-        // old item is removed first, then the replacement is added a few
-        // seconds later. A confirmed order with an explicitly empty item list
-        // is therefore an incomplete fulfillment snapshot, not a POS void.
-        // Keep it confirmed so WMS can pause it as ISSUE and converge when the
-        // replacement snapshot arrives. Only non-fulfillable statuses may use
-        // an empty item list as void evidence.
-        const shouldTreatAsVoid = shouldTreatNoProductSnapshotAsVoid(
-          isNoProductOrder,
-          order.status,
-        );
-        const isConfirmedNoProductSnapshot = isNoProductOrder && !shouldTreatAsVoid;
-        if (shouldTreatAsVoid) {
-          order.isVoid = true;
-        }
-
+        let isConfirmedNoProductSnapshot = false;
         const persistOrder = async (client: Prisma.TransactionClient) => {
-          const persistedOrder = await client.posOrder.upsert({
+          const identity = { tenantId, shopId: order.shopId, posOrderId: order.posOrderId };
+          const previous = await client.posOrder.findUnique({
+            where: { tenantId_shopId_posOrderId: identity },
+            select: { id: true, orderSnapshot: true, statusHistory: true, itemData: true, totalQuantity: true, isVoid: true, status: true },
+          });
+          const skipReason = await this.sourceVersionSkipReason(client, identity, previous, sourceVersion.version);
+          if (skipReason) return { skipped: skipReason, order: null };
+          if (!hasItemsPayload || rawOrder.status === undefined || rawOrder.status === null) {
+            const previousSnapshot = previous?.orderSnapshot && typeof previous.orderSnapshot === 'object'
+              && !Array.isArray(previous.orderSnapshot)
+              ? previous.orderSnapshot as Record<string, unknown>
+              : null;
+            if (!hasItemsPayload && !previous) order.cogsUnresolved = true;
+            if (!hasItemsPayload && order.orderSnapshot && previousSnapshot && Array.isArray(previousSnapshot.items)) {
+              order.orderSnapshot.items = previousSnapshot.items;
+              order.itemData = Array.isArray(previous?.itemData) ? previous.itemData : order.itemData;
+              order.totalQuantity = previous?.totalQuantity ?? order.totalQuantity;
+              order.isVoid = previous?.isVoid ?? order.isVoid;
+            }
+            if (rawOrder.status === undefined || rawOrder.status === null) {
+              order.status = previous?.status ?? order.status;
+            }
+          }
+          // Pancake emits variation replacements as an empty snapshot followed
+          // by the replacement. Confirmed empty snapshots pause fulfillment;
+          // only non-fulfillable statuses may use empty items as void evidence.
+          const shouldTreatAsVoid = shouldTreatNoProductSnapshotAsVoid(isNoProductOrder, order.status);
+          isConfirmedNoProductSnapshot = isNoProductOrder && !shouldTreatAsVoid;
+          if (shouldTreatAsVoid) order.isVoid = true;
+          if (hasItemsPayload && items.length === 0) order.cogsUnresolved = !order.isVoid || undefined;
+          if (sourceVersion.version && order.orderSnapshot) {
+            order.orderSnapshot[PANCAKE_SOURCE_VERSION_KEY] = sourceVersion.version;
+          }
+          const write = {
             where: {
               tenantId_shopId_posOrderId: {
                 tenantId,
@@ -1337,7 +1413,11 @@ export class PosOrderService {
               orderSnapshot: this.jsonOrDbNull(order.orderSnapshot),
               assigningCare: order.assigningCare,
             },
-          });
+          };
+          await this.saveSourceVersion(client, identity, sourceVersion.version, false);
+          const persistedOrder = previous
+            ? await client.posOrder.upsert(write)
+            : await client.posOrder.create({ data: write.create });
           if (hasItemsPayload && !order.cogsUnresolved) {
             await client.posOrder.updateMany({
               where: {
@@ -1351,11 +1431,16 @@ export class PosOrderService {
               data: { cogs: new Decimal(order.cogs) },
             });
           }
-          return persistedOrder;
+          return { skipped: null, order: persistedOrder };
         };
-        const persistedOrder = hasItemsPayload
-          ? await this.withLockedErpCogsSource(tenantId, storeId, items, order, persistOrder)
-          : await persistOrder(this.prisma);
+        const writeResult = await this.withConcurrentCreateRetry(() => hasItemsPayload
+          ? this.withLockedErpCogsSource(tenantId, storeId, items, order, persistOrder)
+          : this.withLockedOrder(tenantId, order.shopId, order.posOrderId, persistOrder));
+        if (writeResult.skipped || !writeResult.order) {
+          outcomes.push({ shopId, orderId: posOrderId, status, upsertStatus: 'SKIPPED', reason: writeResult.skipped ?? 'SOURCE_VERSION_REQUIRED' });
+          continue;
+        }
+        const persistedOrder = writeResult.order;
         await this.syncUndeliverableAttempts({
           tenantId,
           storeId,
@@ -1403,7 +1488,7 @@ export class PosOrderService {
           });
         }
         if (
-          [4, 5].includes(order.status ?? -1)
+          [2, 3, 4, 5].includes(order.status ?? -1)
           && order.shopId
           && order.posOrderId
         ) {
@@ -1451,7 +1536,7 @@ export class PosOrderService {
           warning: message.toString().slice(0, 300),
         });
 
-        if (throwOnFailure) {
+        if (throwOnFailure || options.requireProjectionSuccess) {
           throw error;
         }
       }
@@ -1494,6 +1579,14 @@ export class PosOrderService {
           posOrderRefs: outboundRecordCandidates,
         });
       } catch (error) {
+        if (options.requireProjectionSuccess) throw error;
+        const affected = new Set(outboundRecordCandidates.map(ref => `${ref.shopId}::${ref.posOrderId}`));
+        for (const outcome of outcomes) {
+          if (outcome.upsertStatus !== 'UPSERTED' || !affected.has(`${outcome.shopId}::${outcome.orderId}`)) continue;
+          outcome.upsertStatus = 'FAILED';
+          outcome.reason = 'OUTBOUND_PROJECTION_FAILED';
+          outcome.warning = 'Order saved; outbound status projection requires automatic recovery';
+        }
         this.logger.warn(
           `Outbound unit projection sync failed: ${error instanceof Error ? error.message : String(error)}`,
         );
@@ -1502,6 +1595,7 @@ export class PosOrderService {
 
     const changedSummaryCount = outcomes.filter((outcome) => (
       outcome.upsertStatus === 'UPSERTED' || outcome.upsertStatus === 'DELETED'
+      || outcome.reason === 'OUTBOUND_PROJECTION_FAILED'
     )).length;
 
     if (changedSummaryCount > 0) {

@@ -254,6 +254,7 @@ function createUpsertHarness(previous: any = null) {
   const events: string[] = [];
   const hooks: { beforeTransaction?: () => Promise<void> } = {};
   const parentLocks = new Set<string>();
+  let sourceLedger: any = null;
   const prisma = {
     posStore: {
       findFirst: jest.fn(async () => ({ initialValueOffer: null, shopId: 'shop-1', teamId: null })),
@@ -269,18 +270,33 @@ function createUpsertHarness(previous: any = null) {
         if (write.cogs !== undefined) storedCogs = write.cogs;
         return { id: 'order-1', updatedAt };
       }),
+      create: jest.fn(async ({ data }: any) => {
+        events.push('persist-order');
+        storedCogs = data.cogs;
+        return { id: 'order-1', updatedAt };
+      }),
+      deleteMany: jest.fn(async (_args: any) => { previous = null; return { count: 1 }; }),
       updateMany: jest.fn(async ({ data }: any) => {
         storedCogs = data.cogs;
         return { count: 1 };
       }),
       update: jest.fn(async (_args: any) => ({})),
     },
+    posOrderSourceVersion: {
+      findUnique: jest.fn(async (_args: any) => sourceLedger),
+      upsert: jest.fn(async ({ create, update }: any) => {
+        sourceLedger = sourceLedger ? { ...sourceLedger, ...update } : create;
+        return sourceLedger;
+      }),
+    },
     wmsFulfillmentOrder: { findMany: jest.fn<() => Promise<any[]>>().mockResolvedValue([]) },
     $transaction: jest.fn(async (callback: (client: any) => Promise<any>, options: any) => {
       await hooks.beforeTransaction?.();
       expect(options.isolationLevel).toBe('ReadCommitted');
       events.push('transaction-start');
+      const ledgerBefore = sourceLedger;
       try { return await callback(tx); }
+      catch (error) { sourceLedger = ledgerBefore; throw error; }
       finally { parentLocks.clear(); events.push('transaction-end'); }
     }),
   };
@@ -292,8 +308,14 @@ function createUpsertHarness(previous: any = null) {
       events.push('locked-source-read'); return { cogs: catalogCost };
     }) },
     posOrder: prisma.posOrder,
+    posOrderSourceVersion: prisma.posOrderSourceVersion,
     $executeRawUnsafe: jest.fn(async (sql: string) => { if (sql.startsWith('LOCK TABLE')) events.push('catalog-table-lock'); return 0; }),
     $queryRawUnsafe: jest.fn(async (sql: string, ...params: any[]) => {
+      if (sql.includes('pg_try_advisory_xact_lock')) {
+        expect(params).toEqual([JSON.stringify(['pancake-order', 'tenant-1', 'shop-1', 'order-1'])]);
+        events.push('order-source-lock');
+        return [{ acquired: true }];
+      }
       if (sql.includes('FROM pos_products')) {
         expect(sql).toContain('FOR SHARE OF p'); expect(sql).toContain('FOR SHARE OF s');
         expect(params.slice(1)).toEqual(['store-1', 'tenant-1']);
@@ -313,7 +335,10 @@ function createUpsertHarness(previous: any = null) {
   };
   const outbound = { syncForPosOrders: jest.fn(async () => undefined) };
   const service = new PosOrderService(prisma as never, fulfillment as never, inventory as never, outbound as never);
-  return { service, prisma, inventory, outbound, updatedAt, events, hooks, tx,
+  return { service, prisma, fulfillment, inventory, outbound, updatedAt, events, hooks, tx,
+    setPrevious: (value: any) => { previous = value; },
+    setSourceLedger: (value: any) => { sourceLedger = value; },
+    readSourceLedger: () => sourceLedger,
     setCatalogCost: (amount: number) => { catalogCost = new Decimal(amount); },
     readCogs: () => storedCogs, completeSourceEdit: (amount: number) => {
       catalogCost = new Decimal(amount);
@@ -335,7 +360,7 @@ describe('POS webhook COGS persistence', () => {
     expect(result.upserted).toBe(1);
     expect(readCogs().toFixed(2)).toBe(existing ? '123.45' : '0.00');
     expect(result.outcomes[0].warning).toContain('ERP_POSITIVE_COGS_WMS_ZERO_ONLY_V1');
-    if (!existing) expect(prisma.posOrder.upsert.mock.calls[0][0].create.cogs.toFixed(2)).toBe('0.00');
+    if (!existing) expect(prisma.posOrder.create.mock.calls[0][0].data.cogs.toFixed(2)).toBe('0.00');
     expect(prisma.posOrder.updateMany).not.toHaveBeenCalled();
   });
 
@@ -379,8 +404,7 @@ describe('POS webhook COGS persistence', () => {
       ...rawOrder, status: 4, items: [{ ...identity, quantity: 1 }],
     }], null);
     expect(result.upserted).toBe(1);
-    expect(prisma.posOrder.upsert.mock.calls[0][0].create.isVoid).toBe(false);
-    expect(prisma.posOrder.upsert.mock.calls[0][0].update.isVoid).toBe(false);
+    expect(prisma.posOrder.create.mock.calls[0][0].data.isVoid).toBe(false);
     expect(readCogs().toFixed(2)).toBe('10.00');
   });
 
@@ -389,7 +413,7 @@ describe('POS webhook COGS persistence', () => {
     await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{ ...rawOrder, items: [{
       name: 'Product name', note_product: 'free text', productId: '   ', variation_id: '', quantity: 1,
     }] }], null);
-    expect(prisma.posOrder.upsert.mock.calls[0][0].create.isVoid).toBe(true);
+    expect(prisma.posOrder.create.mock.calls[0][0].data.isVoid).toBe(true);
   });
 
   it.each([{ code: 'P2010', meta: { code: '55P03' } }, { code: 'P2010', meta: { code: '57014' } }, { code: 'P2028' }])(
@@ -417,7 +441,7 @@ describe('POS webhook COGS persistence', () => {
     expect(events.indexOf('source-parent-lock')).toBeLessThan(events.indexOf('locked-source-read'));
     expect(events.indexOf('locked-source-read')).toBeLessThan(events.indexOf('persist-order'));
     expect(events.indexOf('persist-order')).toBeLessThan(events.indexOf('transaction-end'));
-    expect(prisma.posOrder.upsert.mock.calls[0][0].create.cogs.toFixed(2)).toBe('20.00');
+    expect((existing ? prisma.posOrder.upsert.mock.calls[0][0].create : prisma.posOrder.create.mock.calls[0][0].data).cogs.toFixed(2)).toBe('20.00');
     expect(prisma.posOrder.updateMany.mock.calls[0][0].data.cogs.toFixed(2)).toBe('20.00');
     expect(readCogs().toFixed(2)).toBe('20.00');
   });
@@ -464,8 +488,8 @@ describe('POS webhook COGS persistence', () => {
   it('flags a newly created order without items as unresolved instead of inventing a cost', async () => {
     const { service, prisma } = createUpsertHarness();
     const result = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [rawOrder], null);
-    expect(prisma.posOrder.upsert.mock.calls[0][0].create.cogs.toFixed(2)).toBe('0.00');
-    expect(prisma.posOrder.upsert.mock.calls[0][0].update).not.toHaveProperty('cogs');
+    expect(prisma.posOrder.create.mock.calls[0][0].data.cogs.toFixed(2)).toBe('0.00');
+    expect(prisma.posOrder.upsert).not.toHaveBeenCalled();
     expect(prisma.posOrder.updateMany).not.toHaveBeenCalled();
     expect(result.outcomes[0].warning).toContain('ERP_POSITIVE_COGS_WMS_ZERO_ONLY_V1');
   });
@@ -546,7 +570,7 @@ describe('POS webhook COGS persistence', () => {
     await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{
       ...rawOrder, status, items: [{ product_id: 'parent', variation_id: 'variant-a', quantity: 3 }],
     }], null);
-    expect(prisma.posOrder.upsert).toHaveBeenCalledTimes(1);
+    expect(prisma.posOrder.create).toHaveBeenCalledTimes(1);
     expect(outbound.syncForPosOrders).toHaveBeenCalledTimes(1);
     expect(inventory.syncPosOrderCogsFromMatchedInventoryUnits).not.toHaveBeenCalled();
     expect(readCogs().toFixed(2)).toBe('30.00');
@@ -564,7 +588,7 @@ describe('POS webhook COGS persistence', () => {
     expect(inventory.syncPosOrderCogsFromMatchedInventoryUnits).not.toHaveBeenCalled();
     if (status === 2 || status === 3) {
       expect(inventory.syncPackedUnitsToDispatchedForPosOrders).toHaveBeenCalledTimes(1);
-      expect(outbound.syncForPosOrders).not.toHaveBeenCalled();
+      expect(outbound.syncForPosOrders).toHaveBeenCalledTimes(1);
     } else {
       expect(outbound.syncForPosOrders).toHaveBeenCalledTimes(1);
       expect(inventory.syncPackedUnitsToDispatchedForPosOrders).not.toHaveBeenCalled();
@@ -616,5 +640,167 @@ describe('shouldQueueWmsFulfillmentSync', () => {
   it('does not queue canceled or void orders', () => {
     expect(shouldQueueWmsFulfillmentSync(6, false)).toBe(false);
     expect(shouldQueueWmsFulfillmentSync(9, true)).toBe(false);
+  });
+});
+
+describe('POS source freshness and recovery', () => {
+  const older = '2026-10-22T06:57:03.850998';
+  const newer = '2026-10-22T06:57:03.850999';
+  const latest = '2026-10-22T06:57:03.851000';
+  const items = [{ product_id: 'parent', variation_id: 'variant-a', quantity: 3 }];
+  const saved = (version: string) => ({ id: 'order-1', status: 5, cogs: new Decimal(30),
+    orderSnapshot: { _pancakeUpdatedAt: version, items }, itemData: [], totalQuantity: 3, isVoid: false });
+
+  it.each([
+    { label: 'full', status: 4, items },
+    { label: 'partial', status: 4 },
+    { label: 'delete', status: 6, tags: [{ name: 'duplicate order' }] },
+  ])('skips older $label without any mutation or projection', async snapshot => {
+    const { service, prisma, fulfillment, inventory, outbound } = createUpsertHarness(saved(newer));
+    const result = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{
+      ...rawOrder, ...snapshot, updated_at: older,
+    }], null);
+    expect(result).toMatchObject({ upserted: 0, outcomes: [{ upsertStatus: 'SKIPPED', reason: 'STALE_SOURCE_VERSION' }] });
+    expect(prisma.posOrder.upsert).not.toHaveBeenCalled();
+    expect(prisma.posOrder.create).not.toHaveBeenCalled();
+    expect(prisma.posOrder.deleteMany).not.toHaveBeenCalled();
+    expect(prisma.posOrder.updateMany).not.toHaveBeenCalled();
+    expect(prisma.posOrderSourceVersion.upsert).not.toHaveBeenCalled();
+    expect(fulfillment.syncConfirmedPickingOrders).not.toHaveBeenCalled();
+    expect(inventory.syncPackedUnitsToDispatchedForPosOrders).not.toHaveBeenCalled();
+    expect(outbound.syncForPosOrders).not.toHaveBeenCalled();
+  });
+
+  it('re-reads source version after a newer webhook overtakes parsing', async () => {
+    const { service, hooks, setPrevious, prisma, events } = createUpsertHarness(saved(older));
+    hooks.beforeTransaction = async () => { setPrevious(saved(latest)); events.push('newer-webhook-committed'); };
+    const result = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{ ...rawOrder, items, updated_at: newer }], null);
+    expect(result.outcomes[0].reason).toBe('STALE_SOURCE_VERSION');
+    expect(prisma.posOrder.upsert).not.toHaveBeenCalled();
+    expect(events.indexOf('newer-webhook-committed')).toBeLessThan(events.indexOf('order-lock'));
+    expect(events.indexOf('source-parent-lock')).toBeLessThan(events.indexOf('order-source-lock'));
+  });
+
+  it('uses a legacy history floor and refuses an unversioned overwrite', async () => {
+    const { service, prisma } = createUpsertHarness({ ...saved(older), orderSnapshot: null, statusHistory: [{ status: 5, updated_at: newer }] });
+    const result = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [
+      { ...rawOrder, items, updated_at: older }, rawOrder,
+    ], null);
+    expect(result.outcomes.map(row => row.reason)).toEqual(['STALE_SOURCE_VERSION', 'SOURCE_VERSION_REQUIRED']);
+    expect(prisma.posOrder.upsert).not.toHaveBeenCalled();
+  });
+
+  it('does not use malformed timestamps or erase the existing watermark', async () => {
+    const { service, prisma, readSourceLedger, setSourceLedger } = createUpsertHarness(saved(newer));
+    setSourceLedger({ sourceVersion: newer, deleted: false });
+    const result = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{ ...rawOrder, items, updated_at: '2026-02-30T00:00:00Z' }], null);
+    expect(result.outcomes[0]).toMatchObject({ upsertStatus: 'FAILED', reason: 'INVALID_SOURCE_VERSION' });
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(readSourceLedger().sourceVersion).toBe(newer);
+  });
+
+  it('requests a canonical refresh when an unversioned update includes old status history', async () => {
+    const { service, prisma } = createUpsertHarness(saved(newer));
+    const result = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{
+      ...rawOrder, items, status_history: [{ status: 4, updated_at: '2026-10-22T06:57:03' }],
+    }], null);
+    expect(result.outcomes[0]).toMatchObject({ upsertStatus: 'SKIPPED', reason: 'SOURCE_VERSION_REQUIRED' });
+    expect(prisma.posOrder.upsert).not.toHaveBeenCalled();
+  });
+
+  it('merges partial fields from the locked current row and persists a full-precision watermark', async () => {
+    const { service, prisma, hooks, setPrevious, readSourceLedger } = createUpsertHarness(saved(older));
+    hooks.beforeTransaction = async () => setPrevious({ ...saved(newer), totalQuantity: 7, status: 5 });
+    const result = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{ ...rawOrder, status: undefined, updated_at: latest }], null);
+    expect(result.upserted).toBe(1);
+    expect(prisma.posOrder.upsert.mock.calls[0][0].update).toMatchObject({ totalQuantity: 7, status: 5,
+      orderSnapshot: { _pancakeUpdatedAt: '2026-10-22T06:57:03.851000000Z', items } });
+    expect(readSourceLedger()).toMatchObject({ sourceVersion: '2026-10-22T06:57:03.851000000Z', deleted: false });
+  });
+
+  it('preserves a tombstone across hard deletion and only permits a newer resurrection', async () => {
+    const { service, prisma, readSourceLedger } = createUpsertHarness(saved(older));
+    const deleted = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{ ...rawOrder, status: 6, updated_at: newer, tags: ['no product'] }], null);
+    expect(deleted.outcomes[0].upsertStatus).toBe('DELETED');
+    expect(prisma.posOrder.deleteMany).toHaveBeenCalledWith({ where: { id: 'order-1', tenantId: 'tenant-1', shopId: 'shop-1', posOrderId: 'order-1' } });
+    expect(readSourceLedger().deleted).toBe(true);
+    const replay = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [
+      { ...rawOrder, items, updated_at: older }, { ...rawOrder, items, updated_at: newer },
+    ], null);
+    expect(replay.outcomes.map(row => row.reason)).toEqual(['STALE_SOURCE_VERSION', 'SOURCE_DELETED']);
+    expect(prisma.posOrder.create).not.toHaveBeenCalled();
+    const fresh = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{ ...rawOrder, items, updated_at: latest }], null);
+    expect(fresh.upserted).toBe(1);
+    expect(readSourceLedger().deleted).toBe(false);
+  });
+
+  it('does not delete an unversioned legacy record', async () => {
+    const { service, prisma } = createUpsertHarness({ ...saved(older), orderSnapshot: null });
+    const result = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{ ...rawOrder, status: 6, tags: ['no product'] }], null);
+    expect(result.outcomes[0].reason).toBe('SOURCE_VERSION_REQUIRED');
+    expect(prisma.posOrder.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('retries a concurrent absent-row create and compares the winning version', async () => {
+    const { service, prisma, setPrevious } = createUpsertHarness();
+    prisma.posOrder.create.mockImplementationOnce(async () => {
+      setPrevious(saved(latest));
+      throw Object.assign(new Error('unique conflict'), { code: 'P2002' });
+    });
+    const result = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{ ...rawOrder, items, updated_at: newer }], null);
+    expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+    expect(prisma.posOrder.upsert).not.toHaveBeenCalled();
+    expect(result.outcomes[0].reason).toBe('STALE_SOURCE_VERSION');
+  });
+
+  it('treats a busy nonwaiting source lock as retryable and performs no write', async () => {
+    const { service, tx, prisma } = createUpsertHarness(saved(older));
+    tx.$queryRawUnsafe.mockImplementation(async (sql: string) => {
+      if (sql.includes('pg_try_advisory_xact_lock')) return [{ acquired: false }];
+      throw new Error('Unexpected query after source lock');
+    });
+    await expect(service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{ ...rawOrder, updated_at: newer }], null)).rejects.toMatchObject({ code: '55P03' });
+    expect(prisma.posOrder.upsert).not.toHaveBeenCalled();
+  });
+
+  it('retries equal-version Returned projections without physically returning units', async () => {
+    const { service, prisma, outbound, inventory } = createUpsertHarness(saved(newer));
+    const error = new Error('projection unavailable');
+    outbound.syncForPosOrders.mockRejectedValueOnce(error);
+    const apply = () => service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{ ...rawOrder, status: 5, items, updated_at: newer }], null, { requireProjectionSuccess: true });
+    await expect(apply()).rejects.toBe(error);
+    expect((await apply()).upserted).toBe(1);
+    expect(prisma.posOrder.upsert).toHaveBeenCalledTimes(2);
+    expect(outbound.syncForPosOrders).toHaveBeenCalledTimes(2);
+    expect(inventory.syncPackedUnitsToDispatchedForPosOrders).not.toHaveBeenCalled();
+    expect(inventory.syncPosOrderCogsFromMatchedInventoryUnits).not.toHaveBeenCalled();
+  });
+
+  it.each([2, 3])('checks strict outbound projection independently after status-%s dispatch', async status => {
+    const { service, outbound, inventory } = createUpsertHarness(saved(older));
+    const error = new Error('nested projection failed');
+    outbound.syncForPosOrders.mockRejectedValueOnce(error);
+    await expect(service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{ ...rawOrder, status, items, updated_at: newer }], null, { requireProjectionSuccess: true })).rejects.toBe(error);
+    expect(inventory.syncPackedUnitsToDispatchedForPosOrders).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([2, 3, 4, 5])('exposes normal status-%s outbound failure without undoing the order write', async status => {
+    const { service, prisma, outbound, readSourceLedger } = createUpsertHarness(saved(older));
+    outbound.syncForPosOrders.mockRejectedValueOnce(new Error('projection unavailable'));
+    const result = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{ ...rawOrder, status, items, updated_at: newer }], null);
+    expect(result).toMatchObject({ upserted: 1, outcomes: [{ status, upsertStatus: 'FAILED', reason: 'OUTBOUND_PROJECTION_FAILED' }] });
+    expect(prisma.posOrder.upsert).toHaveBeenCalledTimes(1);
+    expect(readSourceLedger().sourceVersion).toBe('2026-10-22T06:57:03.850999000Z');
+  });
+
+  it('reports ordinary outbound failures for recovery while strict undeliverable failures propagate', async () => {
+    const { service, outbound } = createUpsertHarness(saved(older));
+    outbound.syncForPosOrders.mockRejectedValueOnce(new Error('outbound unavailable'));
+    const result = await service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{ ...rawOrder, items, updated_at: newer }], null);
+    expect(result.upserted).toBe(1);
+    expect(result.outcomes[0]).toMatchObject({ upsertStatus: 'FAILED', reason: 'OUTBOUND_PROJECTION_FAILED' });
+    const error = new Error('undeliverable projection failed');
+    jest.spyOn(service as any, 'syncUndeliverableAttempts').mockRejectedValueOnce(error);
+    await expect(service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{ ...rawOrder, items, updated_at: newer }], null, { requireProjectionSuccess: true })).rejects.toBe(error);
   });
 });
