@@ -30,6 +30,7 @@ const MAX_DATE_RANGE_DAYS = 366;
 
 const projectionOrderSelect = Prisma.validator<Prisma.WmsFulfillmentOrderSelect>()({
   id: true,
+  posOrderDbId: true,
   tenantId: true,
   storeId: true,
   assignmentMode: true,
@@ -41,6 +42,7 @@ const projectionOrderSelect = Prisma.validator<Prisma.WmsFulfillmentOrderSelect>
       rtsAt: true,
       tracking: true,
       updatedAt: true,
+      orderSnapshot: true,
     },
   },
   basketUnits: {
@@ -509,7 +511,11 @@ export class WmsOutboundRecordsService {
       }
     }
 
-    const writes: Prisma.PrismaPromise<unknown>[] = [];
+    const writes: Array<{
+      sourceOrderId: string;
+      sourceFingerprint: string;
+      args: Prisma.WmsOutboundUnitRecordUpsertArgs;
+    }> = [];
     for (const order of orders) {
       const currentStatus = POS_TO_OUTBOUND_STATUS[order.posOrder.status ?? -1];
       if (!currentStatus) continue;
@@ -535,7 +541,8 @@ export class WmsOutboundRecordsService {
           fallback: order.posOrder.updatedAt,
         });
 
-        writes.push(this.prisma.wmsOutboundUnitRecord.upsert({
+        writes.push({ sourceOrderId: order.posOrderDbId,
+          sourceFingerprint: this.projectionSourceFingerprint(order.posOrder), args: {
           where: {
             fulfillmentOrderId_inventoryUnitId: {
               fulfillmentOrderId: order.id,
@@ -570,15 +577,43 @@ export class WmsOutboundRecordsService {
             ...(returningAt ? { returningAt } : {}),
             ...(returnedAt ? { returnedAt } : {}),
           },
-        }));
+        } });
       }
     }
 
     for (let index = 0; index < writes.length; index += 100) {
-      await this.prisma.$transaction(writes.slice(index, index + 100));
+      const chunk = writes.slice(index, index + 100);
+      const sourceIds = [...new Set(chunk.map(write => write.sourceOrderId))].sort();
+      await this.prisma.$transaction(async tx => {
+        // Projection inputs were read before this transaction. Fence them with
+        // the same source rows ingest updates, so a slower old projection can
+        // never overwrite one computed from a newer committed order snapshot.
+        const sources = await tx.$queryRaw<Array<Record<string, any>>>(Prisma.sql`
+          SELECT id, status, "statusHistory", "deliveredAt", "rtsAt", tracking, "updatedAt",
+            "orderSnapshot"->>'_pancakeUpdatedAt' AS "sourceVersion"
+          FROM pos_orders WHERE id IN (${Prisma.join(sourceIds.map(id => Prisma.sql`${id}::uuid`))})
+          ORDER BY id FOR SHARE NOWAIT
+        `);
+        const fingerprints = new Map(sources.map(source => [source.id, this.projectionSourceFingerprint(source)]));
+        if (chunk.some(write => fingerprints.get(write.sourceOrderId) !== write.sourceFingerprint)) {
+          throw Object.assign(new Error('POS source changed before outbound projection; retry current source'), { code: 'P2034' });
+        }
+        for (const write of chunk) await tx.wmsOutboundUnitRecord.upsert(write.args);
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10_000, timeout: 20_000 });
     }
 
     return { upsertedRecords: writes.length };
+  }
+
+  private projectionSourceFingerprint(source: Record<string, any>): string {
+    const snapshot = source.orderSnapshot;
+    const sourceVersion = typeof source.sourceVersion === 'string' ? source.sourceVersion
+      : snapshot && typeof snapshot === 'object' && typeof snapshot._pancakeUpdatedAt === 'string'
+        ? snapshot._pancakeUpdatedAt : null;
+    return JSON.stringify([
+      source.status, source.statusHistory, source.deliveredAt?.toISOString() ?? null,
+      source.rtsAt?.toISOString() ?? null, source.tracking, source.updatedAt.toISOString(), sourceVersion,
+    ]);
   }
 
   private resolveProjectionUnits(

@@ -926,6 +926,35 @@ export class IntegrationService {
     return returnRate >= 95;
   }
 
+  /** Internal recovery uses the same scoped credential resolution as live ingest. */
+  async resolvePancakeRecoveryApiKey(
+    tenantId: string,
+    store: { id: string; integrationId: string | null; apiKey: string | null },
+  ): Promise<string | null> {
+    return this.resolveStoreApiKeyForWebhook(tenantId, store);
+  }
+
+  /** Reuse report scheduling without replaying relay or auto-cancel side effects. */
+  async reconcileRecoveredPancakeOrder(
+    tenantId: string, rawOrder: any, recoveryId: string, destructive: boolean,
+  ): Promise<{ queued: number; skipped: number }> {
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId }, select: { settings: true },
+    });
+    if (!tenant) throw new Error('RECOVERY_TENANT_MISSING');
+    const cfg = this.getPancakeWebhookSettings(tenant.settings);
+    if (!cfg.reconcileEnabled) return { queued: 0, skipped: 0 };
+    const dateLocal = this.extractWebhookOrderDateLocal(rawOrder);
+    if (!dateLocal) throw new Error('RECOVERY_ORDER_DATE_INVALID');
+    const result = await this.enqueueWebhookReconcileJobs(
+      tenantId, new Map([[dateLocal, { dateLocal, destructive }]]),
+      `recovery-${recoveryId}`, this.getWebhookReconcileDelayMs(cfg),
+      cfg.reconcileMode ?? 'incremental',
+    );
+    if (result.warnings.length) throw new Error('RECOVERY_RECONCILE_ENQUEUE_FAILED');
+    return { queued: result.queued, skipped: result.skipped };
+  }
+
   private getPancakeAutoCancelQueueJobOptions() {
     const attempts = Math.max(1, Number(process.env.PANCAKE_AUTO_CANCEL_QUEUE_ATTEMPTS || 4));
     const backoffDelay = Math.max(

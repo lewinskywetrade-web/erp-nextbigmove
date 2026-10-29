@@ -20,10 +20,13 @@ import { IntegrationProvider } from './dto/create-integration.dto';
 import {
   PANCAKE_WEBHOOK_QUEUE,
   PANCAKE_WEBHOOK_RECONCILE_QUEUE,
+  POS_ORDER_RECOVERY_QUEUE,
 } from './pancake-webhook.constants';
 import { PancakeWebhookQueueProcessor } from './processors/pancake-webhook.processor';
 import { shouldRunPancakeWorkers } from '../../common/runtime/process-role';
 import { CreativeAgentModule } from '../creative-agent/creative-agent.module';
+import { PosOrderSyncRecoveryService } from './services/pos-order-sync-recovery.service';
+import { PosOrderSyncRecoveryProcessor } from './processors/pos-order-sync-recovery.processor';
 
 @Module({
   imports: [
@@ -38,6 +41,7 @@ import { CreativeAgentModule } from '../creative-agent/creative-agent.module';
     BullModule.registerQueue({
       name: PANCAKE_WEBHOOK_RECONCILE_QUEUE,
     }),
+    BullModule.registerQueue({ name: POS_ORDER_RECOVERY_QUEUE, limiter: { max: 10, duration: 60_000 } }),
   ],
   controllers: [IntegrationController, PancakeWebhookController],
   providers: [
@@ -47,7 +51,8 @@ import { CreativeAgentModule } from '../creative-agent/creative-agent.module';
     PosOrderService,
     ProductCogsRecalculationService,
     PosShopOwnershipService,
-    ...(shouldRunPancakeWorkers() ? [PancakeWebhookQueueProcessor] : []),
+    PosOrderSyncRecoveryService,
+    ...(shouldRunPancakeWorkers() ? [PancakeWebhookQueueProcessor, PosOrderSyncRecoveryProcessor] : []),
     ProviderRegistry,
     ProviderFactory,
   ],

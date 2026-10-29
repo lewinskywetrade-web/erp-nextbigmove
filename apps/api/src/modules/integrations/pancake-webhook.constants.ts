@@ -4,6 +4,12 @@ export const PANCAKE_WEBHOOK_AUTO_CANCEL_JOB = 'auto-cancel-status';
 export const PANCAKE_WEBHOOK_REPORTS_HYDRATE_JOB = 'hydrate-reports-by-phone';
 export const PANCAKE_WEBHOOK_RECONCILE_QUEUE = 'pancake-webhook-reconcile';
 export const PANCAKE_WEBHOOK_RECONCILE_JOB = 'reconcile-day';
+export const POS_ORDER_RECOVERY_QUEUE = 'pos-order-sync-recovery';
+export const POS_ORDER_RECOVERY_JOB = 'refresh-order';
+
+export interface PosOrderRecoveryJobData {
+  recoveryId: string;
+}
 
 export interface PancakeWebhookJobData {
   logId: string;
