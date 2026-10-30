@@ -2945,136 +2945,80 @@ async function backfillAdSpendStoreAndTeamAttribution() {
   }
 }
 
-/** Read-only diagnostic: replays the Business Report "Actual Units" fast
- * cohort read for the last 31 days per tenant and prints timing/shape so a
- * blank Actual Units column can be explained from the deploy log. */
-async function diagnoseActualUnitsCohort() {
+/** Read-only diagnostic: measures how long ERP data takes to become visible
+ * (webhook receive -> ingest -> reconcile rollup) and the Bull queue backlog,
+ * so update delays on erp.nextbigmove.com can be explained from the deploy log. */
+async function diagnoseErpFreshness() {
   try {
-    const end = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
-    const start = new Date(Date.now() + 8 * 3600 * 1000 - 30 * 86400 * 1000).toISOString().slice(0, 10);
-    const tenants = await prisma.$queryRawUnsafe<any[]>(`
-      SELECT t.id, t.name, count(o.id)::int AS orders
-      FROM tenants t JOIN pos_orders o ON o."tenantId" = t.id
-      WHERE o."dateLocal" BETWEEN $1 AND $2 AND o."isVoid" = false AND o.status IS DISTINCT FROM 7
-      GROUP BY t.id, t.name ORDER BY orders DESC LIMIT 6`, start, end);
-    for (const tenant of tenants) {
-      const startedAt = Date.now();
-      try {
-        const [shape] = await prisma.$queryRawUnsafe<any[]>(`
-          WITH c AS (
-            SELECT erp_pos_order_extract_quantities(COALESCE(o."orderSnapshot"->'items', o."itemData")) AS q,
-                   o."totalQuantity" AS tq
-            FROM pos_orders o
-            WHERE o."tenantId" = $1::uuid AND o."dateLocal" BETWEEN $2 AND $3
-              AND o."isVoid" = false AND o.status IS DISTINCT FROM 7
-          )
-          SELECT count(*)::int AS rows,
-            count(*) FILTER (WHERE q IS NULL)::int AS "nullItems",
-            count(*) FILTER (WHERE jsonb_typeof(q) = 'array' AND jsonb_array_length(q) = 0)::int AS "emptyItems",
-            count(*) FILTER (WHERE jsonb_typeof(q) = 'array' AND EXISTS (
-              SELECT 1 FROM jsonb_array_elements(q) e
-              WHERE NOT (COALESCE(e->>'quantity','') ~ '^[0-9]+$') OR (e->>'quantity')::numeric <= 0))::int AS "invalidQty",
-            COALESCE(sum(tq), 0)::bigint::text AS "sumTotalQuantity"
-          FROM c`, tenant.id, start, end);
-        const queryMs = Date.now() - startedAt;
-        const [rm] = await prisma.$queryRawUnsafe<any[]>(`
-          SELECT count(*)::int AS rows, COALESCE(sum(pg_column_size("matchedOrders")), 0)::bigint::text AS bytes
-          FROM reconcile_marketing WHERE "tenantId" = $1::uuid AND date BETWEEN $2::date AND $3::date`,
-          tenant.id, start, end);
-        console.log(`✓ Actual Units cohort [${tenant.name}] ${start}..${end}: ${JSON.stringify({ ...shape, queryMs, rmRows: rm?.rows, rmBytes: rm?.bytes })}`);
-      } catch (err: any) {
-        console.error(`✗ Actual Units cohort [${tenant.name}] failed after ${Date.now() - startedAt}ms: ${err?.message || err}`);
+    const env = Object.fromEntries(['PANCAKE_WEBHOOK_RECONCILE_DELAY_MS', 'PANCAKE_WEBHOOK_RECONCILE_MIN_DELAY_MS',
+      'PANCAKE_RECONCILE_PROCESSOR_CONCURRENCY', 'PANCAKE_WEBHOOK_PROCESSOR_CONCURRENCY', 'PANCAKE_RECONCILE_QUEUE_TIMEOUT_MS',
+      'CACHE_TTL_SECONDS'].map((k) => [k, process.env[k] ?? '(default)']));
+    console.log(`ERP freshness env: ${JSON.stringify(env)}`);
+    const webhooks = await prisma.$queryRawUnsafe<any[]>(`
+      SELECT t.name AS tenant, count(*)::int AS webhooks,
+        count(*) FILTER (WHERE l."processedAt" IS NULL)::int AS unprocessed,
+        array_agg(DISTINCT l."processStatus") AS statuses,
+        round(percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (l."processingStartedAt" - l."receivedAt"))))::int AS "ingestWaitP50s",
+        round(percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (l."processingStartedAt" - l."receivedAt"))))::int AS "ingestWaitP95s",
+        round(max(EXTRACT(EPOCH FROM (l."processingStartedAt" - l."receivedAt"))))::int AS "ingestWaitMaxS",
+        round(percentile_cont(0.95) WITHIN GROUP (ORDER BY l."processingDurationMs"))::int AS "processingP95Ms",
+        to_char(max(l."receivedAt") AT TIME ZONE 'Asia/Manila', 'MM-DD HH24:MI:SS') AS "lastReceivedPH",
+        sum(l."reconcileQueuedCount")::int AS "reconcileQueued", sum(l."reconcileSkippedCount")::int AS "reconcileCoalesced"
+      FROM pancake_webhook_logs l LEFT JOIN tenants t ON t.id = l."tenantId"
+      WHERE l."receivedAt" > now() - interval '24 hours'
+      GROUP BY t.name ORDER BY webhooks DESC LIMIT 12`);
+    for (const row of webhooks) console.log(`ERP freshness webhooks24h ${JSON.stringify(row)}`);
+    const hourly = await prisma.$queryRawUnsafe<any[]>(`
+      SELECT to_char(date_trunc('hour', l."receivedAt") AT TIME ZONE 'Asia/Manila', 'MM-DD HH24') AS hour, count(*)::int AS n,
+        round(percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (l."processingStartedAt" - l."receivedAt"))))::int AS "waitP95s"
+      FROM pancake_webhook_logs l WHERE l."receivedAt" > now() - interval '12 hours'
+      GROUP BY 1 ORDER BY 1`);
+    console.log(`ERP freshness webhook hourly(PH): ${JSON.stringify(hourly)}`);
+    const today = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+    const rollups = await prisma.$queryRawUnsafe<any[]>(`
+      SELECT t.name AS tenant,
+        to_char(max(o."updatedAt") AT TIME ZONE 'Asia/Manila', 'MM-DD HH24:MI:SS') AS "lastOrderUpdatePH",
+        (SELECT to_char(max(r."updatedAt") AT TIME ZONE 'Asia/Manila', 'MM-DD HH24:MI:SS') FROM reconcile_marketing r
+          WHERE r."tenantId" = t.id AND r.date = $1::date) AS "lastRollupTodayPH",
+        round(EXTRACT(EPOCH FROM (max(o."updatedAt") - (SELECT max(r."updatedAt") FROM reconcile_marketing r
+          WHERE r."tenantId" = t.id AND r.date = $1::date))))::int AS "rollupBehindS",
+        count(*) FILTER (WHERE o."updatedAt" > (SELECT max(r."updatedAt") FROM reconcile_marketing r
+          WHERE r."tenantId" = t.id AND r.date = $1::date))::int AS "ordersNewerThanRollup"
+      FROM pos_orders o JOIN tenants t ON t.id = o."tenantId"
+      WHERE o."dateLocal" = $1
+      GROUP BY t.id, t.name ORDER BY count(*) DESC LIMIT 8`, today);
+    for (const row of rollups) console.log(`ERP freshness rollup ${today} ${JSON.stringify(row)}`);
+    const workflows = await prisma.$queryRawUnsafe<any[]>(`
+      SELECT t.name AS tenant, w.name, w.schedule, w.enabled,
+        (SELECT to_char(max(e."completedAt") AT TIME ZONE 'Asia/Manila', 'MM-DD HH24:MI') FROM workflow_executions e WHERE e."workflowId" = w.id) AS "lastCompletedPH",
+        (SELECT round(avg(e.duration) / 1000)::int FROM (SELECT duration FROM workflow_executions e2 WHERE e2."workflowId" = w.id AND e2.duration IS NOT NULL ORDER BY e2."createdAt" DESC LIMIT 10) e) AS "avgDurationS",
+        (SELECT count(*)::int FROM workflow_executions e WHERE e."workflowId" = w.id AND e.status::text IN ('PENDING','RUNNING')) AS "pendingOrRunning"
+      FROM workflows w JOIN tenants t ON t.id = w."tenantId" WHERE w.enabled = true ORDER BY t.name, w.name LIMIT 30`);
+    for (const row of workflows) console.log(`ERP freshness workflow ${JSON.stringify(row)}`);
+    const host = process.env.REDIS_HOST || 'localhost';
+    const port = parseInt(process.env.REDIS_PORT || '6379', 10);
+    const redis = new Redis({ host, port, password: process.env.REDIS_PASSWORD || undefined, lazyConnect: true, maxRetriesPerRequest: 2 });
+    try {
+      await redis.connect();
+      for (const queue of ['pancake-webhook', 'pancake-webhook-reconcile', 'orders-confirmation-update', 'workflow-execution']) {
+        const [wait, active, delayed, failed, paused] = await Promise.all([
+          redis.llen(`bull:${queue}:wait`), redis.llen(`bull:${queue}:active`), redis.zcard(`bull:${queue}:delayed`),
+          redis.zcard(`bull:${queue}:failed`), redis.llen(`bull:${queue}:paused`)]);
+        const oldestWaitId = await redis.lindex(`bull:${queue}:wait`, -1);
+        const oldestTs = oldestWaitId ? await redis.hget(`bull:${queue}:${oldestWaitId}`, 'timestamp') : null;
+        const recentFailedIds = await redis.zrevrange(`bull:${queue}:failed`, 0, 2);
+        const recentFailures = await Promise.all(recentFailedIds.map(async (id) => {
+          const [reason, finishedOn] = await Promise.all([redis.hget(`bull:${queue}:${id}`, 'failedReason'), redis.hget(`bull:${queue}:${id}`, 'finishedOn')]);
+          return { at: finishedOn ? new Date(Number(finishedOn)).toISOString() : null, reason: String(reason ?? '').slice(0, 160) };
+        }));
+        console.log(`ERP freshness queue ${queue}: ${JSON.stringify({ wait, active, delayed, failed, paused,
+          oldestWaitingAgeS: oldestTs ? Math.round((Date.now() - Number(oldestTs)) / 1000) : null, recentFailures })}`);
       }
+    } finally {
+      redis.disconnect();
     }
   } catch (err: any) {
-    console.error('Warning during Actual Units cohort diagnostic:', err?.message || err);
-  }
-}
-
-/** Read-only diagnostic: audits stored order COGS of stores whose name
- * contains "JM" against the ERP product COGS catalog, replaying the same
- * strict per-item rules as calculateSavedErpCogs (variation -> SKU -> parent,
- * dated cost row preferred over undated default, exactly one positive row). */
-async function diagnoseJmStoreCogs() {
-  try {
-    const stores = await prisma.$queryRawUnsafe<any[]>(`
-      SELECT s.id, s."tenantId", s."shopId", s.name, s.status::text AS status, s.enabled,
-             t.name AS "tenantName", tm.name AS "teamName"
-      FROM pos_stores s JOIN tenants t ON t.id = s."tenantId" LEFT JOIN teams tm ON tm.id = s."teamId"
-      WHERE s.name ~* '(^|[^a-z])jm([^a-z]|$)' OR s.name ILIKE 'jm%'
-      ORDER BY s.name`);
-    console.log(`JM COGS audit: matched stores ${JSON.stringify(stores.map((s) => ({ name: s.name, shopId: s.shopId, tenant: s.tenantName, team: s.teamName, status: s.status, enabled: s.enabled })))}`);
-    const ident = (v: unknown) => (typeof v === 'string' || typeof v === 'number') ? (String(v).trim() || null) : null;
-    for (const store of stores) {
-      const products = await prisma.$queryRawUnsafe<any[]>(`
-        SELECT p.id, p."productId", p."variationId", p."customId", p.name FROM pos_products p WHERE p."storeId" = $1::uuid`, store.id);
-      const costs = await prisma.$queryRawUnsafe<any[]>(`
-        SELECT c."productId", c.cogs::text AS cogs, to_char(c."startDate", 'YYYY-MM-DD') AS "startDate",
-               to_char(c."endDate", 'YYYY-MM-DD') AS "endDate"
-        FROM pos_product_cogs c WHERE c."storeId" = $1::uuid`, store.id);
-      const productName = new Map(products.map((p) => [p.id, `${p.name}${p.customId ? ` [${p.customId}]` : ''}`]));
-      const costLines = products.map((p) => {
-        const rows = costs.filter((c) => c.productId === p.id);
-        return `${productName.get(p.id)} = ${rows.length ? rows.map((r) => `${r.cogs}${r.startDate ? `@${r.startDate}${r.endDate ? `..${r.endDate}` : ''}` : ''}`).join(', ') : 'NO COGS'}`;
-      });
-      console.log(`JM COGS audit [${store.name}] catalog (${products.length} products, ${products.filter((p) => !costs.some((c) => c.productId === p.id && Number(c.cogs) > 0)).length} without positive COGS):\n  ${costLines.slice(0, 60).join('\n  ')}`);
-      const orders = await prisma.$queryRawUnsafe<any[]>(`
-        SELECT o."posOrderId", o."dateLocal", o.status, o."isRepurchase", o."totalQuantity", o.cogs::text AS cogs,
-          CASE WHEN jsonb_typeof(o."orderSnapshot"->'items') = 'array' THEN o."orderSnapshot"->'items'
-               WHEN jsonb_typeof(o."itemData") = 'array' THEN o."itemData" ELSE NULL END AS items
-        FROM pos_orders o
-        WHERE o."tenantId" = $1::uuid AND o."shopId" = $2 AND o."dateLocal" >= '2026-01-01'
-          AND o."isVoid" = false AND o.status IS DISTINCT FROM 7`, store.tenantId, store.shopId);
-      const resolve = (item: any) => {
-        const variant = ident(item?.variation_id) ?? ident(item?.variationId);
-        const parent = ident(item?.product_id) ?? ident(item?.productId);
-        const displays = [item?.product_display_id, item?.productDisplayId, item?.variation_info?.product_display_id,
-          item?.variation_info?.display_id, item?.variation_info?.barcode].map(ident).filter(Boolean);
-        const modern = products.filter((p) => p.variationId && p.variationId !== p.productId);
-        const modernMatches = variant ? modern.filter((p) => p.variationId === variant) : modern.filter((p) => p.customId && displays.includes(p.customId));
-        const fallback = variant ? products.filter((p) => p.variationId === variant)
-          : displays.length ? products.filter((p) => p.customId && displays.includes(p.customId))
-            : parent ? products.filter((p) => p.productId === parent || p.customId === parent) : [];
-        const matches = modernMatches.length ? modernMatches : fallback;
-        return matches.length === 1 ? matches[0] : null;
-      };
-      const months = new Map<string, any>();
-      const mismatches: any[] = [];
-      const reasons: Record<string, number> = {};
-      for (const order of orders) {
-        const month = String(order.dateLocal).slice(0, 7);
-        const m = months.get(month) ?? { orders: 0, stored: 0, expected: 0, comparable: 0, storedComparable: 0, unresolved: 0, mismatched: 0 };
-        months.set(month, m);
-        m.orders++; m.stored += Number(order.cogs);
-        let expected = 0; let reason: string | null = null;
-        if (!Array.isArray(order.items) || !order.items.length) reason = 'no items';
-        else for (const item of order.items) {
-          const qty = typeof item?.quantity === 'number' ? item.quantity : /^\d+$/.test(String(item?.quantity ?? '')) ? Number(item.quantity) : NaN;
-          if (!Number.isSafeInteger(qty) || qty <= 0) { reason = 'bad quantity'; break; }
-          const product = resolve(item);
-          if (!product) { reason = 'product not matched'; break; }
-          const history = costs.filter((c) => c.productId === product.id);
-          const dated = history.filter((c) => c.startDate && c.startDate <= order.dateLocal && (!c.endDate || c.endDate >= order.dateLocal));
-          const defaults = history.filter((c) => !c.startDate && (!c.endDate || c.endDate >= order.dateLocal));
-          const applicable = dated.length ? dated : defaults;
-          if (applicable.length !== 1 || !(Number(applicable[0].cogs) > 0)) { reason = applicable.length > 1 ? 'multiple cost rows' : 'no positive cost'; break; }
-          expected += Number(applicable[0].cogs) * qty;
-        }
-        if (reason) { m.unresolved++; reasons[reason] = (reasons[reason] ?? 0) + 1; continue; }
-        m.comparable++; m.expected += expected; m.storedComparable += Number(order.cogs);
-        if (Math.abs(expected - Number(order.cogs)) > 0.005) {
-          m.mismatched++;
-          if (mismatches.length < 15) mismatches.push({ posOrderId: order.posOrderId, date: order.dateLocal, status: order.status, qty: order.totalQuantity, stored: order.cogs, expected: expected.toFixed(2) });
-        }
-      }
-      const summary = Array.from(months.entries()).sort().map(([month, m]) => ({ month, orders: m.orders, storedCogs: m.stored.toFixed(2),
-        comparableOrders: m.comparable, storedComparable: m.storedComparable.toFixed(2), expectedComparable: m.expected.toFixed(2),
-        mismatchedOrders: m.mismatched, unresolvedOrders: m.unresolved }));
-      console.log(`JM COGS audit [${store.name}] monthly: ${JSON.stringify(summary)}`);
-      console.log(`JM COGS audit [${store.name}] unresolved reasons: ${JSON.stringify(reasons)}; sample mismatches: ${JSON.stringify(mismatches)}`);
-    }
-  } catch (err: any) {
-    console.error('Warning during JM COGS audit:', err?.message || err);
+    console.error('Warning during ERP freshness diagnostic:', err?.message || err);
   }
 }
 
@@ -3086,8 +3030,7 @@ async function main() {
   await ensureDefaultTeamsAndBackfill();
   await backfillAdSpendStoreAndTeamAttribution();
   await backfill2026OrderCogsAndReports();
-  await diagnoseActualUnitsCohort();
-  await diagnoseJmStoreCogs();
+  await diagnoseErpFreshness();
   console.log('Seed completed successfully!');
 }
 
