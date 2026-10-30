@@ -2962,14 +2962,14 @@ async function diagnoseErpFreshness() {
         round(percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (l."processingStartedAt" - l."receivedAt"))))::int AS "ingestWaitP95s",
         round(max(EXTRACT(EPOCH FROM (l."processingStartedAt" - l."receivedAt"))))::int AS "ingestWaitMaxS",
         round(percentile_cont(0.95) WITHIN GROUP (ORDER BY l."processingDurationMs"))::int AS "processingP95Ms",
-        to_char(max(l."receivedAt") AT TIME ZONE 'Asia/Manila', 'MM-DD HH24:MI:SS') AS "lastReceivedPH",
+        to_char(max(l."receivedAt") + interval '8 hours', 'MM-DD HH24:MI:SS') AS "lastReceivedPH",
         sum(l."reconcileQueuedCount")::int AS "reconcileQueued", sum(l."reconcileSkippedCount")::int AS "reconcileCoalesced"
       FROM pancake_webhook_logs l LEFT JOIN tenants t ON t.id = l."tenantId"
       WHERE l."receivedAt" > now() - interval '24 hours'
       GROUP BY t.name ORDER BY webhooks DESC LIMIT 12`);
     for (const row of webhooks) console.log(`ERP freshness webhooks24h ${JSON.stringify(row)}`);
     const hourly = await prisma.$queryRawUnsafe<any[]>(`
-      SELECT to_char(date_trunc('hour', l."receivedAt") AT TIME ZONE 'Asia/Manila', 'MM-DD HH24') AS hour, count(*)::int AS n,
+      SELECT to_char(date_trunc('hour', l."receivedAt") + interval '8 hours', 'MM-DD HH24') AS hour, count(*)::int AS n,
         round(percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (l."processingStartedAt" - l."receivedAt"))))::int AS "waitP95s"
       FROM pancake_webhook_logs l WHERE l."receivedAt" > now() - interval '12 hours'
       GROUP BY 1 ORDER BY 1`);
@@ -2977,8 +2977,8 @@ async function diagnoseErpFreshness() {
     const today = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
     const rollups = await prisma.$queryRawUnsafe<any[]>(`
       SELECT t.name AS tenant,
-        to_char(max(o."updatedAt") AT TIME ZONE 'Asia/Manila', 'MM-DD HH24:MI:SS') AS "lastOrderUpdatePH",
-        (SELECT to_char(max(r."updatedAt") AT TIME ZONE 'Asia/Manila', 'MM-DD HH24:MI:SS') FROM reconcile_marketing r
+        to_char(max(o."updatedAt") + interval '8 hours', 'MM-DD HH24:MI:SS') AS "lastOrderUpdatePH",
+        (SELECT to_char(max(r."updatedAt") + interval '8 hours', 'MM-DD HH24:MI:SS') FROM reconcile_marketing r
           WHERE r."tenantId" = t.id AND r.date = $1::date) AS "lastRollupTodayPH",
         round(EXTRACT(EPOCH FROM (max(o."updatedAt") - (SELECT max(r."updatedAt") FROM reconcile_marketing r
           WHERE r."tenantId" = t.id AND r.date = $1::date))))::int AS "rollupBehindS",
@@ -2990,7 +2990,7 @@ async function diagnoseErpFreshness() {
     for (const row of rollups) console.log(`ERP freshness rollup ${today} ${JSON.stringify(row)}`);
     const workflows = await prisma.$queryRawUnsafe<any[]>(`
       SELECT t.name AS tenant, w.name, w.schedule, w.enabled,
-        (SELECT to_char(max(e."completedAt") AT TIME ZONE 'Asia/Manila', 'MM-DD HH24:MI') FROM workflow_executions e WHERE e."workflowId" = w.id) AS "lastCompletedPH",
+        (SELECT to_char(max(e."completedAt") + interval '8 hours', 'MM-DD HH24:MI') FROM workflow_executions e WHERE e."workflowId" = w.id) AS "lastCompletedPH",
         (SELECT round(avg(e.duration) / 1000)::int FROM (SELECT duration FROM workflow_executions e2 WHERE e2."workflowId" = w.id AND e2.duration IS NOT NULL ORDER BY e2."createdAt" DESC LIMIT 10) e) AS "avgDurationS",
         (SELECT count(*)::int FROM workflow_executions e WHERE e."workflowId" = w.id AND e.status::text IN ('PENDING','RUNNING')) AS "pendingOrRunning"
       FROM workflows w JOIN tenants t ON t.id = w."tenantId" WHERE w.enabled = true ORDER BY t.name, w.name LIMIT 30`);
@@ -3014,6 +3014,21 @@ async function diagnoseErpFreshness() {
         console.log(`ERP freshness queue ${queue}: ${JSON.stringify({ wait, active, delayed, failed, paused,
           oldestWaitingAgeS: oldestTs ? Math.round((Date.now() - Number(oldestTs)) / 1000) : null, recentFailures })}`);
       }
+      const rawMetrics = await redis.lrange('erp:metrics:pancake-reconcile', 0, 1999);
+      const metrics = rawMetrics.map((raw) => { try { return JSON.parse(raw); } catch { return null; } })
+        .filter((m) => m && Number(m.finishedAt) > Date.now() - 3 * 3600 * 1000);
+      const pct = (values: number[], p: number) => {
+        if (!values.length) return null;
+        const sorted = [...values].sort((a, b) => a - b);
+        return sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];
+      };
+      const e2e = metrics.map((m) => Number(m.createdToDoneMs)).filter(Number.isFinite);
+      const dur = metrics.map((m) => Number(m.durationMs)).filter(Number.isFinite);
+      console.log(`ERP freshness reconcile last3h: ${JSON.stringify({ runs: metrics.length,
+        orderToReportP50s: pct(e2e, 0.5) === null ? null : Math.round(pct(e2e, 0.5)! / 1000),
+        orderToReportP95s: pct(e2e, 0.95) === null ? null : Math.round(pct(e2e, 0.95)! / 1000),
+        orderToReportMaxS: e2e.length ? Math.round(Math.max(...e2e) / 1000) : null,
+        durationP50Ms: pct(dur, 0.5), durationP95Ms: pct(dur, 0.95), durationMaxMs: dur.length ? Math.max(...dur) : null })}`);
     } finally {
       redis.disconnect();
     }

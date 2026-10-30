@@ -37,6 +37,7 @@ import {
   type AnalyticsTableSelectorOption,
 } from '../../_components/analytics-table-selector';
 import { useAnalyticsDateRange } from '../../_hooks/use-analytics-date-range';
+import { useLiveReportRefresh } from '../../_hooks/use-live-report-refresh';
 import {
   ANALYTICS_FILTER_DEBOUNCE_MS,
   buildAnalyticsQueryKey,
@@ -342,6 +343,11 @@ export default function SalesByTeamAnalyticsPage() {
   useEffect(() => {
     fetchDataRef.current = fetchData;
   }, [fetchData]);
+
+  // Order updates rebuild the rollups within seconds; refresh in place.
+  useLiveReportRefresh(() => {
+    void fetchDataRef.current?.({ silent: true });
+  });
 
   useEffect(() => {
     cancelRequest();

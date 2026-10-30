@@ -62,8 +62,9 @@ import {
   PancakeWebhookReconcileJobData,
 } from './pancake-webhook.constants';
 import {
-  buildPancakeReconcileWindow,
+  enqueueCoalescedPancakeReconcile,
   resolveAutomaticPancakeReconcileMode,
+  resolvePancakeReconcileDelayMs,
 } from './pancake-webhook-reconcile.util';
 import { PosShopOwnershipService } from './services/pos-shop-ownership.service';
 import { assertValidProductCogs } from './product-cogs-validation';
@@ -1485,10 +1486,16 @@ export class IntegrationService {
 
   private getWebhookReconcileDelayMs(cfg: PancakeWebhookSettings): number {
     const intervalSeconds = cfg.reconcileIntervalSeconds ?? this.getDefaultWebhookReconcileIntervalSeconds();
-    return Math.max(
+    const configuredMs = Math.max(
       Math.max(10, intervalSeconds) * 1000,
       this.getMinimumWebhookReconcileDelayMs(),
     );
+    // Legacy five-minute settings made reports lag orders by up to ~6 minutes.
+    // Coalescing is now bounded per tenant/day, so cap the wait to seconds.
+    return resolvePancakeReconcileDelayMs({
+      configuredMs,
+      maxDelayMs: Number(process.env.PANCAKE_WEBHOOK_RECONCILE_MAX_DELAY_MS),
+    });
   }
 
   private getDefaultWebhookReconcileMode(): 'incremental' | 'full_reset' {
@@ -1522,47 +1529,38 @@ export class IntegrationService {
 
     for (const target of targets.values()) {
       try {
-        // A delete/void must remove its previous contribution quickly. Keep the
-        // normal five-minute coalescing window for ordinary updates, while
-        // destructive corrections share a small, separate window per day.
+        // A delete/void must remove its previous contribution quickly; it
+        // gets queue priority. All updates share one bounded slot per day.
         const trigger = target.destructive
           ? 'destructive_order_change' as const
           : 'standard' as const;
         const effectiveDelayMs = target.destructive
-          ? Math.min(delayMs, 15_000)
+          ? Math.min(delayMs, 5_000)
           : delayMs;
-        const reconcileWindow = buildPancakeReconcileWindow({
+        const result = await enqueueCoalescedPancakeReconcile({
+          queue: this.pancakeWebhookReconcileQueue as any,
+          jobName: PANCAKE_WEBHOOK_RECONCILE_JOB,
           tenantId,
           dateLocal: target.dateLocal,
           delayMs: effectiveDelayMs,
-          trigger,
-        });
-        const existingJob = await this.pancakeWebhookReconcileQueue.getJob(
-          reconcileWindow.jobId,
-        );
-        if (existingJob) {
-          skipped += 1;
-          continue;
-        }
-
-        await this.pancakeWebhookReconcileQueue.add(
-          PANCAKE_WEBHOOK_RECONCILE_JOB,
-          {
+          data: {
             tenantId,
             teamId: null,
             dateLocal: target.dateLocal,
             reconcileMode,
             trigger,
-            scheduledFor: reconcileWindow.scheduledFor,
             requestId,
             logId,
           },
-          {
-            jobId: reconcileWindow.jobId,
-            ...this.getPancakeWebhookReconcileQueueJobOptions(reconcileWindow.delayMs),
+          options: {
+            ...this.getPancakeWebhookReconcileQueueJobOptions(effectiveDelayMs),
             ...(target.destructive ? { priority: 1 } : {}),
           },
-        );
+        });
+        if (result === 'coalesced') {
+          skipped += 1;
+          continue;
+        }
         queued += 1;
       } catch (error: any) {
         const message = (error?.message || '').toString();

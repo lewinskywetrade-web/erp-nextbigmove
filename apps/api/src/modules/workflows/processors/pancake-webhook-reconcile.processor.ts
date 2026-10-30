@@ -19,6 +19,7 @@ const PANCAKE_RECONCILE_PROCESSOR_CONCURRENCY = (() => {
     : 1;
 })();
 const QUEUE_METRICS_INTERVAL_MS = 30_000;
+export const RECONCILE_METRICS_KEY = 'erp:metrics:pancake-reconcile';
 
 @Processor(PANCAKE_WEBHOOK_RECONCILE_QUEUE)
 export class PancakeWebhookReconcileProcessor {
@@ -116,7 +117,30 @@ export class PancakeWebhookReconcileProcessor {
     this.logger.log(
       `Processed webhook reconcile tenant=${tenantId} date=${dateLocal} mode=${reconcileMode} scheduledFor=${job.data.scheduledFor ?? 'n/a'} queueLagMs=${this.getQueueLagMs(job)} durationMs=${Date.now() - startedAt}`,
     );
+    void this.recordFreshnessMetric(job, startedAt);
     void this.logQueueMetrics();
+  }
+
+  /** Keeps the latest reconcile timings (job creation = first order update
+   * of the batch -> rollup rebuilt) for freshness diagnostics. Best effort. */
+  private async recordFreshnessMetric(job: Job<PancakeWebhookReconcileJobData>, startedAt: number) {
+    try {
+      const finishedAt = Date.now();
+      const client: any = (this.reconcileQueue as any)?.client;
+      if (!client?.lpush) return;
+      await client.lpush(RECONCILE_METRICS_KEY, JSON.stringify({
+        tenantId: job.data.tenantId,
+        dateLocal: job.data.dateLocal,
+        jobId: String(job.id ?? ''),
+        createdAt: job.timestamp,
+        finishedAt,
+        durationMs: finishedAt - startedAt,
+        createdToDoneMs: Math.max(0, finishedAt - (Number(job.timestamp) || finishedAt)),
+      }));
+      await client.ltrim(RECONCILE_METRICS_KEY, 0, 1999);
+    } catch {
+      // Diagnostics must never affect reconciliation.
+    }
   }
 
   @OnQueueFailed()
