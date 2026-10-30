@@ -2999,6 +2999,30 @@ async function diagnoseErpFreshness() {
       HAVING count(*) FILTER (WHERE o."createdAt" - o."insertedAt" > interval '10 minutes') > 0
       ORDER BY "over10m" DESC LIMIT 15`);
     for (const row of lateShops) console.log(`ERP freshness lateShop48h ${JSON.stringify(row)}`);
+    const lateOrders = await prisma.$queryRawUnsafe<any[]>(`
+      SELECT s.name AS store, o."posOrderId", o.status,
+        to_char(o."insertedAt" + interval '8 hours', 'MM-DD HH24:MI:SS') AS "createdInPancakePH",
+        to_char(o."createdAt" + interval '8 hours', 'MM-DD HH24:MI:SS') AS "savedInErpPH",
+        (SELECT json_agg(x ORDER BY x."receivedPH") FROM (
+          SELECT l.source, l."processStatus", lo."upsertStatus", lo.reason, lo.status AS "orderStatus",
+            to_char(l."receivedAt" + interval '8 hours', 'MM-DD HH24:MI:SS') AS "receivedPH"
+          FROM pancake_webhook_log_orders lo JOIN pancake_webhook_logs l ON l.id = lo."logId"
+          WHERE lo."shopId" = o."shopId" AND lo."orderId" = o."posOrderId" LIMIT 6) x) AS webhooks
+      FROM pos_orders o LEFT JOIN pos_stores s ON s."tenantId" = o."tenantId" AND s."shopId" = o."shopId"
+      WHERE o."insertedAt" > now() - interval '48 hours' AND o."createdAt" - o."insertedAt" > interval '10 minutes'
+      ORDER BY o."insertedAt" DESC LIMIT 12`);
+    for (const row of lateOrders) console.log(`ERP freshness lateOrder ${JSON.stringify(row)}`);
+    const quietShops = await prisma.$queryRawUnsafe<any[]>(`
+      SELECT t.name AS tenant, s.name AS store, s."shopId",
+        (SELECT count(*)::int FROM pos_orders o WHERE o."tenantId" = s."tenantId" AND o."shopId" = s."shopId" AND o."insertedAt" > now() - interval '7 days') AS "orders7d",
+        (SELECT count(*)::int FROM pancake_webhook_log_orders lo WHERE lo."shopId" = s."shopId" AND lo."createdAt" > now() - interval '7 days') AS "webhookOrders7d",
+        (SELECT to_char(max(lo."createdAt") + interval '8 hours', 'MM-DD HH24:MI') FROM pancake_webhook_log_orders lo WHERE lo."shopId" = s."shopId") AS "lastWebhookPH"
+      FROM pos_stores s JOIN tenants t ON t.id = s."tenantId"
+      WHERE s.status = 'ACTIVE' AND (s.enabled IS NULL OR s.enabled = true)
+      ORDER BY "orders7d" DESC LIMIT 40`);
+    for (const row of quietShops.filter((r) => r.orders7d > 0 && r.webhookOrders7d < r.orders7d)) {
+      console.log(`ERP freshness shopWebhookCoverage7d ${JSON.stringify(row)}`);
+    }
     const arrivalHourly = await prisma.$queryRawUnsafe<any[]>(`
       SELECT to_char(date_trunc('hour', o."insertedAt") + interval '8 hours', 'MM-DD HH24') AS hour, count(*)::int AS n,
         round(percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (o."createdAt" - o."insertedAt"))))::int AS "p50s",
