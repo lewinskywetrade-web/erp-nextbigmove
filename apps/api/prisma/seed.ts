@@ -2975,6 +2975,36 @@ async function diagnoseErpFreshness() {
       GROUP BY 1 ORDER BY 1`);
     console.log(`ERP freshness webhook hourly(PH): ${JSON.stringify(hourly)}`);
     const today = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+    // Arrival lag: Pancake order creation (insertedAt) -> first saved in ERP (createdAt).
+    const arrival = await prisma.$queryRawUnsafe<any[]>(`
+      SELECT t.name AS tenant, count(*)::int AS orders,
+        round(percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (o."createdAt" - o."insertedAt"))))::int AS "arrivalP50s",
+        round(percentile_cont(0.9) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (o."createdAt" - o."insertedAt"))))::int AS "arrivalP90s",
+        round(percentile_cont(0.99) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (o."createdAt" - o."insertedAt"))))::int AS "arrivalP99s",
+        count(*) FILTER (WHERE o."createdAt" - o."insertedAt" > interval '10 minutes')::int AS "over10m",
+        count(*) FILTER (WHERE o."createdAt" - o."insertedAt" > interval '1 hour')::int AS "over1h"
+      FROM pos_orders o JOIN tenants t ON t.id = o."tenantId"
+      WHERE o."insertedAt" > now() - interval '48 hours'
+      GROUP BY t.name ORDER BY orders DESC LIMIT 8`);
+    for (const row of arrival) console.log(`ERP freshness arrival48h ${JSON.stringify(row)}`);
+    const lateShops = await prisma.$queryRawUnsafe<any[]>(`
+      SELECT t.name AS tenant, s.name AS store, o."shopId", count(*)::int AS orders,
+        count(*) FILTER (WHERE o."createdAt" - o."insertedAt" > interval '10 minutes')::int AS "over10m",
+        round(percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (o."createdAt" - o."insertedAt"))))::int AS "p50s",
+        round(max(EXTRACT(EPOCH FROM (o."createdAt" - o."insertedAt"))))::int AS "maxS"
+      FROM pos_orders o JOIN tenants t ON t.id = o."tenantId"
+      LEFT JOIN pos_stores s ON s."tenantId" = o."tenantId" AND s."shopId" = o."shopId"
+      WHERE o."insertedAt" > now() - interval '48 hours'
+      GROUP BY t.name, s.name, o."shopId"
+      HAVING count(*) FILTER (WHERE o."createdAt" - o."insertedAt" > interval '10 minutes') > 0
+      ORDER BY "over10m" DESC LIMIT 15`);
+    for (const row of lateShops) console.log(`ERP freshness lateShop48h ${JSON.stringify(row)}`);
+    const arrivalHourly = await prisma.$queryRawUnsafe<any[]>(`
+      SELECT to_char(date_trunc('hour', o."insertedAt") + interval '8 hours', 'MM-DD HH24') AS hour, count(*)::int AS n,
+        round(percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (o."createdAt" - o."insertedAt"))))::int AS "p50s",
+        round(percentile_cont(0.9) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (o."createdAt" - o."insertedAt"))))::int AS "p90s"
+      FROM pos_orders o WHERE o."insertedAt" > now() - interval '30 hours' GROUP BY 1 ORDER BY 1`);
+    console.log(`ERP freshness arrival hourly(PH): ${JSON.stringify(arrivalHourly)}`);
     const rollups = await prisma.$queryRawUnsafe<any[]>(`
       SELECT t.name AS tenant,
         to_char(max(o."updatedAt") + interval '8 hours', 'MM-DD HH24:MI:SS') AS "lastOrderUpdatePH",
@@ -3015,6 +3045,8 @@ async function diagnoseErpFreshness() {
           oldestWaitingAgeS: oldestTs ? Math.round((Date.now() - Number(oldestTs)) / 1000) : null, recentFailures })}`);
       }
       const rawMetrics = await redis.lrange('erp:metrics:pancake-reconcile', 0, 1999);
+      const relaySubscribers = await redis.call('PUBSUB', 'NUMSUB', 'erp:ws:workflow-events').catch(() => null);
+      console.log(`ERP freshness realtime relay subscribers: ${JSON.stringify(relaySubscribers)}`);
       const metrics = rawMetrics.map((raw) => { try { return JSON.parse(raw); } catch { return null; } })
         .filter((m) => m && Number(m.finishedAt) > Date.now() - 3 * 3600 * 1000);
       const pct = (values: number[], p: number) => {
