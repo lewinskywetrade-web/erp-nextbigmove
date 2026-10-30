@@ -2950,7 +2950,7 @@ async function backfillAdSpendStoreAndTeamAttribution() {
  * so update delays on erp.nextbigmove.com can be explained from the deploy log. */
 async function diagnoseErpFreshness() {
   try {
-    const env = Object.fromEntries(['PANCAKE_WEBHOOK_RECONCILE_DELAY_MS', 'PANCAKE_WEBHOOK_RECONCILE_MIN_DELAY_MS',
+    const env = Object.fromEntries(['PANCAKE_WEBHOOK_RECONCILE_DELAY_MS', 'PANCAKE_WEBHOOK_RECONCILE_MIN_DELAY_MS', 'PANCAKE_WEBHOOK_RECONCILE_MAX_DELAY_MS',
       'PANCAKE_RECONCILE_PROCESSOR_CONCURRENCY', 'PANCAKE_WEBHOOK_PROCESSOR_CONCURRENCY', 'PANCAKE_RECONCILE_QUEUE_TIMEOUT_MS',
       'CACHE_TTL_SECONDS'].map((k) => [k, process.env[k] ?? '(default)']));
     console.log(`ERP freshness env: ${JSON.stringify(env)}`);
@@ -2968,13 +2968,6 @@ async function diagnoseErpFreshness() {
       WHERE l."receivedAt" > now() - interval '24 hours'
       GROUP BY t.name ORDER BY webhooks DESC LIMIT 12`);
     for (const row of webhooks) console.log(`ERP freshness webhooks24h ${JSON.stringify(row)}`);
-    const hourly = await prisma.$queryRawUnsafe<any[]>(`
-      SELECT to_char(date_trunc('hour', l."receivedAt") + interval '8 hours', 'MM-DD HH24') AS hour, count(*)::int AS n,
-        round(percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (l."processingStartedAt" - l."receivedAt"))))::int AS "waitP95s"
-      FROM pancake_webhook_logs l WHERE l."receivedAt" > now() - interval '12 hours'
-      GROUP BY 1 ORDER BY 1`);
-    console.log(`ERP freshness webhook hourly(PH): ${JSON.stringify(hourly)}`);
-    const today = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
     // Arrival lag: Pancake order creation (insertedAt) -> first saved in ERP (createdAt).
     const arrival = await prisma.$queryRawUnsafe<any[]>(`
       SELECT t.name AS tenant, count(*)::int AS orders,
@@ -2987,68 +2980,6 @@ async function diagnoseErpFreshness() {
       WHERE o."insertedAt" > now() - interval '48 hours'
       GROUP BY t.name ORDER BY orders DESC LIMIT 8`);
     for (const row of arrival) console.log(`ERP freshness arrival48h ${JSON.stringify(row)}`);
-    const lateShops = await prisma.$queryRawUnsafe<any[]>(`
-      SELECT t.name AS tenant, s.name AS store, o."shopId", count(*)::int AS orders,
-        count(*) FILTER (WHERE o."createdAt" - o."insertedAt" > interval '10 minutes')::int AS "over10m",
-        round(percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (o."createdAt" - o."insertedAt"))))::int AS "p50s",
-        round(max(EXTRACT(EPOCH FROM (o."createdAt" - o."insertedAt"))))::int AS "maxS"
-      FROM pos_orders o JOIN tenants t ON t.id = o."tenantId"
-      LEFT JOIN pos_stores s ON s."tenantId" = o."tenantId" AND s."shopId" = o."shopId"
-      WHERE o."insertedAt" > now() - interval '48 hours'
-      GROUP BY t.name, s.name, o."shopId"
-      HAVING count(*) FILTER (WHERE o."createdAt" - o."insertedAt" > interval '10 minutes') > 0
-      ORDER BY "over10m" DESC LIMIT 15`);
-    for (const row of lateShops) console.log(`ERP freshness lateShop48h ${JSON.stringify(row)}`);
-    const lateOrders = await prisma.$queryRawUnsafe<any[]>(`
-      SELECT s.name AS store, o."posOrderId", o.status,
-        to_char(o."insertedAt" + interval '8 hours', 'MM-DD HH24:MI:SS') AS "createdInPancakePH",
-        to_char(o."createdAt" + interval '8 hours', 'MM-DD HH24:MI:SS') AS "savedInErpPH",
-        (SELECT json_agg(x ORDER BY x."receivedPH") FROM (
-          SELECT l.source, l."processStatus", lo."upsertStatus", lo.reason, lo.status AS "orderStatus",
-            to_char(l."receivedAt" + interval '8 hours', 'MM-DD HH24:MI:SS') AS "receivedPH"
-          FROM pancake_webhook_log_orders lo JOIN pancake_webhook_logs l ON l.id = lo."logId"
-          WHERE lo."shopId" = o."shopId" AND lo."orderId" = o."posOrderId" LIMIT 6) x) AS webhooks
-      FROM pos_orders o LEFT JOIN pos_stores s ON s."tenantId" = o."tenantId" AND s."shopId" = o."shopId"
-      WHERE o."insertedAt" > now() - interval '48 hours' AND o."createdAt" - o."insertedAt" > interval '10 minutes'
-      ORDER BY o."insertedAt" DESC LIMIT 12`);
-    for (const row of lateOrders) console.log(`ERP freshness lateOrder ${JSON.stringify(row)}`);
-    const quietShops = await prisma.$queryRawUnsafe<any[]>(`
-      SELECT t.name AS tenant, s.name AS store, s."shopId",
-        (SELECT count(*)::int FROM pos_orders o WHERE o."tenantId" = s."tenantId" AND o."shopId" = s."shopId" AND o."insertedAt" > now() - interval '7 days') AS "orders7d",
-        (SELECT count(*)::int FROM pancake_webhook_log_orders lo WHERE lo."shopId" = s."shopId" AND lo."createdAt" > now() - interval '7 days') AS "webhookOrders7d",
-        (SELECT to_char(max(lo."createdAt") + interval '8 hours', 'MM-DD HH24:MI') FROM pancake_webhook_log_orders lo WHERE lo."shopId" = s."shopId") AS "lastWebhookPH"
-      FROM pos_stores s JOIN tenants t ON t.id = s."tenantId"
-      WHERE s.status = 'ACTIVE' AND (s.enabled IS NULL OR s.enabled = true)
-      ORDER BY "orders7d" DESC LIMIT 40`);
-    for (const row of quietShops.filter((r) => r.orders7d > 0 && r.webhookOrders7d < r.orders7d)) {
-      console.log(`ERP freshness shopWebhookCoverage7d ${JSON.stringify(row)}`);
-    }
-    const arrivalHourly = await prisma.$queryRawUnsafe<any[]>(`
-      SELECT to_char(date_trunc('hour', o."insertedAt") + interval '8 hours', 'MM-DD HH24') AS hour, count(*)::int AS n,
-        round(percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (o."createdAt" - o."insertedAt"))))::int AS "p50s",
-        round(percentile_cont(0.9) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (o."createdAt" - o."insertedAt"))))::int AS "p90s"
-      FROM pos_orders o WHERE o."insertedAt" > now() - interval '30 hours' GROUP BY 1 ORDER BY 1`);
-    console.log(`ERP freshness arrival hourly(PH): ${JSON.stringify(arrivalHourly)}`);
-    const rollups = await prisma.$queryRawUnsafe<any[]>(`
-      SELECT t.name AS tenant,
-        to_char(max(o."updatedAt") + interval '8 hours', 'MM-DD HH24:MI:SS') AS "lastOrderUpdatePH",
-        (SELECT to_char(max(r."updatedAt") + interval '8 hours', 'MM-DD HH24:MI:SS') FROM reconcile_marketing r
-          WHERE r."tenantId" = t.id AND r.date = $1::date) AS "lastRollupTodayPH",
-        round(EXTRACT(EPOCH FROM (max(o."updatedAt") - (SELECT max(r."updatedAt") FROM reconcile_marketing r
-          WHERE r."tenantId" = t.id AND r.date = $1::date))))::int AS "rollupBehindS",
-        count(*) FILTER (WHERE o."updatedAt" > (SELECT max(r."updatedAt") FROM reconcile_marketing r
-          WHERE r."tenantId" = t.id AND r.date = $1::date))::int AS "ordersNewerThanRollup"
-      FROM pos_orders o JOIN tenants t ON t.id = o."tenantId"
-      WHERE o."dateLocal" = $1
-      GROUP BY t.id, t.name ORDER BY count(*) DESC LIMIT 8`, today);
-    for (const row of rollups) console.log(`ERP freshness rollup ${today} ${JSON.stringify(row)}`);
-    const workflows = await prisma.$queryRawUnsafe<any[]>(`
-      SELECT t.name AS tenant, w.name, w.schedule, w.enabled,
-        (SELECT to_char(max(e."completedAt") + interval '8 hours', 'MM-DD HH24:MI') FROM workflow_executions e WHERE e."workflowId" = w.id) AS "lastCompletedPH",
-        (SELECT round(avg(e.duration) / 1000)::int FROM (SELECT duration FROM workflow_executions e2 WHERE e2."workflowId" = w.id AND e2.duration IS NOT NULL ORDER BY e2."createdAt" DESC LIMIT 10) e) AS "avgDurationS",
-        (SELECT count(*)::int FROM workflow_executions e WHERE e."workflowId" = w.id AND e.status::text IN ('PENDING','RUNNING')) AS "pendingOrRunning"
-      FROM workflows w JOIN tenants t ON t.id = w."tenantId" WHERE w.enabled = true ORDER BY t.name, w.name LIMIT 30`);
-    for (const row of workflows) console.log(`ERP freshness workflow ${JSON.stringify(row)}`);
     const host = process.env.REDIS_HOST || 'localhost';
     const port = parseInt(process.env.REDIS_PORT || '6379', 10);
     const redis = new Redis({ host, port, password: process.env.REDIS_PASSWORD || undefined, lazyConnect: true, maxRetriesPerRequest: 2 });
