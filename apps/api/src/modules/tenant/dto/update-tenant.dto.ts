@@ -40,13 +40,13 @@ export class UpdateTenantDto {
 
   @IsOptional()
   @IsNumber()
-  @Min(1)
+  @Min(0)
   @Max(10000)
   maxUsers?: number;
 
   @IsOptional()
   @IsNumber()
-  @Min(1)
+  @Min(0)
   @Max(100)
   maxIntegrations?: number;
 

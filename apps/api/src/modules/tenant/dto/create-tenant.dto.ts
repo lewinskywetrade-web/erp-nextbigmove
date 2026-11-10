@@ -62,12 +62,12 @@ export class CreateTenantDto {
   status: string;
 
   @IsNumber()
-  @Min(1)
+  @Min(0)
   @Max(10000)
   maxUsers: number;
 
   @IsNumber()
-  @Min(1)
+  @Min(0)
   @Max(100)
   maxIntegrations: number;
 

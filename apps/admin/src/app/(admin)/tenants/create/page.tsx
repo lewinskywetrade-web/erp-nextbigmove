@@ -45,12 +45,12 @@ const createTenantSchema = z.object({
   maxUsers: z
     .number({ invalid_type_error: 'Enter the maximum number of users' })
     .int('Use a whole number')
-    .min(1, 'Max users must be at least 1')
+    .min(0, 'Max users must be at least 1, or Unlimited (0)')
     .max(10000, 'Max users cannot exceed 10,000'),
   maxIntegrations: z
     .number({ invalid_type_error: 'Enter the maximum number of integrations' })
     .int('Use a whole number')
-    .min(1, 'Max integrations must be at least 1')
+    .min(0, 'Max integrations must be at least 1, or Unlimited (0)')
     .max(100, 'Max integrations cannot exceed 100'),
   trialDays: z
     .number({ invalid_type_error: 'Enter the trial length in days' })
@@ -201,7 +201,10 @@ export default function CreateTenantPage() {
 
   const planType = watch('planType');
   const status = watch('status');
+  const maxUsers = watch('maxUsers');
+  const maxIntegrations = watch('maxIntegrations');
   const trialDaysField = register('trialDays', { valueAsNumber: true });
+  const activePreset = planPresets.find((preset) => preset.value === planType) ?? planPresets[0];
 
   const handleTenantNameChange = (name: string) => {
     setValue('tenantSlug', createTenantSlugFromName(name), { shouldValidate: false });
@@ -451,26 +454,87 @@ export default function CreateTenantPage() {
               ) : null}
 
               <WmsFormField label="Max users">
-                <input
-                  {...register('maxUsers', { valueAsNumber: true })}
-                  type="number"
-                  min={1}
-                  max={10000}
-                  className="input"
-                />
+                <div className="flex items-center gap-2">
+                  {maxUsers === 0 ? (
+                    <input
+                      type="text"
+                      value="Unlimited"
+                      readOnly
+                      onClick={() =>
+                        setValue('maxUsers', activePreset.suggestedMaxUsers, {
+                          shouldDirty: true,
+                          shouldValidate: true,
+                        })
+                      }
+                      className="input flex-1 cursor-pointer bg-[#f4f8fa] font-semibold text-primary"
+                    />
+                  ) : null}
+                  <input
+                    {...register('maxUsers', { valueAsNumber: true })}
+                    type="number"
+                    min={1}
+                    max={10000}
+                    className={maxUsers === 0 ? 'sr-only' : 'input flex-1'}
+                  />
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setValue('maxUsers', maxUsers === 0 ? activePreset.suggestedMaxUsers : 0, {
+                        shouldDirty: true,
+                        shouldValidate: true,
+                      })
+                    }
+                    className={`btn btn-md shrink-0 ${
+                      maxUsers === 0 ? 'btn-primary' : 'btn-outline'
+                    }`}
+                  >
+                    Unlimited
+                  </button>
+                </div>
                 {errors.maxUsers ? (
                   <p className="mt-1.5 text-[12px] text-rose-600">{errors.maxUsers.message}</p>
                 ) : null}
               </WmsFormField>
 
               <WmsFormField label="Max integrations">
-                <input
-                  {...register('maxIntegrations', { valueAsNumber: true })}
-                  type="number"
-                  min={1}
-                  max={100}
-                  className="input"
-                />
+                <div className="flex items-center gap-2">
+                  {maxIntegrations === 0 ? (
+                    <input
+                      type="text"
+                      value="Unlimited"
+                      readOnly
+                      onClick={() =>
+                        setValue('maxIntegrations', activePreset.suggestedMaxIntegrations, {
+                          shouldDirty: true,
+                          shouldValidate: true,
+                        })
+                      }
+                      className="input flex-1 cursor-pointer bg-[#f4f8fa] font-semibold text-primary"
+                    />
+                  ) : null}
+                  <input
+                    {...register('maxIntegrations', { valueAsNumber: true })}
+                    type="number"
+                    min={1}
+                    max={100}
+                    className={maxIntegrations === 0 ? 'sr-only' : 'input flex-1'}
+                  />
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setValue(
+                        'maxIntegrations',
+                        maxIntegrations === 0 ? activePreset.suggestedMaxIntegrations : 0,
+                        { shouldDirty: true, shouldValidate: true },
+                      )
+                    }
+                    className={`btn btn-md shrink-0 ${
+                      maxIntegrations === 0 ? 'btn-primary' : 'btn-outline'
+                    }`}
+                  >
+                    Unlimited
+                  </button>
+                </div>
                 {errors.maxIntegrations ? (
                   <p className="mt-1.5 text-[12px] text-rose-600">{errors.maxIntegrations.message}</p>
                 ) : null}

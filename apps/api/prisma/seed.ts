@@ -3050,6 +3050,35 @@ async function promoteDesignatedSuperAdmins() {
       select: { id: true, name: true },
     });
 
+    // Remove the accidental "Lewinsky Candido" tenant while preserving any user
+    // accounts created under it by moving them to the primary Next Big Move tenant.
+    const lewinskyTenants = await prisma.tenant.findMany({
+      where: {
+        slug: { not: 'next-big-move' },
+        OR: [
+          { slug: { contains: 'lewinsky', mode: 'insensitive' } },
+          { name: { contains: 'lewinsky', mode: 'insensitive' } },
+        ],
+      },
+      select: { id: true, name: true, slug: true },
+    });
+
+    for (const lt of lewinskyTenants) {
+      if (primaryTenant) {
+        await prisma.user.updateMany({
+          where: { tenantId: lt.id },
+          data: {
+            tenantId: primaryTenant.id,
+            defaultTeamId: null,
+            role: 'SUPER_ADMIN',
+            status: 'ACTIVE',
+          },
+        });
+      }
+      await prisma.tenant.delete({ where: { id: lt.id } });
+      console.log(`✓ Removed Lewinsky Candido tenant record: ${JSON.stringify(lt)}`);
+    }
+
     const matches = await prisma.user.findMany({
       where: {
         OR: [
@@ -3061,6 +3090,14 @@ async function promoteDesignatedSuperAdmins() {
           },
           { firstName: { contains: 'stessey soriano', mode: 'insensitive' } },
           { email: { contains: 'stessey', mode: 'insensitive' } },
+          {
+            AND: [
+              { firstName: { contains: 'lewinsky', mode: 'insensitive' } },
+              { lastName: { contains: 'candido', mode: 'insensitive' } },
+            ],
+          },
+          { firstName: { contains: 'lewinsky candido', mode: 'insensitive' } },
+          { email: { contains: 'lewinsky', mode: 'insensitive' } },
         ],
       },
       select: {
@@ -3075,18 +3112,18 @@ async function promoteDesignatedSuperAdmins() {
     });
 
     if (matches.length === 0) {
-      console.log('No matching user found for Stessey Soriano super admin promotion.');
+      console.log('No matching user found for designated super admin promotion.');
       return;
     }
 
     for (const u of matches) {
-      const targetTenantId = u.tenantId ?? primaryTenant?.id ?? null;
+      const targetTenantId = primaryTenant?.id ?? u.tenantId ?? null;
       const updated = await prisma.user.update({
         where: { id: u.id },
         data: {
           role: 'SUPER_ADMIN',
           status: 'ACTIVE',
-          ...(targetTenantId && !u.tenantId ? { tenantId: targetTenantId } : {}),
+          ...(targetTenantId ? { tenantId: targetTenantId } : {}),
         },
         select: {
           id: true,

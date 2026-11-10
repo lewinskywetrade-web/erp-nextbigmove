@@ -130,7 +130,8 @@ export function TenantsTable({ tenants, isLoading }: TenantsTableProps) {
 }
 
 function UsageCell({ current, max }: { current: number; max: number }) {
-  const ratio = max > 0 ? Math.min(1, current / max) : 0;
+  const isUnlimited = max <= 0;
+  const ratio = !isUnlimited && max > 0 ? Math.min(1, current / max) : 0;
   const percent = Math.round(ratio * 100);
   const barColor =
     percent >= 90 ? 'bg-destructive/60' : percent >= 70 ? 'bg-warning/60' : 'bg-primary';
@@ -141,7 +142,9 @@ function UsageCell({ current, max }: { current: number; max: number }) {
         <span className="text-[12.5px] font-semibold tabular-nums text-primary">
           {current.toLocaleString()}
         </span>
-        <span className="text-[11px] text-[#7c8f9b]">/ {max.toLocaleString()}</span>
+        <span className="text-[11px] text-[#7c8f9b]">
+          / {isUnlimited ? 'Unlimited' : max.toLocaleString()}
+        </span>
       </div>
       <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-[#eef2f5]">
         <div

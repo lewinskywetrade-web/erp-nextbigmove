@@ -54,12 +54,12 @@ const updateTenantSchema = z.object({
   maxUsers: z
     .number({ invalid_type_error: 'Enter the maximum number of users' })
     .int('Use a whole number')
-    .min(1, 'Max users must be at least 1')
+    .min(0, 'Max users must be at least 1, or Unlimited (0)')
     .max(10000, 'Max users cannot exceed 10,000'),
   maxIntegrations: z
     .number({ invalid_type_error: 'Enter the maximum number of integrations' })
     .int('Use a whole number')
-    .min(1, 'Max integrations must be at least 1')
+    .min(0, 'Max integrations must be at least 1, or Unlimited (0)')
     .max(100, 'Max integrations cannot exceed 100'),
   wmsFulfillmentGoLiveAt: z.string().nullable().optional(),
   billingCompanyName: z.string().max(160).nullable().optional(),
@@ -110,10 +110,15 @@ export default function TenantDetailsPage() {
     register,
     handleSubmit,
     reset,
+    setValue,
+    watch,
     formState: { errors, isDirty },
   } = useForm<UpdateTenantForm>({
     resolver: zodResolver(updateTenantSchema),
   });
+
+  const watchedMaxUsers = watch('maxUsers');
+  const watchedMaxIntegrations = watch('maxIntegrations');
 
   // Keep the form baseline equal to the saved tenant so "unsaved changes"
   // and the Save button reflect real edits only.
@@ -440,28 +445,102 @@ export default function TenantDetailsPage() {
               </WmsFormField>
 
               <WmsFormField label="Max users">
-                <input
-                  {...register('maxUsers', { valueAsNumber: true })}
-                  type="number"
-                  min={1}
-                  max={10000}
-                  className="input"
-                  disabled={!canEdit}
-                />
+                <div className="flex items-center gap-2">
+                  {watchedMaxUsers === 0 ? (
+                    <input
+                      type="text"
+                      value="Unlimited"
+                      readOnly
+                      disabled={!canEdit}
+                      onClick={() => {
+                        if (!canEdit) return;
+                        setValue(
+                          'maxUsers',
+                          tenant.maxUsers > 0 ? tenant.maxUsers : 20,
+                          { shouldDirty: true, shouldValidate: true },
+                        );
+                      }}
+                      className="input flex-1 cursor-pointer bg-[#f4f8fa] font-semibold text-primary"
+                    />
+                  ) : null}
+                  <input
+                    {...register('maxUsers', { valueAsNumber: true })}
+                    type="number"
+                    min={1}
+                    max={10000}
+                    className={watchedMaxUsers === 0 ? 'sr-only' : 'input flex-1'}
+                    disabled={!canEdit}
+                  />
+                  <button
+                    type="button"
+                    disabled={!canEdit}
+                    onClick={() =>
+                      setValue(
+                        'maxUsers',
+                        watchedMaxUsers === 0 ? (tenant.maxUsers > 0 ? tenant.maxUsers : 20) : 0,
+                        { shouldDirty: true, shouldValidate: true },
+                      )
+                    }
+                    className={`btn btn-md shrink-0 ${
+                      watchedMaxUsers === 0 ? 'btn-primary' : 'btn-outline'
+                    }`}
+                  >
+                    Unlimited
+                  </button>
+                </div>
                 {errors.maxUsers ? (
                   <p className="mt-1.5 text-[12px] text-rose-600">{errors.maxUsers.message}</p>
                 ) : null}
               </WmsFormField>
 
               <WmsFormField label="Max integrations">
-                <input
-                  {...register('maxIntegrations', { valueAsNumber: true })}
-                  type="number"
-                  min={1}
-                  max={100}
-                  className="input"
-                  disabled={!canEdit}
-                />
+                <div className="flex items-center gap-2">
+                  {watchedMaxIntegrations === 0 ? (
+                    <input
+                      type="text"
+                      value="Unlimited"
+                      readOnly
+                      disabled={!canEdit}
+                      onClick={() => {
+                        if (!canEdit) return;
+                        setValue(
+                          'maxIntegrations',
+                          tenant.maxIntegrations > 0 ? tenant.maxIntegrations : 5,
+                          { shouldDirty: true, shouldValidate: true },
+                        );
+                      }}
+                      className="input flex-1 cursor-pointer bg-[#f4f8fa] font-semibold text-primary"
+                    />
+                  ) : null}
+                  <input
+                    {...register('maxIntegrations', { valueAsNumber: true })}
+                    type="number"
+                    min={1}
+                    max={100}
+                    className={watchedMaxIntegrations === 0 ? 'sr-only' : 'input flex-1'}
+                    disabled={!canEdit}
+                  />
+                  <button
+                    type="button"
+                    disabled={!canEdit}
+                    onClick={() =>
+                      setValue(
+                        'maxIntegrations',
+                        watchedMaxIntegrations === 0
+                          ? tenant.maxIntegrations > 0
+                            ? tenant.maxIntegrations
+                            : 5
+                          : 0,
+                        { shouldDirty: true, shouldValidate: true },
+                      )
+                    }
+                    className={`btn btn-md shrink-0 ${
+                      watchedMaxIntegrations === 0 ? 'btn-primary' : 'btn-outline'
+                    }`}
+                  >
+                    Unlimited
+                  </button>
+                </div>
                 {errors.maxIntegrations ? (
                   <p className="mt-1.5 text-[12px] text-rose-600">{errors.maxIntegrations.message}</p>
                 ) : null}
@@ -717,7 +796,7 @@ function UsageRow({
           {label}
         </div>
         <span className="text-[12px] font-semibold tabular-nums text-primary">
-          {current.toLocaleString()} / {max.toLocaleString()}
+          {current.toLocaleString()} / {max <= 0 ? 'Unlimited' : max.toLocaleString()}
         </span>
       </div>
       <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-[#eef2f5]">
