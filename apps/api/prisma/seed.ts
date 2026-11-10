@@ -3043,10 +3043,73 @@ async function normalizeUserEmails() {
   }
 }
 
+async function promoteDesignatedSuperAdmins() {
+  try {
+    const primaryTenant = await prisma.tenant.findFirst({
+      where: { slug: 'next-big-move' },
+      select: { id: true, name: true },
+    });
+
+    const matches = await prisma.user.findMany({
+      where: {
+        OR: [
+          {
+            AND: [
+              { firstName: { contains: 'stessey', mode: 'insensitive' } },
+              { lastName: { contains: 'soriano', mode: 'insensitive' } },
+            ],
+          },
+          { firstName: { contains: 'stessey soriano', mode: 'insensitive' } },
+          { email: { contains: 'stessey', mode: 'insensitive' } },
+        ],
+      },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        role: true,
+        status: true,
+        tenantId: true,
+      },
+    });
+
+    if (matches.length === 0) {
+      console.log('No matching user found for Stessey Soriano super admin promotion.');
+      return;
+    }
+
+    for (const u of matches) {
+      const targetTenantId = u.tenantId ?? primaryTenant?.id ?? null;
+      const updated = await prisma.user.update({
+        where: { id: u.id },
+        data: {
+          role: 'SUPER_ADMIN',
+          status: 'ACTIVE',
+          ...(targetTenantId && !u.tenantId ? { tenantId: targetTenantId } : {}),
+        },
+        select: {
+          id: true,
+          email: true,
+          firstName: true,
+          lastName: true,
+          role: true,
+          status: true,
+          tenantId: true,
+        },
+      });
+      console.log(`✓ Promoted user to SUPER_ADMIN: ${JSON.stringify(updated)}`);
+    }
+  } catch (err: any) {
+    console.error('Warning during designated super admin promotion:', err?.message || err);
+  }
+}
+
 async function main() {
   console.log('Starting database seed...');
   await ensureSuperAdmin();
   await normalizeUserEmails();
+  await promoteDesignatedSuperAdmins();
   await seedPermissions();
   await seedRoles();
   await ensureDefaultTeamsAndBackfill();
