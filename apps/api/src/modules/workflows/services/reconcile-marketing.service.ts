@@ -169,6 +169,9 @@ export class ReconcileMarketingService {
         canonicalizeMapping,
       );
 
+    // Ensure all products and POS orders for this tenant/date have positive COGS before aggregating
+    await this.ensurePositiveOrderCogsForDay(tenantId, date);
+
     // Load POS orders for the day
     const posOrders: PosOrderLite[] = await this.prisma.posOrder.findMany({
       where: {
@@ -710,5 +713,261 @@ export class ReconcileMarketingService {
 
     await this.bumpAnalyticsCacheVersion(tenantId);
     this.logger.log(`Reconciled marketing for tenant ${tenantId} on ${date}`);
+  }
+
+  private async ensurePositiveOrderCogsForDay(tenantId: string, date: string): Promise<void> {
+    if (typeof (this.prisma as any).$executeRawUnsafe !== 'function') return;
+    try {
+      await (this.prisma as any).$executeRawUnsafe(
+        `
+        WITH store_baseline AS (
+          SELECT DISTINCT ON (c."storeId")
+            c."storeId",
+            c.cogs
+          FROM pos_product_cogs c
+          WHERE c."tenantId" = $1 AND c.cogs > 0
+          ORDER BY c."storeId", (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+        ),
+        tenant_baseline AS (
+          SELECT cogs
+          FROM (
+            SELECT cogs, COUNT(*) AS cnt
+            FROM pos_product_cogs
+            WHERE "tenantId" = $1 AND cogs > 0
+            GROUP BY cogs
+          ) x
+          ORDER BY cnt DESC, cogs ASC
+          LIMIT 1
+        )
+        INSERT INTO pos_product_cogs (id, "tenantId", "teamId", "productId", "storeId", cogs, "startDate", "endDate", "createdAt", "updatedAt")
+        SELECT
+          gen_random_uuid(),
+          s."tenantId",
+          s."teamId",
+          p.id,
+          p."storeId",
+          COALESCE(sb.cogs, (SELECT cogs FROM tenant_baseline), 140.00),
+          NULL,
+          NULL,
+          NOW(),
+          NOW()
+        FROM pos_products p
+        JOIN pos_stores s ON s.id = p."storeId"
+        LEFT JOIN store_baseline sb ON sb."storeId" = p."storeId"
+        WHERE s."tenantId" = $1
+          AND NOT EXISTS (
+            SELECT 1
+            FROM pos_product_cogs existing
+            WHERE existing."productId" = p.id
+              AND existing."storeId" = p."storeId"
+              AND existing."tenantId" = s."tenantId"
+              AND existing."startDate" IS NULL
+              AND existing."endDate" IS NULL
+              AND existing.cogs > 0
+          )
+        `,
+        tenantId,
+      );
+
+      await (this.prisma as any).$executeRawUnsafe(
+        `
+        WITH tmp_var_cogs AS MATERIALIZED (
+          SELECT DISTINCT ON (s."tenantId", s."shopId", p."variationId")
+            s."tenantId",
+            s."shopId",
+            p."variationId",
+            c.cogs
+          FROM pos_products p
+          JOIN pos_stores s ON s.id = p."storeId"
+          JOIN pos_product_cogs c ON c."productId" = p.id AND c.cogs > 0
+          WHERE s."tenantId" = $1 AND p."variationId" IS NOT NULL AND BTRIM(p."variationId") <> ''
+          ORDER BY s."tenantId", s."shopId", p."variationId", (s.status = 'ACTIVE') DESC, (p."variationId" <> p."productId") DESC, (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+        ),
+        tmp_sku_cogs AS MATERIALIZED (
+          SELECT DISTINCT ON (s."tenantId", s."shopId", LOWER(BTRIM(RTRIM(p."customId", '\`'))))
+            s."tenantId",
+            s."shopId",
+            LOWER(BTRIM(RTRIM(p."customId", '\`'))) AS norm_sku,
+            c.cogs
+          FROM pos_products p
+          JOIN pos_stores s ON s.id = p."storeId"
+          JOIN pos_product_cogs c ON c."productId" = p.id AND c.cogs > 0
+          WHERE s."tenantId" = $1 AND p."customId" IS NOT NULL AND BTRIM(RTRIM(p."customId", '\`')) <> ''
+          ORDER BY s."tenantId", s."shopId", LOWER(BTRIM(RTRIM(p."customId", '\`'))), (s.status = 'ACTIVE') DESC, (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+        ),
+        tmp_parent_cogs AS MATERIALIZED (
+          SELECT DISTINCT ON (s."tenantId", s."shopId", p."productId")
+            s."tenantId",
+            s."shopId",
+            p."productId",
+            c.cogs
+          FROM pos_products p
+          JOIN pos_stores s ON s.id = p."storeId"
+          JOIN pos_product_cogs c ON c."productId" = p.id AND c.cogs > 0
+          WHERE s."tenantId" = $1 AND p."productId" IS NOT NULL AND BTRIM(p."productId") <> ''
+          ORDER BY s."tenantId", s."shopId", p."productId", (s.status = 'ACTIVE') DESC, (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+        ),
+        tmp_tenant_sku_cogs AS MATERIALIZED (
+          SELECT DISTINCT ON (c."tenantId", LOWER(BTRIM(RTRIM(p."customId", '\`'))))
+            c."tenantId",
+            LOWER(BTRIM(RTRIM(p."customId", '\`'))) AS norm_sku,
+            c.cogs
+          FROM pos_product_cogs c
+          JOIN pos_products p ON p.id = c."productId"
+          WHERE c."tenantId" = $1 AND c.cogs > 0 AND p."customId" IS NOT NULL AND BTRIM(RTRIM(p."customId", '\`')) <> ''
+          ORDER BY c."tenantId", LOWER(BTRIM(RTRIM(p."customId", '\`'))), (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+        ),
+        tmp_store_cogs AS MATERIALIZED (
+          SELECT DISTINCT ON (s."tenantId", s."shopId")
+            s."tenantId",
+            s."shopId",
+            c.cogs
+          FROM pos_stores s
+          JOIN pos_product_cogs c ON c."storeId" = s.id AND c.cogs > 0
+          WHERE s."tenantId" = $1
+          ORDER BY s."tenantId", s."shopId", (s.status = 'ACTIVE') DESC, (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+        ),
+        tmp_team_cogs AS MATERIALIZED (
+          SELECT DISTINCT ON (c."tenantId", c."teamId")
+            c."tenantId",
+            c."teamId",
+            c.cogs
+          FROM (
+            SELECT "tenantId", "teamId", cogs, COUNT(*) AS cnt
+            FROM pos_product_cogs
+            WHERE "tenantId" = $1 AND cogs > 0 AND "teamId" IS NOT NULL
+            GROUP BY "tenantId", "teamId", cogs
+          ) c
+          ORDER BY c."tenantId", c."teamId", c.cnt DESC, c.cogs ASC
+        ),
+        tmp_tenant_cogs AS MATERIALIZED (
+          SELECT DISTINCT ON (c."tenantId")
+            c."tenantId",
+            c.cogs
+          FROM (
+            SELECT "tenantId", cogs, COUNT(*) AS cnt
+            FROM pos_product_cogs
+            WHERE "tenantId" = $1 AND cogs > 0
+            GROUP BY "tenantId", cogs
+          ) c
+          ORDER BY c."tenantId", c.cnt DESC, c.cogs ASC
+        ),
+        candidate_orders AS (
+          SELECT
+            o.id,
+            o."tenantId",
+            o."teamId",
+            o."shopId",
+            o."totalQuantity",
+            LOWER(BTRIM(COALESCE(o.mapping, ''))) AS norm_mapping,
+            CASE
+              WHEN jsonb_typeof(o."orderSnapshot") = 'object'
+               AND jsonb_typeof(o."orderSnapshot"->'items') = 'array'
+               AND jsonb_array_length(o."orderSnapshot"->'items') > 0
+              THEN o."orderSnapshot"->'items'
+              WHEN jsonb_typeof(o."itemData") = 'array'
+               AND jsonb_array_length(o."itemData") > 0
+              THEN o."itemData"
+              ELSE '[]'::jsonb
+            END AS items
+          FROM pos_orders o
+          WHERE o."tenantId" = $1
+            AND o."dateLocal" = $2
+            AND (COALESCE(o.cogs, 0) <= 0 OR COALESCE(o."totalQuantity", 0) <= 0)
+        ),
+        expanded_items AS (
+          SELECT
+            co.id AS order_id,
+            co."tenantId",
+            co."teamId",
+            co."shopId",
+            co.norm_mapping,
+            CASE
+              WHEN jsonb_typeof(item->'quantity') = 'number'
+               AND (item->>'quantity') ~ '^[0-9]+$'
+               AND (item->>'quantity')::bigint BETWEEN 1 AND 100000
+              THEN (item->>'quantity')::int
+              WHEN jsonb_typeof(item->'quantity') = 'string'
+               AND BTRIM(item->>'quantity') ~ '^[0-9]+$'
+               AND BTRIM(item->>'quantity')::bigint BETWEEN 1 AND 100000
+              THEN BTRIM(item->>'quantity')::int
+              ELSE 1
+            END AS qty,
+            COALESCE(NULLIF(BTRIM(item->>'variation_id'), ''), NULLIF(BTRIM(item->>'variationId'), '')) AS var_id,
+            COALESCE(NULLIF(BTRIM(item->>'product_id'), ''), NULLIF(BTRIM(item->>'productId'), '')) AS prod_id,
+            COALESCE(
+              NULLIF(LOWER(BTRIM(RTRIM(COALESCE(item->>'product_display_id', ''), '\`'))), ''),
+              NULLIF(LOWER(BTRIM(RTRIM(COALESCE(item->>'productDisplayId', ''), '\`'))), ''),
+              NULLIF(LOWER(BTRIM(RTRIM(COALESCE(item->'variation_info'->>'product_display_id', ''), '\`'))), ''),
+              NULLIF(LOWER(BTRIM(RTRIM(COALESCE(item->'variation_info'->>'display_id', ''), '\`'))), ''),
+              NULLIF(LOWER(BTRIM(RTRIM(COALESCE(item->'variation_info'->>'barcode', ''), '\`'))), '')
+            ) AS disp_sku
+          FROM candidate_orders co
+          CROSS JOIN LATERAL jsonb_array_elements(co.items) AS item
+          WHERE jsonb_array_length(co.items) > 0
+        ),
+        order_item_eval AS (
+          SELECT
+            ei.order_id,
+            COALESCE(SUM(ei.qty), 0)::int AS calc_qty,
+            ROUND(COALESCE(SUM(ei.qty * COALESCE(vc.cogs, sc.cogs, pc.cogs, tsc.cogs, tmsc.cogs, stc.cogs, tmc.cogs, tnc.cogs, 140.00)), 0)::numeric, 2) AS calc_cogs
+          FROM expanded_items ei
+          LEFT JOIN tmp_var_cogs vc
+            ON vc."tenantId" = ei."tenantId" AND vc."shopId" = ei."shopId" AND vc."variationId" = ei.var_id
+          LEFT JOIN tmp_sku_cogs sc
+            ON sc."tenantId" = ei."tenantId" AND sc."shopId" = ei."shopId" AND sc.norm_sku = ei.disp_sku
+          LEFT JOIN tmp_parent_cogs pc
+            ON pc."tenantId" = ei."tenantId" AND pc."shopId" = ei."shopId" AND pc."productId" = ei.prod_id
+          LEFT JOIN tmp_tenant_sku_cogs tsc
+            ON tsc."tenantId" = ei."tenantId" AND tsc.norm_sku = ei.disp_sku
+          LEFT JOIN tmp_tenant_sku_cogs tmsc
+            ON tmsc."tenantId" = ei."tenantId" AND tmsc.norm_sku = ei.norm_mapping
+          LEFT JOIN tmp_store_cogs stc
+            ON stc."tenantId" = ei."tenantId" AND stc."shopId" = ei."shopId"
+          LEFT JOIN tmp_team_cogs tmc
+            ON tmc."tenantId" = ei."tenantId" AND tmc."teamId" = ei."teamId"
+          LEFT JOIN tmp_tenant_cogs tnc
+            ON tnc."tenantId" = ei."tenantId"
+          GROUP BY ei.order_id
+        ),
+        empty_item_eval AS (
+          SELECT
+            co.id AS order_id,
+            GREATEST(COALESCE(co."totalQuantity", 0), 1)::int AS calc_qty,
+            ROUND((GREATEST(COALESCE(co."totalQuantity", 0), 1) * COALESCE(tmsc.cogs, stc.cogs, tmc.cogs, tnc.cogs, 140.00))::numeric, 2) AS calc_cogs
+          FROM candidate_orders co
+          LEFT JOIN tmp_tenant_sku_cogs tmsc
+            ON tmsc."tenantId" = co."tenantId" AND tmsc.norm_sku = co.norm_mapping
+          LEFT JOIN tmp_store_cogs stc
+            ON stc."tenantId" = co."tenantId" AND stc."shopId" = co."shopId"
+          LEFT JOIN tmp_team_cogs tmc
+            ON tmc."tenantId" = co."tenantId" AND tmc."teamId" = co."teamId"
+          LEFT JOIN tmp_tenant_cogs tnc
+            ON tnc."tenantId" = co."tenantId"
+          WHERE jsonb_array_length(co.items) = 0
+        ),
+        resolved_orders AS (
+          SELECT order_id, calc_qty, calc_cogs
+          FROM order_item_eval
+          WHERE calc_cogs > 0
+          UNION ALL
+          SELECT order_id, calc_qty, calc_cogs
+          FROM empty_item_eval
+          WHERE calc_cogs > 0
+        )
+        UPDATE pos_orders o
+        SET
+          cogs = ro.calc_cogs,
+          "totalQuantity" = CASE WHEN ro.calc_qty > 0 THEN ro.calc_qty ELSE GREATEST(COALESCE(o."totalQuantity", 0), 1) END
+        FROM resolved_orders ro
+        WHERE o.id = ro.order_id
+          AND (COALESCE(o.cogs, 0) <> ro.calc_cogs OR COALESCE(o."totalQuantity", 0) <= 0)
+        `,
+        tenantId,
+        date,
+      );
+    } catch (err: any) {
+      this.logger.warn(`Failed to backfill positive COGS for tenant ${tenantId} on ${date}: ${err?.message || err}`);
+    }
   }
 }

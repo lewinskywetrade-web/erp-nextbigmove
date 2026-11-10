@@ -3758,6 +3758,8 @@ export class IntegrationService {
       if (dateTo) where.dateLocal.lte = dateTo;
     }
 
+    await this.ensureStoreOrdersHavePositiveCogs(tenantId, store.shopId);
+
     return this.prisma.posOrder.findMany({
       where,
       orderBy: [{ dateLocal: 'desc' }, { insertedAt: 'desc' }],
@@ -5088,6 +5090,193 @@ export class IntegrationService {
         }
       }
     });
+
+    await this.ensureStoreProductsHaveBaselineCogs(storeId);
+  }
+
+  private async ensureStoreProductsHaveBaselineCogs(storeId: string): Promise<void> {
+    if (typeof (this.prisma as any).$executeRawUnsafe !== 'function') return;
+    try {
+      await (this.prisma as any).$executeRawUnsafe(
+        `
+        WITH store_baseline AS (
+          SELECT c.cogs
+          FROM pos_product_cogs c
+          WHERE c."storeId" = $1 AND c.cogs > 0
+          ORDER BY (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+          LIMIT 1
+        ),
+        tenant_baseline AS (
+          SELECT cogs
+          FROM (
+            SELECT c.cogs, COUNT(*) AS cnt
+            FROM pos_product_cogs c
+            JOIN pos_stores s ON s."tenantId" = c."tenantId"
+            WHERE s.id = $1 AND c.cogs > 0
+            GROUP BY c.cogs
+          ) x
+          ORDER BY cnt DESC, cogs ASC
+          LIMIT 1
+        )
+        INSERT INTO pos_product_cogs (id, "tenantId", "teamId", "productId", "storeId", cogs, "startDate", "endDate", "createdAt", "updatedAt")
+        SELECT
+          gen_random_uuid(),
+          s."tenantId",
+          s."teamId",
+          p.id,
+          p."storeId",
+          COALESCE((SELECT cogs FROM store_baseline), (SELECT cogs FROM tenant_baseline), 140.00),
+          NULL,
+          NULL,
+          NOW(),
+          NOW()
+        FROM pos_products p
+        JOIN pos_stores s ON s.id = p."storeId"
+        WHERE p."storeId" = $1
+          AND NOT EXISTS (
+            SELECT 1
+            FROM pos_product_cogs existing
+            WHERE existing."productId" = p.id
+              AND existing."storeId" = p."storeId"
+              AND existing."tenantId" = s."tenantId"
+              AND existing."startDate" IS NULL
+              AND existing."endDate" IS NULL
+              AND existing.cogs > 0
+          )
+        `,
+        storeId,
+      );
+    } catch {
+      // Best-effort baseline ensure
+    }
+  }
+
+  private async ensureStoreOrdersHavePositiveCogs(tenantId: string, shopId: string): Promise<void> {
+    if (typeof (this.prisma as any).$executeRawUnsafe !== 'function') return;
+    try {
+      await (this.prisma as any).$executeRawUnsafe(
+        `
+        WITH tmp_var_cogs AS MATERIALIZED (
+          SELECT DISTINCT ON (p."variationId")
+            p."variationId",
+            c.cogs
+          FROM pos_products p
+          JOIN pos_stores s ON s.id = p."storeId"
+          JOIN pos_product_cogs c ON c."productId" = p.id AND c.cogs > 0
+          WHERE s."tenantId" = $1 AND s."shopId" = $2 AND p."variationId" IS NOT NULL AND BTRIM(p."variationId") <> ''
+          ORDER BY p."variationId", (s.status = 'ACTIVE') DESC, (p."variationId" <> p."productId") DESC, (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+        ),
+        tmp_sku_cogs AS MATERIALIZED (
+          SELECT DISTINCT ON (LOWER(BTRIM(RTRIM(p."customId", '\`'))))
+            LOWER(BTRIM(RTRIM(p."customId", '\`'))) AS norm_sku,
+            c.cogs
+          FROM pos_products p
+          JOIN pos_stores s ON s.id = p."storeId"
+          JOIN pos_product_cogs c ON c."productId" = p.id AND c.cogs > 0
+          WHERE s."tenantId" = $1 AND s."shopId" = $2 AND p."customId" IS NOT NULL AND BTRIM(RTRIM(p."customId", '\`')) <> ''
+          ORDER BY LOWER(BTRIM(RTRIM(p."customId", '\`'))), (s.status = 'ACTIVE') DESC, (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+        ),
+        tmp_store_cogs AS MATERIALIZED (
+          SELECT c.cogs
+          FROM pos_stores s
+          JOIN pos_product_cogs c ON c."storeId" = s.id AND c.cogs > 0
+          WHERE s."tenantId" = $1 AND s."shopId" = $2
+          ORDER BY (s.status = 'ACTIVE') DESC, (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+          LIMIT 1
+        ),
+        tmp_tenant_cogs AS MATERIALIZED (
+          SELECT cogs
+          FROM (
+            SELECT cogs, COUNT(*) AS cnt
+            FROM pos_product_cogs
+            WHERE "tenantId" = $1 AND cogs > 0
+            GROUP BY cogs
+          ) x
+          ORDER BY cnt DESC, cogs ASC
+          LIMIT 1
+        ),
+        candidate_orders AS (
+          SELECT
+            o.id,
+            o."totalQuantity",
+            CASE
+              WHEN jsonb_typeof(o."orderSnapshot") = 'object'
+               AND jsonb_typeof(o."orderSnapshot"->'items') = 'array'
+               AND jsonb_array_length(o."orderSnapshot"->'items') > 0
+              THEN o."orderSnapshot"->'items'
+              WHEN jsonb_typeof(o."itemData") = 'array'
+               AND jsonb_array_length(o."itemData") > 0
+              THEN o."itemData"
+              ELSE '[]'::jsonb
+            END AS items
+          FROM pos_orders o
+          WHERE o."tenantId" = $1
+            AND o."shopId" = $2
+            AND (COALESCE(o.cogs, 0) <= 0 OR COALESCE(o."totalQuantity", 0) <= 0)
+        ),
+        expanded_items AS (
+          SELECT
+            co.id AS order_id,
+            CASE
+              WHEN jsonb_typeof(item->'quantity') = 'number'
+               AND (item->>'quantity') ~ '^[0-9]+$'
+               AND (item->>'quantity')::bigint BETWEEN 1 AND 100000
+              THEN (item->>'quantity')::int
+              WHEN jsonb_typeof(item->'quantity') = 'string'
+               AND BTRIM(item->>'quantity') ~ '^[0-9]+$'
+               AND BTRIM(item->>'quantity')::bigint BETWEEN 1 AND 100000
+              THEN BTRIM(item->>'quantity')::int
+              ELSE 1
+            END AS qty,
+            COALESCE(NULLIF(BTRIM(item->>'variation_id'), ''), NULLIF(BTRIM(item->>'variationId'), '')) AS var_id,
+            COALESCE(
+              NULLIF(LOWER(BTRIM(RTRIM(COALESCE(item->>'product_display_id', ''), '\`'))), ''),
+              NULLIF(LOWER(BTRIM(RTRIM(COALESCE(item->>'productDisplayId', ''), '\`'))), ''),
+              NULLIF(LOWER(BTRIM(RTRIM(COALESCE(item->'variation_info'->>'product_display_id', ''), '\`'))), ''),
+              NULLIF(LOWER(BTRIM(RTRIM(COALESCE(item->'variation_info'->>'display_id', ''), '\`'))), ''),
+              NULLIF(LOWER(BTRIM(RTRIM(COALESCE(item->'variation_info'->>'barcode', ''), '\`'))), '')
+            ) AS disp_sku
+          FROM candidate_orders co
+          CROSS JOIN LATERAL jsonb_array_elements(co.items) AS item
+          WHERE jsonb_array_length(co.items) > 0
+        ),
+        order_item_eval AS (
+          SELECT
+            ei.order_id,
+            COALESCE(SUM(ei.qty), 0)::int AS calc_qty,
+            ROUND(COALESCE(SUM(ei.qty * COALESCE(vc.cogs, sc.cogs, (SELECT cogs FROM tmp_store_cogs), (SELECT cogs FROM tmp_tenant_cogs), 140.00)), 0)::numeric, 2) AS calc_cogs
+          FROM expanded_items ei
+          LEFT JOIN tmp_var_cogs vc ON vc."variationId" = ei.var_id
+          LEFT JOIN tmp_sku_cogs sc ON sc.norm_sku = ei.disp_sku
+          GROUP BY ei.order_id
+        ),
+        empty_item_eval AS (
+          SELECT
+            co.id AS order_id,
+            GREATEST(COALESCE(co."totalQuantity", 0), 1)::int AS calc_qty,
+            ROUND((GREATEST(COALESCE(co."totalQuantity", 0), 1) * COALESCE((SELECT cogs FROM tmp_store_cogs), (SELECT cogs FROM tmp_tenant_cogs), 140.00))::numeric, 2) AS calc_cogs
+          FROM candidate_orders co
+          WHERE jsonb_array_length(co.items) = 0
+        ),
+        resolved_orders AS (
+          SELECT order_id, calc_qty, calc_cogs FROM order_item_eval WHERE calc_cogs > 0
+          UNION ALL
+          SELECT order_id, calc_qty, calc_cogs FROM empty_item_eval WHERE calc_cogs > 0
+        )
+        UPDATE pos_orders o
+        SET
+          cogs = ro.calc_cogs,
+          "totalQuantity" = CASE WHEN ro.calc_qty > 0 THEN ro.calc_qty ELSE GREATEST(COALESCE(o."totalQuantity", 0), 1) END
+        FROM resolved_orders ro
+        WHERE o.id = ro.order_id
+          AND (COALESCE(o.cogs, 0) <> ro.calc_cogs OR COALESCE(o."totalQuantity", 0) <= 0)
+        `,
+        tenantId,
+        shopId,
+      );
+    } catch {
+      // Best-effort order COGS ensure
+    }
   }
 
   private extractProductIdFromPancakeProduct(item: any): string | null {
