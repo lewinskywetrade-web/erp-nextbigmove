@@ -1044,6 +1044,7 @@ export default function SalesAnalyticsPage() {
     const fulfillment = (kpis.sf_fees ?? 0) + (kpis.ff_fees ?? 0) + (kpis.if_fees ?? 0);
     const canceledCodAdj = excludeCanceled ? kpis.canceled_cod ?? 0 : 0;
     const restockingCodAdj = excludeRestocking ? kpis.restocking_cod ?? 0 : 0;
+    const abandonedCodAdj = excludeAbandoned ? kpis.abandoned_cod ?? 0 : 0;
     const rtsCodAdj = excludeRts ? kpis.rts_cod ?? 0 : 0;
     const excludedCogsCanceled = excludeCanceled ? kpis.cogs_canceled ?? 0 : 0;
     const excludedCogsRestocking = excludeRestocking ? kpis.cogs_restocking ?? 0 : 0;
@@ -1077,6 +1078,12 @@ export default function SalesAnalyticsPage() {
             Restocking COD
           </span>
           <span>{neg(restockingCodAdj)}</span>
+        </div>
+        <div className="flex justify-between text-slate-700">
+          <span className="flex items-center gap-1">
+            Abandoned COD
+          </span>
+          <span>{neg(abandonedCodAdj)}</span>
         </div>
         <div className="flex justify-between text-slate-700">
           <span className="flex items-center gap-1">
@@ -1211,6 +1218,7 @@ export default function SalesAnalyticsPage() {
       cogsTotal, cogsCanceled, cogsRestocking, cogsAdjusted,
       purchases: purchasesForCmRts, aov: aovForCmRts, revenueBase: revenueBaseForCmRts,
     } = forecast;
+    const cogsAbandoned = excludeAbandoned ? kpis.cogs_abandoned ?? 0 : 0;
     const filtersLabel = [
       `${startDate} → ${endDate}`,
       `${selectedMappings.length || 0}/${mappingOptions.length || 0} mappings`,
@@ -1264,6 +1272,10 @@ export default function SalesAnalyticsPage() {
         <div className="flex justify-between text-slate-800">
           <span>Excluded COGS Restocking</span>
           <span>{pos(cogsRestocking)}</span>
+        </div>
+        <div className="flex justify-between text-slate-800">
+          <span>Excluded COGS Abandoned</span>
+          <span>{pos(cogsAbandoned)}</span>
         </div>
         <div className="flex justify-between text-slate-800 border-t border-slate-100 pt-1">
           <span>COGS (adjusted)</span>

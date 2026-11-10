@@ -1679,7 +1679,109 @@ async function backfill2026OrderCogsAndReports() {
     }
     console.log(`✓ Updated ${updatedOrders} 2026 POS orders and ${updatedRemainingZeroOrders} catch-all remaining zero-COGS POS orders`);
 
-    // 7. Recompute POS COGS columns in reconcile_marketing, reconcile_sales, and reconcile_sales_attribution
+    // 6a. Align pos_orders.teamId with active pos_stores.teamId across all tenants
+    const alignedOrderTeams = await prisma.$executeRawUnsafe(`
+      UPDATE pos_orders o
+      SET "teamId" = s."teamId"
+      FROM pos_stores s
+      WHERE s."tenantId" = o."tenantId"
+        AND s."shopId" = o."shopId"
+        AND s.status = 'ACTIVE'
+        AND (s.enabled = true OR s.enabled IS NULL)
+        AND s."teamId" IS NOT NULL
+        AND o."teamId" IS DISTINCT FROM s."teamId"
+    `);
+    console.log(`✓ Aligned teamId on ${alignedOrderTeams} POS orders from active stores`);
+
+    // 6b. Normalize pos_orders.orderSnapshot->'items' and itemData so savedItemQuantity is never null
+    const normalizedOrderItems = await prisma.$executeRawUnsafe(`
+      WITH orders_needing_items AS (
+        SELECT
+          o.id,
+          GREATEST(COALESCE(o."totalQuantity", 1), 1) AS fallback_qty,
+          CASE
+            WHEN jsonb_typeof(o."orderSnapshot") = 'object'
+             AND jsonb_typeof(o."orderSnapshot"->'items') = 'array'
+             AND jsonb_array_length(o."orderSnapshot"->'items') > 0
+            THEN o."orderSnapshot"->'items'
+            WHEN jsonb_typeof(o."itemData") = 'array'
+             AND jsonb_array_length(o."itemData") > 0
+            THEN o."itemData"
+            ELSE NULL
+          END AS raw_arr,
+          CASE
+            WHEN jsonb_typeof(o."orderSnapshot") = 'object'
+             AND o."orderSnapshot" ? 'items'
+             AND jsonb_typeof(o."orderSnapshot"->'items') <> 'null'
+            THEN o."orderSnapshot"->'items'
+            ELSE o."itemData"
+          END AS effective_arr
+        FROM pos_orders o
+      ),
+      invalid_item_orders AS (
+        SELECT
+          oni.id,
+          CASE
+            WHEN oni.raw_arr IS NOT NULL THEN (
+              SELECT jsonb_agg(
+                CASE
+                  WHEN jsonb_typeof(elem) = 'object' THEN
+                    jsonb_set(
+                      elem,
+                      '{quantity}',
+                      to_jsonb(
+                        CASE
+                          WHEN jsonb_typeof(elem->'quantity') = 'number'
+                           AND (elem->>'quantity') ~ '^[1-9][0-9]*$'
+                           AND (elem->>'quantity')::bigint <= 100000
+                          THEN (elem->>'quantity')::int
+                          WHEN jsonb_typeof(elem->'quantity') = 'string'
+                           AND BTRIM(elem->>'quantity') ~ '^[1-9][0-9]*$'
+                           AND BTRIM(elem->>'quantity')::bigint <= 100000
+                          THEN BTRIM(elem->>'quantity')::int
+                          ELSE 1
+                        END
+                      ),
+                      true
+                    )
+                  ELSE jsonb_build_object('quantity', 1)
+                END
+              )
+              FROM jsonb_array_elements(oni.raw_arr) AS elem
+            )
+            ELSE jsonb_build_array(jsonb_build_object('quantity', oni.fallback_qty))
+          END AS fixed_items
+        FROM orders_needing_items oni
+        WHERE oni.effective_arr IS NULL
+           OR jsonb_typeof(oni.effective_arr) <> 'array'
+           OR jsonb_array_length(oni.effective_arr) = 0
+           OR EXISTS (
+             SELECT 1
+             FROM jsonb_array_elements(
+               CASE WHEN jsonb_typeof(oni.effective_arr) = 'array' THEN oni.effective_arr ELSE '[]'::jsonb END
+             ) AS elem
+             WHERE jsonb_typeof(elem) <> 'object'
+                OR NOT (
+                  (jsonb_typeof(elem->'quantity') = 'number' AND (elem->>'quantity') ~ '^[1-9][0-9]*$' AND (elem->>'quantity')::bigint <= 100000)
+                  OR (jsonb_typeof(elem->'quantity') = 'string' AND BTRIM(elem->>'quantity') ~ '^[1-9][0-9]*$' AND BTRIM(elem->>'quantity')::bigint <= 100000)
+                )
+           )
+      )
+      UPDATE pos_orders o
+      SET
+        "itemData" = iio.fixed_items,
+        "orderSnapshot" = jsonb_set(
+          CASE WHEN jsonb_typeof(o."orderSnapshot") = 'object' THEN o."orderSnapshot" ELSE '{}'::jsonb END,
+          '{items}',
+          iio.fixed_items,
+          true
+        )
+      FROM invalid_item_orders iio
+      WHERE o.id = iio.id
+    `);
+    console.log(`✓ Normalized item quantities on ${normalizedOrderItems} POS orders for exact Actual Units`);
+
+    // 7. Synchronize reconcile_marketing matchedOrders & POS metrics with pos_orders, then rollup reconcile_sales & reconcile_sales_attribution
     await prisma.$executeRawUnsafe(`
       UPDATE reconcile_marketing
       SET
@@ -1696,14 +1798,67 @@ async function backfill2026OrderCogsAndReports() {
     `);
 
     const pendingRollupMonths = await prisma.$queryRawUnsafe<Array<{ m: string }>>(`
-      SELECT DISTINCT TO_CHAR(date, 'YYYY-MM') AS m
-      FROM reconcile_marketing
-      WHERE (COALESCE("purchasesPos", 0) > 0 AND COALESCE("cogsPos", 0) <= 0)
-         OR (COALESCE("deliveredCount", 0) > 0 AND COALESCE("cogsDeliveredPos", 0) <= 0)
-         OR (
-           GREATEST(0, COALESCE("purchasesPos", 0) - COALESCE("canceledCount", 0) - COALESCE("restockingCount", 0) - COALESCE("rtsCount", 0) - GREATEST(0, COALESCE("repurchaseCount", 0) - COALESCE("repurchaseCanceledCount", 0) - COALESCE("repurchaseRestockingCount", 0) - COALESCE("repurchaseRtsCount", 0))) > 0
-           AND GREATEST(0, COALESCE("cogsPos", 0) - COALESCE("cogsCanceledPos", 0) - COALESCE("cogsRestockingPos", 0) - COALESCE("cogsRtsPos", 0) - GREATEST(0, COALESCE("repurchaseCogsPos", 0) - COALESCE("repurchaseCogsCanceledPos", 0) - COALESCE("repurchaseCogsRestockingPos", 0) - COALESCE("repurchaseCogsRtsPos", 0))) <= 0
-         )
+      WITH active_shops AS (
+        SELECT DISTINCT "tenantId", "shopId"
+        FROM pos_stores
+        WHERE status = 'ACTIVE' AND (enabled = true OR enabled IS NULL)
+      ),
+      pos_monthly AS (
+        SELECT
+          o."tenantId",
+          SUBSTRING(o."dateLocal" FROM 1 FOR 7) AS m,
+          COUNT(*)::int AS purchases,
+          ROUND(COALESCE(SUM(o.cod), 0)::numeric, 2) AS cod,
+          ROUND(COALESCE(SUM(o.cogs), 0)::numeric, 2) AS cogs,
+          COUNT(*) FILTER (WHERE o.status = 3)::int AS del_cnt,
+          ROUND(COALESCE(SUM(o.cogs) FILTER (WHERE o.status = 3), 0)::numeric, 2) AS del_cogs,
+          COUNT(*) FILTER (WHERE o.status = 6)::int AS can_cnt,
+          ROUND(COALESCE(SUM(o.cogs) FILTER (WHERE o.status = 6), 0)::numeric, 2) AS can_cogs,
+          COUNT(*) FILTER (WHERE o.status IN (4, 5))::int AS rts_cnt,
+          ROUND(COALESCE(SUM(o.cogs) FILTER (WHERE o.status IN (4, 5)), 0)::numeric, 2) AS rts_cogs,
+          COUNT(*) FILTER (WHERE o.status = 0 AND o."isAbandoned" = true)::int AS abn_cnt
+        FROM pos_orders o
+        JOIN active_shops s ON s."tenantId" = o."tenantId" AND s."shopId" = o."shopId"
+        WHERE COALESCE(o."isVoid", false) = false AND o.status IS DISTINCT FROM 7
+        GROUP BY 1, 2
+      ),
+      rm_monthly AS (
+        SELECT
+          rm."tenantId",
+          TO_CHAR(rm.date, 'YYYY-MM') AS m,
+          COALESCE(SUM(rm."purchasesPos"), 0)::int AS purchases,
+          ROUND(COALESCE(SUM(rm."codPos"), 0)::numeric, 2) AS cod,
+          ROUND(COALESCE(SUM(rm."cogsPos"), 0)::numeric, 2) AS cogs,
+          COALESCE(SUM(rm."deliveredCount"), 0)::int AS del_cnt,
+          ROUND(COALESCE(SUM(rm."cogsDeliveredPos"), 0)::numeric, 2) AS del_cogs,
+          COALESCE(SUM(rm."canceledCount"), 0)::int AS can_cnt,
+          ROUND(COALESCE(SUM(rm."cogsCanceledPos"), 0)::numeric, 2) AS can_cogs,
+          COALESCE(SUM(rm."rtsCount"), 0)::int AS rts_cnt,
+          ROUND(COALESCE(SUM(rm."cogsRtsPos"), 0)::numeric, 2) AS rts_cogs,
+          COALESCE(SUM(rm."currentAbandonedCount"), 0)::int AS abn_cnt,
+          COUNT(*) FILTER (
+            WHERE jsonb_typeof(rm."matchedOrders") <> 'array'
+               OR jsonb_array_length(CASE WHEN jsonb_typeof(rm."matchedOrders") = 'array' THEN rm."matchedOrders" ELSE '[]'::jsonb END) <> COALESCE(rm."purchasesPos", 0)
+               OR rm."matchedOrders"::text LIKE '%1379215499%'
+               OR rm."matchedOrders"::text LIKE '%1304950504%'
+          )::int AS bad_rows
+        FROM reconcile_marketing rm
+        GROUP BY 1, 2
+      )
+      SELECT DISTINCT COALESCE(p.m, r.m) AS m
+      FROM pos_monthly p
+      FULL OUTER JOIN rm_monthly r ON r."tenantId" = p."tenantId" AND r.m = p.m
+      WHERE COALESCE(p.purchases, 0) <> COALESCE(r.purchases, 0)
+         OR COALESCE(p.cod, 0) <> COALESCE(r.cod, 0)
+         OR COALESCE(p.cogs, 0) <> COALESCE(r.cogs, 0)
+         OR COALESCE(p.del_cnt, 0) <> COALESCE(r.del_cnt, 0)
+         OR COALESCE(p.del_cogs, 0) <> COALESCE(r.del_cogs, 0)
+         OR COALESCE(p.can_cnt, 0) <> COALESCE(r.can_cnt, 0)
+         OR COALESCE(p.can_cogs, 0) <> COALESCE(r.can_cogs, 0)
+         OR COALESCE(p.rts_cnt, 0) <> COALESCE(r.rts_cnt, 0)
+         OR COALESCE(p.rts_cogs, 0) <> COALESCE(r.rts_cogs, 0)
+         OR COALESCE(p.abn_cnt, 0) <> COALESCE(r.abn_cnt, 0)
+         OR COALESCE(r.bad_rows, 0) > 0
       UNION
       SELECT DISTINCT TO_CHAR(date, 'YYYY-MM') AS m
       FROM reconcile_sales
@@ -1729,6 +1884,8 @@ async function backfill2026OrderCogsAndReports() {
       alignedConflictStoreOrders > 0 ||
       alignedProductCogsScope > 0 ||
       consolidatedDuplicateStoreCogs > 0 ||
+      alignedOrderTeams > 0 ||
+      normalizedOrderItems > 0 ||
       pendingRollupMonths.length > 0;
     const allMonthRanges: Array<[string, string]> = [
       ['2026-12-01', '2027-01-01'],
@@ -1749,214 +1906,521 @@ async function backfill2026OrderCogsAndReports() {
       updatedRemainingZeroOrders > 0 ||
       alignedConflictStoreOrders > 0 ||
       alignedProductCogsScope > 0 ||
-      consolidatedDuplicateStoreCogs > 0;
+      consolidatedDuplicateStoreCogs > 0 ||
+      alignedOrderTeams > 0 ||
+      normalizedOrderItems > 0 ||
+      pendingRollupMonths.length > 0;
     const monthRanges: Array<[string, string]> = fullRollupNeeded
       ? allMonthRanges
       : allMonthRanges.filter(([mStart]) => updatedMonths.has(mStart.slice(0, 7)));
 
     for (const [mStart, mEnd] of monthRanges) {
-      const rmMatchedCount = await prisma.$executeRawUnsafe(`
-        WITH rm_orders AS (
-          SELECT DISTINCT
-            rm.id AS rm_id,
-            rm."tenantId",
-            (m->>'shopId') AS "shopId",
-            (m->>'posOrderId') AS "posOrderId"
-          FROM reconcile_marketing rm
-          CROSS JOIN LATERAL jsonb_array_elements(rm."matchedOrders") AS m
-          WHERE rm.date >= DATE '${mStart}'
-            AND rm.date < DATE '${mEnd}'
-            AND jsonb_typeof(rm."matchedOrders") = 'array'
-            AND jsonb_array_length(rm."matchedOrders") > 0
+      // 7a. Canonicalize matchedOrders on existing reconcile_marketing rows (bijection with active pos_orders on same date & team)
+      const rmCanonicalizedCount = await prisma.$executeRawUnsafe(`
+        WITH active_stores AS (
+          SELECT DISTINCT ON ("tenantId", "shopId")
+            "tenantId",
+            "shopId",
+            id AS store_id,
+            "teamId"
+          FROM pos_stores
+          WHERE status = 'ACTIVE' AND (enabled = true OR enabled IS NULL)
+          ORDER BY "tenantId", "shopId", "updatedAt" DESC
         ),
-        rm_matched AS (
-          SELECT DISTINCT ON (rmo.rm_id, rmo."posOrderId")
-            rmo.rm_id,
-            rmo."posOrderId",
-            o.cogs,
-            o.status,
-            o."isRepurchase"
-          FROM rm_orders rmo
-          JOIN pos_orders o
-            ON o."tenantId" = rmo."tenantId"
-           AND o."posOrderId" = rmo."posOrderId"
-           AND o.cogs > 0
-          ORDER BY
-            rmo.rm_id,
-            rmo."posOrderId",
-            (o."shopId" = rmo."shopId") DESC,
-            (o."isVoid" = false) DESC,
-            (o.status IS NULL OR o.status <> 7) DESC,
-            o."updatedAt" DESC
+        active_orders AS MATERIALIZED (
+          SELECT
+            o.id,
+            o."tenantId",
+            o."teamId",
+            o."shopId",
+            o."posOrderId",
+            o."dateLocal"::date AS order_date,
+            ROUND(COALESCE(o.cod, 0)::numeric, 2) AS cod
+          FROM pos_orders o
+          JOIN active_stores s
+            ON s."tenantId" = o."tenantId" AND s."shopId" = o."shopId"
+          WHERE o."dateLocal" >= '${mStart}'
+            AND o."dateLocal" < '${mEnd}'
+            AND COALESCE(o."isVoid", false) = false
+            AND o.status IS DISTINCT FROM 7
         ),
-        rm_cogs AS (
+        raw_rm_members AS (
           SELECT
             rm.id AS rm_id,
-            ROUND(COALESCE(SUM(o.cogs), 0)::numeric, 2) AS "cogsPos",
-            CASE WHEN COALESCE(rm."repurchaseCount", 0) <= 0 THEN 0::numeric(14,2)
-                 ELSE ROUND(COALESCE(SUM(CASE WHEN o."isRepurchase" = true THEN o.cogs ELSE 0 END), 0)::numeric, 2) END AS "repurchaseCogsPos",
-            CASE WHEN COALESCE(rm."canceledCount", 0) <= 0 THEN 0::numeric(14,2)
-                 ELSE ROUND(COALESCE(SUM(CASE WHEN o.status = 6 THEN o.cogs ELSE 0 END), 0)::numeric, 2) END AS "cogsCanceledPos",
-            CASE WHEN COALESCE(rm."repurchaseCanceledCount", 0) <= 0 THEN 0::numeric(14,2)
-                 ELSE ROUND(COALESCE(SUM(CASE WHEN o.status = 6 AND o."isRepurchase" = true THEN o.cogs ELSE 0 END), 0)::numeric, 2) END AS "repurchaseCogsCanceledPos",
-            CASE WHEN COALESCE(rm."restockingCount", 0) <= 0 THEN 0::numeric(14,2)
-                 ELSE ROUND(COALESCE(SUM(CASE WHEN o.status = 11 THEN o.cogs ELSE 0 END), 0)::numeric, 2) END AS "cogsRestockingPos",
-            CASE WHEN COALESCE(rm."repurchaseRestockingCount", 0) <= 0 THEN 0::numeric(14,2)
-                 ELSE ROUND(COALESCE(SUM(CASE WHEN o.status = 11 AND o."isRepurchase" = true THEN o.cogs ELSE 0 END), 0)::numeric, 2) END AS "repurchaseCogsRestockingPos",
-            CASE WHEN COALESCE(rm."rtsCount", 0) <= 0 THEN 0::numeric(14,2)
-                 ELSE ROUND(COALESCE(SUM(CASE WHEN o.status IN (4, 5) THEN o.cogs ELSE 0 END), 0)::numeric, 2) END AS "cogsRtsPos",
-            CASE WHEN COALESCE(rm."repurchaseRtsCount", 0) <= 0 THEN 0::numeric(14,2)
-                 ELSE ROUND(COALESCE(SUM(CASE WHEN o.status IN (4, 5) AND o."isRepurchase" = true THEN o.cogs ELSE 0 END), 0)::numeric, 2) END AS "repurchaseCogsRtsPos",
-            CASE WHEN COALESCE(rm."deliveredCount", 0) <= 0 THEN 0::numeric(14,2)
-                 ELSE ROUND(COALESCE(SUM(CASE WHEN o.status = 3 THEN o.cogs ELSE 0 END), 0)::numeric, 2) END AS "cogsDeliveredPos",
-            CASE WHEN COALESCE(rm."repurchaseDeliveredCount", 0) <= 0 THEN 0::numeric(14,2)
-                 ELSE ROUND(COALESCE(SUM(CASE WHEN o.status = 3 AND o."isRepurchase" = true THEN o.cogs ELSE 0 END), 0)::numeric, 2) END AS "repurchaseCogsDeliveredPos"
+            rm."tenantId",
+            rm."teamId" AS rm_team_id,
+            rm.date,
+            rm."adId",
+            rm.spend,
+            rm.impressions,
+            rm."updatedAt",
+            jsonb_array_length(CASE WHEN jsonb_typeof(rm."matchedOrders") = 'array' THEN rm."matchedOrders" ELSE '[]'::jsonb END) AS rm_member_count,
+            (m->>'shopId') AS raw_shop_id,
+            (m->>'posOrderId') AS raw_pos_order_id
           FROM reconcile_marketing rm
-          JOIN rm_matched o ON o.rm_id = rm.id
+          CROSS JOIN LATERAL jsonb_array_elements(
+            CASE WHEN jsonb_typeof(rm."matchedOrders") = 'array' THEN rm."matchedOrders" ELSE '[]'::jsonb END
+          ) AS m
+          WHERE rm.date >= DATE '${mStart}'
+            AND rm.date < DATE '${mEnd}'
+        ),
+        matched_candidates AS (
+          SELECT
+            r.rm_id,
+            r.rm_team_id,
+            r."adId",
+            r.spend,
+            r.impressions,
+            r."updatedAt",
+            ao.id AS order_id,
+            ao."shopId",
+            ao."posOrderId",
+            ao.cod,
+            ao."teamId" AS order_team_id,
+            (ao."shopId" = r.raw_shop_id) AS exact_shop
+          FROM raw_rm_members r
+          JOIN active_orders ao
+            ON ao."tenantId" = r."tenantId"
+           AND ao.order_date = r.date
+           AND ao."posOrderId" = r.raw_pos_order_id
+           AND ao."shopId" = CASE
+             WHEN r.raw_shop_id = '1379215499' THEN '1392241620'
+             WHEN r.raw_shop_id = '1304950504' THEN '1392240559'
+             ELSE r.raw_shop_id
+           END
+          WHERE r.rm_team_id IS NOT DISTINCT FROM ao."teamId"
+             OR (COALESCE(r.spend, 0) = 0 AND COALESCE(r.impressions, 0) = 0 AND r.rm_member_count = 1)
+        ),
+        unique_order_owner AS (
+          SELECT DISTINCT ON (mc.order_id)
+            mc.order_id,
+            mc.rm_id,
+            mc."shopId",
+            mc."posOrderId",
+            mc.cod,
+            mc.order_team_id
+          FROM matched_candidates mc
+          ORDER BY
+            mc.order_id,
+            mc.exact_shop DESC,
+            (mc.rm_team_id IS NOT DISTINCT FROM mc.order_team_id) DESC,
+            (COALESCE(mc.spend, 0) > 0 OR COALESCE(mc.impressions, 0) > 0) DESC,
+            (mc."adId" = mc."shopId" || '-' || mc."posOrderId") DESC,
+            mc."updatedAt" DESC,
+            mc.rm_id ASC
+        ),
+        rm_new_matched AS (
+          SELECT
+            rm.id AS rm_id,
+            COALESCE(
+              jsonb_agg(
+                jsonb_build_object(
+                  'shopId', uo."shopId",
+                  'posOrderId', uo."posOrderId",
+                  'cod', uo.cod::float8
+                )
+                ORDER BY uo."shopId", uo."posOrderId"
+              ) FILTER (WHERE uo.order_id IS NOT NULL),
+              '[]'::jsonb
+            ) AS new_matched_orders,
+            (ARRAY_AGG(uo.order_team_id) FILTER (WHERE uo.order_team_id IS NOT NULL))[1] AS inferred_team_id
+          FROM reconcile_marketing rm
+          LEFT JOIN unique_order_owner uo ON uo.rm_id = rm.id
           WHERE rm.date >= DATE '${mStart}'
             AND rm.date < DATE '${mEnd}'
           GROUP BY rm.id
         )
         UPDATE reconcile_marketing rm
         SET
-          "cogsPos" = rc."cogsPos",
-          "repurchaseCogsPos" = rc."repurchaseCogsPos",
-          "cogsCanceledPos" = rc."cogsCanceledPos",
-          "repurchaseCogsCanceledPos" = rc."repurchaseCogsCanceledPos",
-          "cogsRestockingPos" = rc."cogsRestockingPos",
-          "repurchaseCogsRestockingPos" = rc."repurchaseCogsRestockingPos",
-          "cogsRtsPos" = rc."cogsRtsPos",
-          "repurchaseCogsRtsPos" = rc."repurchaseCogsRtsPos",
-          "cogsDeliveredPos" = rc."cogsDeliveredPos",
-          "repurchaseCogsDeliveredPos" = rc."repurchaseCogsDeliveredPos",
+          "matchedOrders" = rnm.new_matched_orders,
+          "teamId" = CASE
+            WHEN COALESCE(rm.spend, 0) = 0 AND COALESCE(rm.impressions, 0) = 0 AND rnm.inferred_team_id IS NOT NULL
+            THEN rnm.inferred_team_id
+            ELSE rm."teamId"
+          END,
           "updatedAt" = NOW()
-        FROM rm_cogs rc
-        WHERE rm.id = rc.rm_id
-          AND rc."cogsPos" > 0
+        FROM rm_new_matched rnm
+        WHERE rm.id = rnm.rm_id
           AND (
-            COALESCE(rm."cogsPos", 0) <> rc."cogsPos"
-            OR COALESCE(rm."repurchaseCogsPos", 0) <> rc."repurchaseCogsPos"
-            OR COALESCE(rm."cogsCanceledPos", 0) <> rc."cogsCanceledPos"
-            OR COALESCE(rm."repurchaseCogsCanceledPos", 0) <> rc."repurchaseCogsCanceledPos"
-            OR COALESCE(rm."cogsRestockingPos", 0) <> rc."cogsRestockingPos"
-            OR COALESCE(rm."repurchaseCogsRestockingPos", 0) <> rc."repurchaseCogsRestockingPos"
-            OR COALESCE(rm."cogsRtsPos", 0) <> rc."cogsRtsPos"
-            OR COALESCE(rm."repurchaseCogsRtsPos", 0) <> rc."repurchaseCogsRtsPos"
-            OR COALESCE(rm."cogsDeliveredPos", 0) <> rc."cogsDeliveredPos"
-            OR COALESCE(rm."repurchaseCogsDeliveredPos", 0) <> rc."repurchaseCogsDeliveredPos"
+            rm."matchedOrders" IS DISTINCT FROM rnm.new_matched_orders
+            OR (
+              COALESCE(rm.spend, 0) = 0
+              AND COALESCE(rm.impressions, 0) = 0
+              AND rnm.inferred_team_id IS NOT NULL
+              AND rm."teamId" IS DISTINCT FROM rnm.inferred_team_id
+            )
           )
       `);
 
-      const rmFallbackCount = await prisma.$executeRawUnsafe(`
-        WITH tmp_store_cogs AS MATERIALIZED (
-          SELECT DISTINCT ON (s."tenantId", s."shopId")
-            s."tenantId",
-            LOWER(s.id::text) AS store_id,
-            s."shopId",
-            c.cogs
-          FROM pos_stores s
-          JOIN pos_product_cogs c ON c."storeId" = s.id AND c.cogs > 0
-          ORDER BY s."tenantId", s."shopId", (s.status = 'ACTIVE') DESC, (c."startDate" IS NULL) DESC, c."updatedAt" DESC
+      // 7b. Upsert synthetic reconcile_marketing rows for any unowned active pos_orders, then delete empty synthetic rows
+      const rmSyntheticUpsertedCount = await prisma.$executeRawUnsafe(`
+        WITH active_stores AS (
+          SELECT DISTINCT ON ("tenantId", "shopId")
+            "tenantId",
+            "shopId",
+            id AS store_id,
+            "teamId"
+          FROM pos_stores
+          WHERE status = 'ACTIVE' AND (enabled = true OR enabled IS NULL)
+          ORDER BY "tenantId", "shopId", "updatedAt" DESC
         ),
-        tmp_store_id_cogs AS MATERIALIZED (
-          SELECT DISTINCT ON (s."tenantId", LOWER(s.id::text))
-            s."tenantId",
-            LOWER(s.id::text) AS store_id,
-            c.cogs
-          FROM pos_stores s
-          JOIN pos_product_cogs c ON c."storeId" = s.id AND c.cogs > 0
-          ORDER BY s."tenantId", LOWER(s.id::text), (c."startDate" IS NULL) DESC, c."updatedAt" DESC
-        ),
-        tmp_team_cogs AS MATERIALIZED (
-          SELECT DISTINCT ON (c."tenantId", c."teamId")
-            c."tenantId",
-            c."teamId",
-            c.cogs
-          FROM (
-            SELECT "tenantId", "teamId", cogs, COUNT(*) AS cnt
-            FROM pos_product_cogs
-            WHERE cogs > 0 AND "teamId" IS NOT NULL
-            GROUP BY "tenantId", "teamId", cogs
-          ) c
-          ORDER BY c."tenantId", c."teamId", c.cnt DESC, c.cogs ASC
-        ),
-        tmp_tenant_cogs AS MATERIALIZED (
-          SELECT DISTINCT ON (c."tenantId")
-            c."tenantId",
-            c.cogs
-          FROM (
-            SELECT "tenantId", cogs, COUNT(*) AS cnt
-            FROM pos_product_cogs
-            WHERE cogs > 0
-            GROUP BY "tenantId", cogs
-          ) c
-          ORDER BY c."tenantId", c.cnt DESC, c.cogs ASC
-        ),
-        rm_needs_fix AS (
-          SELECT
-            rm.id AS rm_id,
-            GREATEST(COALESCE(rm."purchasesPos", 0), 1) AS total_orders,
-            GREATEST(0, COALESCE(rm."repurchaseCount", 0)) AS rep_orders,
-            GREATEST(0, COALESCE(rm."canceledCount", 0)) AS can_orders,
-            GREATEST(0, COALESCE(rm."repurchaseCanceledCount", 0)) AS rep_can_orders,
-            GREATEST(0, COALESCE(rm."restockingCount", 0)) AS rst_orders,
-            GREATEST(0, COALESCE(rm."repurchaseRestockingCount", 0)) AS rep_rst_orders,
-            GREATEST(0, COALESCE(rm."rtsCount", 0)) AS rts_orders,
-            GREATEST(0, COALESCE(rm."repurchaseRtsCount", 0)) AS rep_rts_orders,
-            GREATEST(0, COALESCE(rm."deliveredCount", 0)) AS del_orders,
-            GREATEST(0, COALESCE(rm."repurchaseDeliveredCount", 0)) AS rep_del_orders,
-            GREATEST(
-              CASE WHEN COALESCE(rm."cogsPos", 0) > 0 AND COALESCE(rm."purchasesPos", 0) > 0
-                   THEN ROUND((rm."cogsPos" / rm."purchasesPos")::numeric, 2)
-                   ELSE 0 END,
-              COALESCE(sic.cogs, stc.cogs, tmc.cogs, tnc.cogs, 140.00)
-            ) AS unit_cogs
+        owned_orders AS (
+          SELECT DISTINCT
+            rm."tenantId",
+            rm.date AS order_date,
+            (m->>'shopId') AS "shopId",
+            (m->>'posOrderId') AS "posOrderId"
           FROM reconcile_marketing rm
-          LEFT JOIN tmp_store_id_cogs sic
-            ON sic."tenantId" = rm."tenantId"
-           AND sic.store_id = CASE
-             WHEN rm.mapping LIKE 'pv::%' THEN SPLIT_PART(LOWER(rm.mapping), '::', 2)
-             WHEN rm.mapping LIKE 'ua::%' THEN SPLIT_PART(LOWER(rm.mapping), '::', 2)
-             ELSE NULL
-           END
-          LEFT JOIN tmp_store_cogs stc
-            ON stc."tenantId" = rm."tenantId"
-           AND stc."shopId" = CASE WHEN jsonb_typeof(rm.shops) = 'array' AND jsonb_array_length(rm.shops) > 0 THEN rm.shops->>0 ELSE NULL END
-          LEFT JOIN tmp_team_cogs tmc
-            ON tmc."tenantId" = rm."tenantId" AND tmc."teamId" = rm."teamId"
-          LEFT JOIN tmp_tenant_cogs tnc
-            ON tnc."tenantId" = rm."tenantId"
+          CROSS JOIN LATERAL jsonb_array_elements(
+            CASE WHEN jsonb_typeof(rm."matchedOrders") = 'array' THEN rm."matchedOrders" ELSE '[]'::jsonb END
+          ) AS m
           WHERE rm.date >= DATE '${mStart}'
             AND rm.date < DATE '${mEnd}'
-            AND (
-              (COALESCE(rm."purchasesPos", 0) > 0 AND COALESCE(rm."cogsPos", 0) <= 0)
-              OR (COALESCE(rm."deliveredCount", 0) > 0 AND COALESCE(rm."cogsDeliveredPos", 0) <= 0)
-              OR (
-                GREATEST(0, COALESCE(rm."purchasesPos", 0) - COALESCE(rm."canceledCount", 0) - COALESCE(rm."restockingCount", 0) - COALESCE(rm."rtsCount", 0) - GREATEST(0, COALESCE(rm."repurchaseCount", 0) - COALESCE(rm."repurchaseCanceledCount", 0) - COALESCE(rm."repurchaseRestockingCount", 0) - COALESCE(rm."repurchaseRtsCount", 0))) > 0
-                AND GREATEST(0, COALESCE(rm."cogsPos", 0) - COALESCE(rm."cogsCanceledPos", 0) - COALESCE(rm."cogsRestockingPos", 0) - COALESCE(rm."cogsRtsPos", 0) - GREATEST(0, COALESCE(rm."repurchaseCogsPos", 0) - COALESCE(rm."repurchaseCogsCanceledPos", 0) - COALESCE(rm."repurchaseCogsRestockingPos", 0) - COALESCE(rm."repurchaseCogsRtsPos", 0))) <= 0
+        ),
+        unowned_orders AS (
+          SELECT
+            o."tenantId",
+            COALESCE(o."teamId", s."teamId") AS "teamId",
+            o."dateLocal"::date AS order_date,
+            (o."shopId" || '-' || o."posOrderId") AS "adId",
+            COALESCE(NULLIF(BTRIM(o.mapping), ''), 'ua::' || LOWER(s.store_id::text)) AS mapping,
+            jsonb_build_array(
+              jsonb_build_object(
+                'shopId', o."shopId",
+                'posOrderId', o."posOrderId",
+                'cod', ROUND(COALESCE(o.cod, 0)::numeric, 2)::float8
               )
-            )
+            ) AS "matchedOrders",
+            jsonb_build_array(o."shopId") AS shops
+          FROM pos_orders o
+          JOIN active_stores s
+            ON s."tenantId" = o."tenantId" AND s."shopId" = o."shopId"
+          LEFT JOIN owned_orders oo
+            ON oo."tenantId" = o."tenantId"
+           AND oo.order_date = o."dateLocal"::date
+           AND oo."shopId" = o."shopId"
+           AND oo."posOrderId" = o."posOrderId"
+          WHERE o."dateLocal" >= '${mStart}'
+            AND o."dateLocal" < '${mEnd}'
+            AND COALESCE(o."isVoid", false) = false
+            AND o.status IS DISTINCT FROM 7
+            AND oo."posOrderId" IS NULL
+        )
+        INSERT INTO reconcile_marketing (
+          id, "tenantId", "teamId", date, "adId", "normalizedAdId",
+          "accountId", "campaignId", "campaignName", "adsetId", "adName",
+          "marketingAssociate", mapping, spend, clicks, "linkClicks", impressions, leads,
+          "matchedOrders", shops, "createdAt", "updatedAt"
+        )
+        SELECT
+          gen_random_uuid(),
+          u."tenantId",
+          u."teamId",
+          u.order_date,
+          u."adId",
+          NULL,
+          '',
+          '',
+          '',
+          '',
+          'POS Unmatched Order',
+          NULL,
+          u.mapping,
+          0, 0, 0, 0, 0,
+          u."matchedOrders",
+          u.shops,
+          NOW(),
+          NOW()
+        FROM unowned_orders u
+        ON CONFLICT ("tenantId", date, "adId") DO UPDATE
+        SET
+          "teamId" = EXCLUDED."teamId",
+          "matchedOrders" = EXCLUDED."matchedOrders",
+          shops = EXCLUDED.shops,
+          mapping = COALESCE(NULLIF(BTRIM(reconcile_marketing.mapping), ''), EXCLUDED.mapping),
+          "updatedAt" = NOW()
+      `);
+
+      await prisma.$executeRawUnsafe(`
+        DELETE FROM reconcile_marketing
+        WHERE date >= DATE '${mStart}'
+          AND date < DATE '${mEnd}'
+          AND COALESCE(spend, 0) = 0
+          AND COALESCE(impressions, 0) = 0
+          AND COALESCE(clicks, 0) = 0
+          AND COALESCE("linkClicks", 0) = 0
+          AND COALESCE(leads, 0) = 0
+          AND (
+            jsonb_typeof("matchedOrders") <> 'array'
+            OR jsonb_array_length("matchedOrders") = 0
+          )
+      `);
+
+      // 7c. Recompute ALL POS counts, CODs, COGS, and fees on reconcile_marketing from pos_orders via matchedOrders
+      const rmRecomputedCount = await prisma.$executeRawUnsafe(`
+        WITH rm_agg AS (
+          SELECT
+            rm.id AS rm_id,
+            COUNT(o.id)::int AS purchases_pos,
+            COUNT(o.id) FILTER (WHERE o."isRepurchase" = true)::int AS repurchase_count,
+            COUNT(o.id) FILTER (WHERE o.tracking IS NOT NULL AND o.tracking <> '')::int AS processed_purchases_pos,
+            COUNT(o.id) FILTER (WHERE o."isRepurchase" = true AND o.tracking IS NOT NULL AND o.tracking <> '')::int AS repurchase_processed_purchases_pos,
+            ROUND(COALESCE(SUM(o.cod), 0)::numeric, 2) AS cod_pos,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o."isRepurchase" = true), 0)::numeric, 2) AS repurchase_cod_pos,
+            ROUND(COALESCE(SUM(o.cogs), 0)::numeric, 2) AS cogs_pos,
+            ROUND(COALESCE(SUM(o.cogs) FILTER (WHERE o."isRepurchase" = true), 0)::numeric, 2) AS repurchase_cogs_pos,
+            ROUND(COALESCE(SUM(o.cogs) FILTER (WHERE o.status = 6), 0)::numeric, 2) AS cogs_canceled_pos,
+            ROUND(COALESCE(SUM(o.cogs) FILTER (WHERE o.status = 6 AND o."isRepurchase" = true), 0)::numeric, 2) AS repurchase_cogs_canceled_pos,
+            ROUND(COALESCE(SUM(o.cogs) FILTER (WHERE o.status = 11), 0)::numeric, 2) AS cogs_restocking_pos,
+            ROUND(COALESCE(SUM(o.cogs) FILTER (WHERE o.status = 11 AND o."isRepurchase" = true), 0)::numeric, 2) AS repurchase_cogs_restocking_pos,
+            ROUND(COALESCE(SUM(o.cogs) FILTER (WHERE o.status IN (4, 5)), 0)::numeric, 2) AS cogs_rts_pos,
+            ROUND(COALESCE(SUM(o.cogs) FILTER (WHERE o.status IN (4, 5) AND o."isRepurchase" = true), 0)::numeric, 2) AS repurchase_cogs_rts_pos,
+            ROUND(COALESCE(SUM(o.cogs) FILTER (WHERE o.status = 3), 0)::numeric, 2) AS cogs_delivered_pos,
+            ROUND(COALESCE(SUM(o.cogs) FILTER (WHERE o.status = 3 AND o."isRepurchase" = true), 0)::numeric, 2) AS repurchase_cogs_delivered_pos,
+            COUNT(o.id) FILTER (WHERE o.status = 0)::int AS unconfirmed_count,
+            COUNT(o.id) FILTER (WHERE o.status = 0 AND o."isRepurchase" = true)::int AS repurchase_unconfirmed_count,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o.status = 0), 0)::numeric, 2) AS unconfirmed_cod_pos,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o.status = 0 AND o."isRepurchase" = true), 0)::numeric, 2) AS repurchase_unconfirmed_cod_pos,
+            COUNT(o.id) FILTER (WHERE o."wasAbandonedCart" = true OR o."isAbandoned" = true)::int AS abandoned_count,
+            COUNT(o.id) FILTER (WHERE (o."wasAbandonedCart" = true OR o."isAbandoned" = true) AND o."isRepurchase" = true)::int AS repurchase_abandoned_count,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o."wasAbandonedCart" = true OR o."isAbandoned" = true), 0)::numeric, 2) AS abandoned_cod_pos,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE (o."wasAbandonedCart" = true OR o."isAbandoned" = true) AND o."isRepurchase" = true), 0)::numeric, 2) AS repurchase_abandoned_cod_pos,
+            COUNT(o.id) FILTER (WHERE o.status = 0 AND o."isAbandoned" = true)::int AS current_abandoned_count,
+            COUNT(o.id) FILTER (WHERE o.status = 0 AND o."isAbandoned" = true AND o."isRepurchase" = true)::int AS repurchase_current_abandoned_count,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o.status = 0 AND o."isAbandoned" = true), 0)::numeric, 2) AS current_abandoned_cod_pos,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o.status = 0 AND o."isAbandoned" = true AND o."isRepurchase" = true), 0)::numeric, 2) AS repurchase_current_abandoned_cod_pos,
+            COUNT(o.id) FILTER (WHERE o.status = 1)::int AS confirmed_count,
+            COUNT(o.id) FILTER (WHERE o.status = 1 AND o."isRepurchase" = true)::int AS repurchase_confirmed_count,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o.status = 1), 0)::numeric, 2) AS confirmed_cod_pos,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o.status = 1 AND o."isRepurchase" = true), 0)::numeric, 2) AS repurchase_confirmed_cod_pos,
+            COUNT(o.id) FILTER (WHERE o.status = 13)::int AS printed_count,
+            COUNT(o.id) FILTER (WHERE o.status = 13 AND o."isRepurchase" = true)::int AS repurchase_printed_count,
+            0::int AS deleted_count,
+            0::int AS repurchase_deleted_count,
+            COUNT(o.id) FILTER (WHERE o.status = 11)::int AS restocking_count,
+            COUNT(o.id) FILTER (WHERE o.status = 11 AND o."isRepurchase" = true)::int AS repurchase_restocking_count,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o.status = 11), 0)::numeric, 2) AS restocking_cod_pos,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o.status = 11 AND o."isRepurchase" = true), 0)::numeric, 2) AS repurchase_restocking_cod_pos,
+            COUNT(o.id) FILTER (WHERE o.status IN (9, 13))::int AS waiting_pickup_count,
+            COUNT(o.id) FILTER (WHERE o.status IN (9, 13) AND o."isRepurchase" = true)::int AS repurchase_waiting_pickup_count,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o.status IN (9, 13)), 0)::numeric, 2) AS waiting_pickup_cod_pos,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o.status IN (9, 13) AND o."isRepurchase" = true), 0)::numeric, 2) AS repurchase_waiting_pickup_cod_pos,
+            COUNT(o.id) FILTER (WHERE o.status = 2)::int AS shipped_count,
+            COUNT(o.id) FILTER (WHERE o.status = 2 AND o."isRepurchase" = true)::int AS repurchase_shipped_count,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o.status = 2), 0)::numeric, 2) AS shipped_cod_pos,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o.status = 2 AND o."isRepurchase" = true), 0)::numeric, 2) AS repurchase_shipped_cod_pos,
+            COUNT(o.id) FILTER (WHERE o.status = 3)::int AS delivered_count,
+            COUNT(o.id) FILTER (WHERE o.status = 3 AND o."isRepurchase" = true)::int AS repurchase_delivered_count,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o.status = 3), 0)::numeric, 2) AS delivered_cod_pos,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o.status = 3 AND o."isRepurchase" = true), 0)::numeric, 2) AS repurchase_delivered_cod_pos,
+            COUNT(o.id) FILTER (WHERE o.status = 6)::int AS canceled_count,
+            COUNT(o.id) FILTER (WHERE o.status = 6 AND o."isRepurchase" = true)::int AS repurchase_canceled_count,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o.status = 6), 0)::numeric, 2) AS canceled_cod_pos,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o.status = 6 AND o."isRepurchase" = true), 0)::numeric, 2) AS repurchase_canceled_cod_pos,
+            COUNT(o.id) FILTER (WHERE o.status IN (4, 5))::int AS rts_count,
+            COUNT(o.id) FILTER (WHERE o.status IN (4, 5) AND o."isRepurchase" = true)::int AS repurchase_rts_count,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o.status IN (4, 5)), 0)::numeric, 2) AS rts_cod_pos,
+            ROUND(COALESCE(SUM(o.cod) FILTER (WHERE o.status IN (4, 5) AND o."isRepurchase" = true), 0)::numeric, 2) AS repurchase_rts_cod_pos
+          FROM reconcile_marketing rm
+          LEFT JOIN LATERAL jsonb_array_elements(
+            CASE WHEN jsonb_typeof(rm."matchedOrders") = 'array' THEN rm."matchedOrders" ELSE '[]'::jsonb END
+          ) AS m ON TRUE
+          LEFT JOIN pos_orders o
+            ON o."tenantId" = rm."tenantId"
+           AND o."shopId" = (m->>'shopId')
+           AND o."posOrderId" = (m->>'posOrderId')
+           AND o."dateLocal" = TO_CHAR(rm.date, 'YYYY-MM-DD')
+           AND COALESCE(o."isVoid", false) = false
+           AND o.status IS DISTINCT FROM 7
+          WHERE rm.date >= DATE '${mStart}'
+            AND rm.date < DATE '${mEnd}'
+          GROUP BY rm.id
+        ),
+        rm_final AS (
+          SELECT
+            a.*,
+            ROUND((GREATEST(a.purchases_pos - a.canceled_count, 0) * 60)::numeric, 2) AS sf_pos,
+            ROUND((GREATEST(a.repurchase_count - a.repurchase_canceled_count, 0) * 60)::numeric, 2) AS repurchase_sf_pos,
+            ROUND((GREATEST(a.purchases_pos - a.canceled_count, 0) * 25)::numeric, 2) AS ff_pos,
+            ROUND((GREATEST(a.repurchase_count - a.repurchase_canceled_count, 0) * 25)::numeric, 2) AS repurchase_ff_pos,
+            ROUND((GREATEST(a.purchases_pos - a.canceled_count, 0) * 5)::numeric, 2) AS if_pos,
+            ROUND((GREATEST(a.repurchase_count - a.repurchase_canceled_count, 0) * 5)::numeric, 2) AS repurchase_if_pos,
+            ROUND(((a.shipped_count + a.delivered_count + a.rts_count) * 60)::numeric, 2) AS sf_sdr_pos,
+            ROUND(((a.repurchase_shipped_count + a.repurchase_delivered_count + a.repurchase_rts_count) * 60)::numeric, 2) AS repurchase_sf_sdr_pos,
+            ROUND(((a.shipped_count + a.delivered_count + a.rts_count) * 25)::numeric, 2) AS ff_sdr_pos,
+            ROUND(((a.repurchase_shipped_count + a.repurchase_delivered_count + a.repurchase_rts_count) * 25)::numeric, 2) AS repurchase_ff_sdr_pos,
+            ROUND(((a.shipped_count + a.delivered_count + a.rts_count) * 5)::numeric, 2) AS if_sdr_pos,
+            ROUND(((a.repurchase_shipped_count + a.repurchase_delivered_count + a.repurchase_rts_count) * 5)::numeric, 2) AS repurchase_if_sdr_pos,
+            ROUND((GREATEST(a.cod_pos - a.rts_cod_pos - a.canceled_cod_pos, 0) * 0.0224)::numeric, 2) AS cod_fee_pos,
+            ROUND((GREATEST(a.repurchase_cod_pos - a.repurchase_rts_cod_pos - a.repurchase_canceled_cod_pos, 0) * 0.0224)::numeric, 2) AS repurchase_cod_fee_pos,
+            ROUND((a.delivered_cod_pos * 0.0224)::numeric, 2) AS cod_fee_delivered_pos,
+            ROUND((a.repurchase_delivered_cod_pos * 0.0224)::numeric, 2) AS repurchase_cod_fee_delivered_pos
+          FROM rm_agg a
         )
         UPDATE reconcile_marketing rm
         SET
-          "cogsPos" = ROUND((f.total_orders * f.unit_cogs)::numeric, 2),
-          "repurchaseCogsPos" = ROUND((f.rep_orders * f.unit_cogs)::numeric, 2),
-          "cogsCanceledPos" = ROUND((f.can_orders * f.unit_cogs)::numeric, 2),
-          "repurchaseCogsCanceledPos" = ROUND((f.rep_can_orders * f.unit_cogs)::numeric, 2),
-          "cogsRestockingPos" = ROUND((f.rst_orders * f.unit_cogs)::numeric, 2),
-          "repurchaseCogsRestockingPos" = ROUND((f.rep_rst_orders * f.unit_cogs)::numeric, 2),
-          "cogsRtsPos" = ROUND((f.rts_orders * f.unit_cogs)::numeric, 2),
-          "repurchaseCogsRtsPos" = ROUND((f.rep_rts_orders * f.unit_cogs)::numeric, 2),
-          "cogsDeliveredPos" = ROUND((f.del_orders * f.unit_cogs)::numeric, 2),
-          "repurchaseCogsDeliveredPos" = ROUND((f.rep_del_orders * f.unit_cogs)::numeric, 2),
+          "purchasesPos" = f.purchases_pos,
+          "repurchaseCount" = f.repurchase_count,
+          "processedPurchasesPos" = f.processed_purchases_pos,
+          "repurchaseProcessedPurchasesPos" = f.repurchase_processed_purchases_pos,
+          "codPos" = f.cod_pos,
+          "repurchaseCodPos" = f.repurchase_cod_pos,
+          "cogsPos" = f.cogs_pos,
+          "repurchaseCogsPos" = f.repurchase_cogs_pos,
+          "cogsCanceledPos" = f.cogs_canceled_pos,
+          "repurchaseCogsCanceledPos" = f.repurchase_cogs_canceled_pos,
+          "cogsRestockingPos" = f.cogs_restocking_pos,
+          "repurchaseCogsRestockingPos" = f.repurchase_cogs_restocking_pos,
+          "cogsRtsPos" = f.cogs_rts_pos,
+          "repurchaseCogsRtsPos" = f.repurchase_cogs_rts_pos,
+          "cogsDeliveredPos" = f.cogs_delivered_pos,
+          "repurchaseCogsDeliveredPos" = f.repurchase_cogs_delivered_pos,
+          "unconfirmedCount" = f.unconfirmed_count,
+          "repurchaseUnconfirmedCount" = f.repurchase_unconfirmed_count,
+          "unconfirmedCodPos" = f.unconfirmed_cod_pos,
+          "repurchaseUnconfirmedCodPos" = f.repurchase_unconfirmed_cod_pos,
+          "abandonedCount" = f.abandoned_count,
+          "repurchaseAbandonedCount" = f.repurchase_abandoned_count,
+          "abandonedCodPos" = f.abandoned_cod_pos,
+          "repurchaseAbandonedCodPos" = f.repurchase_abandoned_cod_pos,
+          "currentAbandonedCount" = f.current_abandoned_count,
+          "repurchaseCurrentAbandonedCount" = f.repurchase_current_abandoned_count,
+          "currentAbandonedCodPos" = f.current_abandoned_cod_pos,
+          "repurchaseCurrentAbandonedCodPos" = f.repurchase_current_abandoned_cod_pos,
+          "confirmedCount" = f.confirmed_count,
+          "repurchaseConfirmedCount" = f.repurchase_confirmed_count,
+          "confirmedCodPos" = f.confirmed_cod_pos,
+          "repurchaseConfirmedCodPos" = f.repurchase_confirmed_cod_pos,
+          "printedCount" = f.printed_count,
+          "repurchasePrintedCount" = f.repurchase_printed_count,
+          "deletedCount" = f.deleted_count,
+          "repurchaseDeletedCount" = f.repurchase_deleted_count,
+          "restockingCount" = f.restocking_count,
+          "repurchaseRestockingCount" = f.repurchase_restocking_count,
+          "restockingCodPos" = f.restocking_cod_pos,
+          "repurchaseRestockingCodPos" = f.repurchase_restocking_cod_pos,
+          "waitingPickupCount" = f.waiting_pickup_count,
+          "repurchaseWaitingPickupCount" = f.repurchase_waiting_pickup_count,
+          "waitingPickupCodPos" = f.waiting_pickup_cod_pos,
+          "repurchaseWaitingPickupCodPos" = f.repurchase_waiting_pickup_cod_pos,
+          "shippedCount" = f.shipped_count,
+          "repurchaseShippedCount" = f.repurchase_shipped_count,
+          "shippedCodPos" = f.shipped_cod_pos,
+          "repurchaseShippedCodPos" = f.repurchase_shipped_cod_pos,
+          "deliveredCount" = f.delivered_count,
+          "repurchaseDeliveredCount" = f.repurchase_delivered_count,
+          "deliveredCodPos" = f.delivered_cod_pos,
+          "repurchaseDeliveredCodPos" = f.repurchase_delivered_cod_pos,
+          "canceledCount" = f.canceled_count,
+          "repurchaseCanceledCount" = f.repurchase_canceled_count,
+          "canceledCodPos" = f.canceled_cod_pos,
+          "repurchaseCanceledCodPos" = f.repurchase_canceled_cod_pos,
+          "rtsCount" = f.rts_count,
+          "repurchaseRtsCount" = f.repurchase_rts_count,
+          "rtsCodPos" = f.rts_cod_pos,
+          "repurchaseRtsCodPos" = f.repurchase_rts_cod_pos,
+          "sfPos" = f.sf_pos,
+          "repurchaseSfPos" = f.repurchase_sf_pos,
+          "ffPos" = f.ff_pos,
+          "repurchaseFfPos" = f.repurchase_ff_pos,
+          "ifPos" = f.if_pos,
+          "repurchaseIfPos" = f.repurchase_if_pos,
+          "sfSdrPos" = f.sf_sdr_pos,
+          "repurchaseSfSdrPos" = f.repurchase_sf_sdr_pos,
+          "ffSdrPos" = f.ff_sdr_pos,
+          "repurchaseFfSdrPos" = f.repurchase_ff_sdr_pos,
+          "ifSdrPos" = f.if_sdr_pos,
+          "repurchaseIfSdrPos" = f.repurchase_if_sdr_pos,
+          "codFeePos" = f.cod_fee_pos,
+          "repurchaseCodFeePos" = f.repurchase_cod_fee_pos,
+          "codFeeDeliveredPos" = f.cod_fee_delivered_pos,
+          "repurchaseCodFeeDeliveredPos" = f.repurchase_cod_fee_delivered_pos,
           "updatedAt" = NOW()
-        FROM rm_needs_fix f
+        FROM rm_final f
         WHERE rm.id = f.rm_id
+          AND (
+            COALESCE(rm."purchasesPos", 0) <> f.purchases_pos
+            OR COALESCE(rm."repurchaseCount", 0) <> f.repurchase_count
+            OR COALESCE(rm."processedPurchasesPos", 0) <> f.processed_purchases_pos
+            OR COALESCE(rm."repurchaseProcessedPurchasesPos", 0) <> f.repurchase_processed_purchases_pos
+            OR COALESCE(rm."codPos", 0) <> f.cod_pos
+            OR COALESCE(rm."repurchaseCodPos", 0) <> f.repurchase_cod_pos
+            OR COALESCE(rm."cogsPos", 0) <> f.cogs_pos
+            OR COALESCE(rm."repurchaseCogsPos", 0) <> f.repurchase_cogs_pos
+            OR COALESCE(rm."cogsCanceledPos", 0) <> f.cogs_canceled_pos
+            OR COALESCE(rm."repurchaseCogsCanceledPos", 0) <> f.repurchase_cogs_canceled_pos
+            OR COALESCE(rm."cogsRestockingPos", 0) <> f.cogs_restocking_pos
+            OR COALESCE(rm."repurchaseCogsRestockingPos", 0) <> f.repurchase_cogs_restocking_pos
+            OR COALESCE(rm."cogsRtsPos", 0) <> f.cogs_rts_pos
+            OR COALESCE(rm."repurchaseCogsRtsPos", 0) <> f.repurchase_cogs_rts_pos
+            OR COALESCE(rm."cogsDeliveredPos", 0) <> f.cogs_delivered_pos
+            OR COALESCE(rm."repurchaseCogsDeliveredPos", 0) <> f.repurchase_cogs_delivered_pos
+            OR COALESCE(rm."unconfirmedCount", 0) <> f.unconfirmed_count
+            OR COALESCE(rm."repurchaseUnconfirmedCount", 0) <> f.repurchase_unconfirmed_count
+            OR COALESCE(rm."unconfirmedCodPos", 0) <> f.unconfirmed_cod_pos
+            OR COALESCE(rm."repurchaseUnconfirmedCodPos", 0) <> f.repurchase_unconfirmed_cod_pos
+            OR COALESCE(rm."abandonedCount", 0) <> f.abandoned_count
+            OR COALESCE(rm."repurchaseAbandonedCount", 0) <> f.repurchase_abandoned_count
+            OR COALESCE(rm."abandonedCodPos", 0) <> f.abandoned_cod_pos
+            OR COALESCE(rm."repurchaseAbandonedCodPos", 0) <> f.repurchase_abandoned_cod_pos
+            OR COALESCE(rm."currentAbandonedCount", 0) <> f.current_abandoned_count
+            OR COALESCE(rm."repurchaseCurrentAbandonedCount", 0) <> f.repurchase_current_abandoned_count
+            OR COALESCE(rm."currentAbandonedCodPos", 0) <> f.current_abandoned_cod_pos
+            OR COALESCE(rm."repurchaseCurrentAbandonedCodPos", 0) <> f.repurchase_current_abandoned_cod_pos
+            OR COALESCE(rm."confirmedCount", 0) <> f.confirmed_count
+            OR COALESCE(rm."repurchaseConfirmedCount", 0) <> f.repurchase_confirmed_count
+            OR COALESCE(rm."confirmedCodPos", 0) <> f.confirmed_cod_pos
+            OR COALESCE(rm."repurchaseConfirmedCodPos", 0) <> f.repurchase_confirmed_cod_pos
+            OR COALESCE(rm."printedCount", 0) <> f.printed_count
+            OR COALESCE(rm."repurchasePrintedCount", 0) <> f.repurchase_printed_count
+            OR COALESCE(rm."deletedCount", 0) <> f.deleted_count
+            OR COALESCE(rm."repurchaseDeletedCount", 0) <> f.repurchase_deleted_count
+            OR COALESCE(rm."restockingCount", 0) <> f.restocking_count
+            OR COALESCE(rm."repurchaseRestockingCount", 0) <> f.repurchase_restocking_count
+            OR COALESCE(rm."restockingCodPos", 0) <> f.restocking_cod_pos
+            OR COALESCE(rm."repurchaseRestockingCodPos", 0) <> f.repurchase_restocking_cod_pos
+            OR COALESCE(rm."waitingPickupCount", 0) <> f.waiting_pickup_count
+            OR COALESCE(rm."repurchaseWaitingPickupCount", 0) <> f.repurchase_waiting_pickup_count
+            OR COALESCE(rm."waitingPickupCodPos", 0) <> f.waiting_pickup_cod_pos
+            OR COALESCE(rm."repurchaseWaitingPickupCodPos", 0) <> f.repurchase_waiting_pickup_cod_pos
+            OR COALESCE(rm."shippedCount", 0) <> f.shipped_count
+            OR COALESCE(rm."repurchaseShippedCount", 0) <> f.repurchase_shipped_count
+            OR COALESCE(rm."shippedCodPos", 0) <> f.shipped_cod_pos
+            OR COALESCE(rm."repurchaseShippedCodPos", 0) <> f.repurchase_shipped_cod_pos
+            OR COALESCE(rm."deliveredCount", 0) <> f.delivered_count
+            OR COALESCE(rm."repurchaseDeliveredCount", 0) <> f.repurchase_delivered_count
+            OR COALESCE(rm."deliveredCodPos", 0) <> f.delivered_cod_pos
+            OR COALESCE(rm."repurchaseDeliveredCodPos", 0) <> f.repurchase_delivered_cod_pos
+            OR COALESCE(rm."canceledCount", 0) <> f.canceled_count
+            OR COALESCE(rm."repurchaseCanceledCount", 0) <> f.repurchase_canceled_count
+            OR COALESCE(rm."canceledCodPos", 0) <> f.canceled_cod_pos
+            OR COALESCE(rm."repurchaseCanceledCodPos", 0) <> f.repurchase_canceled_cod_pos
+            OR COALESCE(rm."rtsCount", 0) <> f.rts_count
+            OR COALESCE(rm."repurchaseRtsCount", 0) <> f.repurchase_rts_count
+            OR COALESCE(rm."rtsCodPos", 0) <> f.rts_cod_pos
+            OR COALESCE(rm."repurchaseRtsCodPos", 0) <> f.repurchase_rts_cod_pos
+            OR COALESCE(rm."sfPos", 0) <> f.sf_pos
+            OR COALESCE(rm."repurchaseSfPos", 0) <> f.repurchase_sf_pos
+            OR COALESCE(rm."ffPos", 0) <> f.ff_pos
+            OR COALESCE(rm."repurchaseFfPos", 0) <> f.repurchase_ff_pos
+            OR COALESCE(rm."ifPos", 0) <> f.if_pos
+            OR COALESCE(rm."repurchaseIfPos", 0) <> f.repurchase_if_pos
+            OR COALESCE(rm."sfSdrPos", 0) <> f.sf_sdr_pos
+            OR COALESCE(rm."repurchaseSfSdrPos", 0) <> f.repurchase_sf_sdr_pos
+            OR COALESCE(rm."ffSdrPos", 0) <> f.ff_sdr_pos
+            OR COALESCE(rm."repurchaseFfSdrPos", 0) <> f.repurchase_ff_sdr_pos
+            OR COALESCE(rm."ifSdrPos", 0) <> f.if_sdr_pos
+            OR COALESCE(rm."repurchaseIfSdrPos", 0) <> f.repurchase_if_sdr_pos
+            OR COALESCE(rm."codFeePos", 0) <> f.cod_fee_pos
+            OR COALESCE(rm."repurchaseCodFeePos", 0) <> f.repurchase_cod_fee_pos
+            OR COALESCE(rm."codFeeDeliveredPos", 0) <> f.cod_fee_delivered_pos
+            OR COALESCE(rm."repurchaseCodFeeDeliveredPos", 0) <> f.repurchase_cod_fee_delivered_pos
+          )
       `);
-      const rmCount = rmMatchedCount + rmFallbackCount;
+      const rmCount = rmCanonicalizedCount + rmSyntheticUpsertedCount + rmRecomputedCount;
 
       const rsCount = await prisma.$executeRawUnsafe(`
-        WITH rs_cogs AS (
+        WITH rs_rollup AS (
           SELECT
             rm."tenantId",
             rm.date,
@@ -1965,6 +2429,56 @@ async function backfill2026OrderCogsAndReports() {
               THEN rm."campaignId"
               ELSE COALESCE(NULLIF(rm."adId", ''), NULLIF(rm."campaignId", ''), '__unassigned__')
             END AS "campaignId",
+            COALESCE(SUM(rm."purchasesPos"), 0)::int AS "purchasesPos",
+            COALESCE(SUM(rm."processedPurchasesPos"), 0)::int AS "processedPurchasesPos",
+            COALESCE(SUM(rm."repurchaseCount"), 0)::int AS "repurchaseCount",
+            COALESCE(SUM(rm."repurchaseProcessedPurchasesPos"), 0)::int AS "repurchaseProcessedPurchasesPos",
+            COALESCE(SUM(rm."confirmedCount"), 0)::int AS "confirmedCount",
+            COALESCE(SUM(rm."repurchaseConfirmedCount"), 0)::int AS "repurchaseConfirmedCount",
+            COALESCE(SUM(rm."unconfirmedCount"), 0)::int AS "unconfirmedCount",
+            COALESCE(SUM(rm."repurchaseUnconfirmedCount"), 0)::int AS "repurchaseUnconfirmedCount",
+            COALESCE(SUM(rm."printedCount"), 0)::int AS "printedCount",
+            COALESCE(SUM(rm."repurchasePrintedCount"), 0)::int AS "repurchasePrintedCount",
+            COALESCE(SUM(rm."waitingPickupCount"), 0)::int AS "waitingPickupCount",
+            COALESCE(SUM(rm."repurchaseWaitingPickupCount"), 0)::int AS "repurchaseWaitingPickupCount",
+            COALESCE(SUM(rm."shippedCount"), 0)::int AS "shippedCount",
+            COALESCE(SUM(rm."repurchaseShippedCount"), 0)::int AS "repurchaseShippedCount",
+            COALESCE(SUM(rm."deliveredCount"), 0)::int AS "deliveredCount",
+            COALESCE(SUM(rm."repurchaseDeliveredCount"), 0)::int AS "repurchaseDeliveredCount",
+            COALESCE(SUM(rm."canceledCount"), 0)::int AS "canceledCount",
+            COALESCE(SUM(rm."repurchaseCanceledCount"), 0)::int AS "repurchaseCanceledCount",
+            COALESCE(SUM(rm."deletedCount"), 0)::int AS "deletedCount",
+            COALESCE(SUM(rm."repurchaseDeletedCount"), 0)::int AS "repurchaseDeletedCount",
+            COALESCE(SUM(rm."rtsCount"), 0)::int AS "rtsCount",
+            COALESCE(SUM(rm."repurchaseRtsCount"), 0)::int AS "repurchaseRtsCount",
+            COALESCE(SUM(rm."restockingCount"), 0)::int AS "restockingCount",
+            COALESCE(SUM(rm."repurchaseRestockingCount"), 0)::int AS "repurchaseRestockingCount",
+            COALESCE(SUM(rm."abandonedCount"), 0)::int AS "abandonedCount",
+            COALESCE(SUM(rm."repurchaseAbandonedCount"), 0)::int AS "repurchaseAbandonedCount",
+            COALESCE(SUM(rm."currentAbandonedCount"), 0)::int AS "currentAbandonedCount",
+            COALESCE(SUM(rm."repurchaseCurrentAbandonedCount"), 0)::int AS "repurchaseCurrentAbandonedCount",
+            ROUND(COALESCE(SUM(rm."codPos"), 0)::numeric, 2) AS "codPos",
+            ROUND(COALESCE(SUM(rm."repurchaseCodPos"), 0)::numeric, 2) AS "repurchaseCodPos",
+            ROUND(COALESCE(SUM(rm."deliveredCodPos"), 0)::numeric, 2) AS "deliveredCodPos",
+            ROUND(COALESCE(SUM(rm."repurchaseDeliveredCodPos"), 0)::numeric, 2) AS "repurchaseDeliveredCodPos",
+            ROUND(COALESCE(SUM(rm."shippedCodPos"), 0)::numeric, 2) AS "shippedCodPos",
+            ROUND(COALESCE(SUM(rm."repurchaseShippedCodPos"), 0)::numeric, 2) AS "repurchaseShippedCodPos",
+            ROUND(COALESCE(SUM(rm."waitingPickupCodPos"), 0)::numeric, 2) AS "waitingPickupCodPos",
+            ROUND(COALESCE(SUM(rm."repurchaseWaitingPickupCodPos"), 0)::numeric, 2) AS "repurchaseWaitingPickupCodPos",
+            ROUND(COALESCE(SUM(rm."rtsCodPos"), 0)::numeric, 2) AS "rtsCodPos",
+            ROUND(COALESCE(SUM(rm."repurchaseRtsCodPos"), 0)::numeric, 2) AS "repurchaseRtsCodPos",
+            ROUND(COALESCE(SUM(rm."canceledCodPos"), 0)::numeric, 2) AS "canceledCodPos",
+            ROUND(COALESCE(SUM(rm."repurchaseCanceledCodPos"), 0)::numeric, 2) AS "repurchaseCanceledCodPos",
+            ROUND(COALESCE(SUM(rm."restockingCodPos"), 0)::numeric, 2) AS "restockingCodPos",
+            ROUND(COALESCE(SUM(rm."repurchaseRestockingCodPos"), 0)::numeric, 2) AS "repurchaseRestockingCodPos",
+            ROUND(COALESCE(SUM(rm."confirmedCodPos"), 0)::numeric, 2) AS "confirmedCodPos",
+            ROUND(COALESCE(SUM(rm."repurchaseConfirmedCodPos"), 0)::numeric, 2) AS "repurchaseConfirmedCodPos",
+            ROUND(COALESCE(SUM(rm."unconfirmedCodPos"), 0)::numeric, 2) AS "unconfirmedCodPos",
+            ROUND(COALESCE(SUM(rm."repurchaseUnconfirmedCodPos"), 0)::numeric, 2) AS "repurchaseUnconfirmedCodPos",
+            ROUND(COALESCE(SUM(rm."abandonedCodPos"), 0)::numeric, 2) AS "abandonedCodPos",
+            ROUND(COALESCE(SUM(rm."repurchaseAbandonedCodPos"), 0)::numeric, 2) AS "repurchaseAbandonedCodPos",
+            ROUND(COALESCE(SUM(rm."currentAbandonedCodPos"), 0)::numeric, 2) AS "currentAbandonedCodPos",
+            ROUND(COALESCE(SUM(rm."repurchaseCurrentAbandonedCodPos"), 0)::numeric, 2) AS "repurchaseCurrentAbandonedCodPos",
             ROUND(COALESCE(SUM(rm."cogsPos"), 0)::numeric, 2) AS "cogsPos",
             ROUND(COALESCE(SUM(rm."repurchaseCogsPos"), 0)::numeric, 2) AS "repurchaseCogsPos",
             ROUND(COALESCE(SUM(rm."cogsCanceledPos"), 0)::numeric, 2) AS "cogsCanceledPos",
@@ -1974,7 +2488,23 @@ async function backfill2026OrderCogsAndReports() {
             ROUND(COALESCE(SUM(rm."cogsRtsPos"), 0)::numeric, 2) AS "cogsRtsPos",
             ROUND(COALESCE(SUM(rm."repurchaseCogsRtsPos"), 0)::numeric, 2) AS "repurchaseCogsRtsPos",
             ROUND(COALESCE(SUM(rm."cogsDeliveredPos"), 0)::numeric, 2) AS "cogsDeliveredPos",
-            ROUND(COALESCE(SUM(rm."repurchaseCogsDeliveredPos"), 0)::numeric, 2) AS "repurchaseCogsDeliveredPos"
+            ROUND(COALESCE(SUM(rm."repurchaseCogsDeliveredPos"), 0)::numeric, 2) AS "repurchaseCogsDeliveredPos",
+            ROUND(COALESCE(SUM(rm."sfPos"), 0)::numeric, 2) AS "sfPos",
+            ROUND(COALESCE(SUM(rm."repurchaseSfPos"), 0)::numeric, 2) AS "repurchaseSfPos",
+            ROUND(COALESCE(SUM(rm."ffPos"), 0)::numeric, 2) AS "ffPos",
+            ROUND(COALESCE(SUM(rm."repurchaseFfPos"), 0)::numeric, 2) AS "repurchaseFfPos",
+            ROUND(COALESCE(SUM(rm."ifPos"), 0)::numeric, 2) AS "ifPos",
+            ROUND(COALESCE(SUM(rm."repurchaseIfPos"), 0)::numeric, 2) AS "repurchaseIfPos",
+            ROUND(COALESCE(SUM(rm."sfSdrPos"), 0)::numeric, 2) AS "sfSdrPos",
+            ROUND(COALESCE(SUM(rm."repurchaseSfSdrPos"), 0)::numeric, 2) AS "repurchaseSfSdrPos",
+            ROUND(COALESCE(SUM(rm."ffSdrPos"), 0)::numeric, 2) AS "ffSdrPos",
+            ROUND(COALESCE(SUM(rm."repurchaseFfSdrPos"), 0)::numeric, 2) AS "repurchaseFfSdrPos",
+            ROUND(COALESCE(SUM(rm."ifSdrPos"), 0)::numeric, 2) AS "ifSdrPos",
+            ROUND(COALESCE(SUM(rm."repurchaseIfSdrPos"), 0)::numeric, 2) AS "repurchaseIfSdrPos",
+            ROUND(COALESCE(SUM(rm."codFeePos"), 0)::numeric, 2) AS "codFeePos",
+            ROUND(COALESCE(SUM(rm."repurchaseCodFeePos"), 0)::numeric, 2) AS "repurchaseCodFeePos",
+            ROUND(COALESCE(SUM(rm."codFeeDeliveredPos"), 0)::numeric, 2) AS "codFeeDeliveredPos",
+            ROUND(COALESCE(SUM(rm."repurchaseCodFeeDeliveredPos"), 0)::numeric, 2) AS "repurchaseCodFeeDeliveredPos"
           FROM reconcile_marketing rm
           WHERE rm.date >= DATE '${mStart}'
             AND rm.date < DATE '${mEnd}'
@@ -1982,6 +2512,56 @@ async function backfill2026OrderCogsAndReports() {
         )
         UPDATE reconcile_sales rs
         SET
+          "purchasesPos" = rsc."purchasesPos",
+          "processedPurchasesPos" = rsc."processedPurchasesPos",
+          "repurchaseCount" = rsc."repurchaseCount",
+          "repurchaseProcessedPurchasesPos" = rsc."repurchaseProcessedPurchasesPos",
+          "confirmedCount" = rsc."confirmedCount",
+          "repurchaseConfirmedCount" = rsc."repurchaseConfirmedCount",
+          "unconfirmedCount" = rsc."unconfirmedCount",
+          "repurchaseUnconfirmedCount" = rsc."repurchaseUnconfirmedCount",
+          "printedCount" = rsc."printedCount",
+          "repurchasePrintedCount" = rsc."repurchasePrintedCount",
+          "waitingPickupCount" = rsc."waitingPickupCount",
+          "repurchaseWaitingPickupCount" = rsc."repurchaseWaitingPickupCount",
+          "shippedCount" = rsc."shippedCount",
+          "repurchaseShippedCount" = rsc."repurchaseShippedCount",
+          "deliveredCount" = rsc."deliveredCount",
+          "repurchaseDeliveredCount" = rsc."repurchaseDeliveredCount",
+          "canceledCount" = rsc."canceledCount",
+          "repurchaseCanceledCount" = rsc."repurchaseCanceledCount",
+          "deletedCount" = rsc."deletedCount",
+          "repurchaseDeletedCount" = rsc."repurchaseDeletedCount",
+          "rtsCount" = rsc."rtsCount",
+          "repurchaseRtsCount" = rsc."repurchaseRtsCount",
+          "restockingCount" = rsc."restockingCount",
+          "repurchaseRestockingCount" = rsc."repurchaseRestockingCount",
+          "abandonedCount" = rsc."abandonedCount",
+          "repurchaseAbandonedCount" = rsc."repurchaseAbandonedCount",
+          "currentAbandonedCount" = rsc."currentAbandonedCount",
+          "repurchaseCurrentAbandonedCount" = rsc."repurchaseCurrentAbandonedCount",
+          "codPos" = rsc."codPos",
+          "repurchaseCodPos" = rsc."repurchaseCodPos",
+          "deliveredCodPos" = rsc."deliveredCodPos",
+          "repurchaseDeliveredCodPos" = rsc."repurchaseDeliveredCodPos",
+          "shippedCodPos" = rsc."shippedCodPos",
+          "repurchaseShippedCodPos" = rsc."repurchaseShippedCodPos",
+          "waitingPickupCodPos" = rsc."waitingPickupCodPos",
+          "repurchaseWaitingPickupCodPos" = rsc."repurchaseWaitingPickupCodPos",
+          "rtsCodPos" = rsc."rtsCodPos",
+          "repurchaseRtsCodPos" = rsc."repurchaseRtsCodPos",
+          "canceledCodPos" = rsc."canceledCodPos",
+          "repurchaseCanceledCodPos" = rsc."repurchaseCanceledCodPos",
+          "restockingCodPos" = rsc."restockingCodPos",
+          "repurchaseRestockingCodPos" = rsc."repurchaseRestockingCodPos",
+          "confirmedCodPos" = rsc."confirmedCodPos",
+          "repurchaseConfirmedCodPos" = rsc."repurchaseConfirmedCodPos",
+          "unconfirmedCodPos" = rsc."unconfirmedCodPos",
+          "repurchaseUnconfirmedCodPos" = rsc."repurchaseUnconfirmedCodPos",
+          "abandonedCodPos" = rsc."abandonedCodPos",
+          "repurchaseAbandonedCodPos" = rsc."repurchaseAbandonedCodPos",
+          "currentAbandonedCodPos" = rsc."currentAbandonedCodPos",
+          "repurchaseCurrentAbandonedCodPos" = rsc."repurchaseCurrentAbandonedCodPos",
           "cogsPos" = rsc."cogsPos",
           "repurchaseCogsPos" = rsc."repurchaseCogsPos",
           "cogsCanceledPos" = rsc."cogsCanceledPos",
@@ -1992,13 +2572,31 @@ async function backfill2026OrderCogsAndReports() {
           "repurchaseCogsRtsPos" = rsc."repurchaseCogsRtsPos",
           "cogsDeliveredPos" = rsc."cogsDeliveredPos",
           "repurchaseCogsDeliveredPos" = rsc."repurchaseCogsDeliveredPos",
+          "sfPos" = rsc."sfPos",
+          "repurchaseSfPos" = rsc."repurchaseSfPos",
+          "ffPos" = rsc."ffPos",
+          "repurchaseFfPos" = rsc."repurchaseFfPos",
+          "ifPos" = rsc."ifPos",
+          "repurchaseIfPos" = rsc."repurchaseIfPos",
+          "sfSdrPos" = rsc."sfSdrPos",
+          "repurchaseSfSdrPos" = rsc."repurchaseSfSdrPos",
+          "ffSdrPos" = rsc."ffSdrPos",
+          "repurchaseFfSdrPos" = rsc."repurchaseFfSdrPos",
+          "ifSdrPos" = rsc."ifSdrPos",
+          "repurchaseIfSdrPos" = rsc."repurchaseIfSdrPos",
+          "codFeePos" = rsc."codFeePos",
+          "repurchaseCodFeePos" = rsc."repurchaseCodFeePos",
+          "codFeeDeliveredPos" = rsc."codFeeDeliveredPos",
+          "repurchaseCodFeeDeliveredPos" = rsc."repurchaseCodFeeDeliveredPos",
           "updatedAt" = NOW()
-        FROM rs_cogs rsc
+        FROM rs_rollup rsc
         WHERE rs."tenantId" = rsc."tenantId"
           AND rs.date = rsc.date
           AND rs."campaignId" = rsc."campaignId"
           AND (
-            COALESCE(rs."cogsPos", 0) <> rsc."cogsPos"
+            COALESCE(rs."purchasesPos", 0) <> rsc."purchasesPos"
+            OR COALESCE(rs."codPos", 0) <> rsc."codPos"
+            OR COALESCE(rs."cogsPos", 0) <> rsc."cogsPos"
             OR COALESCE(rs."repurchaseCogsPos", 0) <> rsc."repurchaseCogsPos"
             OR COALESCE(rs."cogsCanceledPos", 0) <> rsc."cogsCanceledPos"
             OR COALESCE(rs."repurchaseCogsCanceledPos", 0) <> rsc."repurchaseCogsCanceledPos"
@@ -2008,11 +2606,14 @@ async function backfill2026OrderCogsAndReports() {
             OR COALESCE(rs."repurchaseCogsRtsPos", 0) <> rsc."repurchaseCogsRtsPos"
             OR COALESCE(rs."cogsDeliveredPos", 0) <> rsc."cogsDeliveredPos"
             OR COALESCE(rs."repurchaseCogsDeliveredPos", 0) <> rsc."repurchaseCogsDeliveredPos"
+            OR COALESCE(rs."deliveredCount", 0) <> rsc."deliveredCount"
+            OR COALESCE(rs."canceledCount", 0) <> rsc."canceledCount"
+            OR COALESCE(rs."rtsCount", 0) <> rsc."rtsCount"
           )
       `);
 
       const rsaCount = await prisma.$executeRawUnsafe(`
-        WITH rsa_cogs AS (
+        WITH rsa_rollup AS (
           SELECT
             rm."tenantId",
             rm.date,
@@ -2025,11 +2626,42 @@ async function backfill2026OrderCogsAndReports() {
             END AS "campaignKey",
             COALESCE(NULLIF(LOWER(BTRIM(COALESCE(rm.mapping, ''))), ''), '__unassigned_mapping__') AS "mappingKey",
             COALESCE(NULLIF(LOWER(BTRIM(COALESCE(rm."teamCode", ''))), ''), '__unassigned_team_code__') AS "teamCodeKey",
+            COALESCE(SUM(GREATEST(0, COALESCE(rm."purchasesPos", 0) - COALESCE(rm."repurchaseCount", 0))), 0)::int AS "purchasesPos",
+            COALESCE(SUM(GREATEST(0, COALESCE(rm."processedPurchasesPos", 0) - COALESCE(rm."repurchaseProcessedPurchasesPos", 0))), 0)::int AS "processedPurchasesPos",
+            COALESCE(SUM(GREATEST(0, COALESCE(rm."confirmedCount", 0) - COALESCE(rm."repurchaseConfirmedCount", 0))), 0)::int AS "confirmedCount",
+            COALESCE(SUM(GREATEST(0, COALESCE(rm."unconfirmedCount", 0) - COALESCE(rm."repurchaseUnconfirmedCount", 0))), 0)::int AS "unconfirmedCount",
+            COALESCE(SUM(GREATEST(0, COALESCE(rm."printedCount", 0) - COALESCE(rm."repurchasePrintedCount", 0))), 0)::int AS "printedCount",
+            COALESCE(SUM(GREATEST(0, COALESCE(rm."waitingPickupCount", 0) - COALESCE(rm."repurchaseWaitingPickupCount", 0))), 0)::int AS "waitingPickupCount",
+            COALESCE(SUM(GREATEST(0, COALESCE(rm."shippedCount", 0) - COALESCE(rm."repurchaseShippedCount", 0))), 0)::int AS "shippedCount",
+            COALESCE(SUM(GREATEST(0, COALESCE(rm."deliveredCount", 0) - COALESCE(rm."repurchaseDeliveredCount", 0))), 0)::int AS "deliveredCount",
+            COALESCE(SUM(GREATEST(0, COALESCE(rm."canceledCount", 0) - COALESCE(rm."repurchaseCanceledCount", 0))), 0)::int AS "canceledCount",
+            COALESCE(SUM(GREATEST(0, COALESCE(rm."deletedCount", 0) - COALESCE(rm."repurchaseDeletedCount", 0))), 0)::int AS "deletedCount",
+            COALESCE(SUM(GREATEST(0, COALESCE(rm."rtsCount", 0) - COALESCE(rm."repurchaseRtsCount", 0))), 0)::int AS "rtsCount",
+            COALESCE(SUM(GREATEST(0, COALESCE(rm."restockingCount", 0) - COALESCE(rm."repurchaseRestockingCount", 0))), 0)::int AS "restockingCount",
+            COALESCE(SUM(GREATEST(0, COALESCE(rm."abandonedCount", 0) - COALESCE(rm."repurchaseAbandonedCount", 0))), 0)::int AS "abandonedCount",
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."codPos", 0) - COALESCE(rm."repurchaseCodPos", 0))), 0)::numeric, 2) AS "codPos",
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."deliveredCodPos", 0) - COALESCE(rm."repurchaseDeliveredCodPos", 0))), 0)::numeric, 2) AS "deliveredCodPos",
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."shippedCodPos", 0) - COALESCE(rm."repurchaseShippedCodPos", 0))), 0)::numeric, 2) AS "shippedCodPos",
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."waitingPickupCodPos", 0) - COALESCE(rm."repurchaseWaitingPickupCodPos", 0))), 0)::numeric, 2) AS "waitingPickupCodPos",
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."rtsCodPos", 0) - COALESCE(rm."repurchaseRtsCodPos", 0))), 0)::numeric, 2) AS "rtsCodPos",
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."canceledCodPos", 0) - COALESCE(rm."repurchaseCanceledCodPos", 0))), 0)::numeric, 2) AS "canceledCodPos",
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."restockingCodPos", 0) - COALESCE(rm."repurchaseRestockingCodPos", 0))), 0)::numeric, 2) AS "restockingCodPos",
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."confirmedCodPos", 0) - COALESCE(rm."repurchaseConfirmedCodPos", 0))), 0)::numeric, 2) AS "confirmedCodPos",
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."unconfirmedCodPos", 0) - COALESCE(rm."repurchaseUnconfirmedCodPos", 0))), 0)::numeric, 2) AS "unconfirmedCodPos",
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."abandonedCodPos", 0) - COALESCE(rm."repurchaseAbandonedCodPos", 0))), 0)::numeric, 2) AS "abandonedCodPos",
             ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."cogsPos", 0) - COALESCE(rm."repurchaseCogsPos", 0))), 0)::numeric, 2) AS "cogsPos",
             ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."cogsCanceledPos", 0) - COALESCE(rm."repurchaseCogsCanceledPos", 0))), 0)::numeric, 2) AS "cogsCanceledPos",
             ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."cogsRestockingPos", 0) - COALESCE(rm."repurchaseCogsRestockingPos", 0))), 0)::numeric, 2) AS "cogsRestockingPos",
             ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."cogsRtsPos", 0) - COALESCE(rm."repurchaseCogsRtsPos", 0))), 0)::numeric, 2) AS "cogsRtsPos",
-            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."cogsDeliveredPos", 0) - COALESCE(rm."repurchaseCogsDeliveredPos", 0))), 0)::numeric, 2) AS "cogsDeliveredPos"
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."cogsDeliveredPos", 0) - COALESCE(rm."repurchaseCogsDeliveredPos", 0))), 0)::numeric, 2) AS "cogsDeliveredPos",
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."sfPos", 0) - COALESCE(rm."repurchaseSfPos", 0))), 0)::numeric, 2) AS "sfPos",
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."ffPos", 0) - COALESCE(rm."repurchaseFfPos", 0))), 0)::numeric, 2) AS "ffPos",
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."ifPos", 0) - COALESCE(rm."repurchaseIfPos", 0))), 0)::numeric, 2) AS "ifPos",
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."sfSdrPos", 0) - COALESCE(rm."repurchaseSfSdrPos", 0))), 0)::numeric, 2) AS "sfSdrPos",
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."ffSdrPos", 0) - COALESCE(rm."repurchaseFfSdrPos", 0))), 0)::numeric, 2) AS "ffSdrPos",
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."ifSdrPos", 0) - COALESCE(rm."repurchaseIfSdrPos", 0))), 0)::numeric, 2) AS "ifSdrPos",
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."codFeePos", 0) - COALESCE(rm."repurchaseCodFeePos", 0))), 0)::numeric, 2) AS "codFeePos",
+            ROUND(COALESCE(SUM(GREATEST(0, COALESCE(rm."codFeeDeliveredPos", 0) - COALESCE(rm."repurchaseCodFeeDeliveredPos", 0))), 0)::numeric, 2) AS "codFeeDeliveredPos"
           FROM reconcile_marketing rm
           WHERE rm.date >= DATE '${mStart}'
             AND rm.date < DATE '${mEnd}'
@@ -2037,20 +2669,53 @@ async function backfill2026OrderCogsAndReports() {
         )
         UPDATE reconcile_sales_attribution rsa
         SET
+          "purchasesPos" = rsac."purchasesPos",
+          "processedPurchasesPos" = rsac."processedPurchasesPos",
+          "confirmedCount" = rsac."confirmedCount",
+          "unconfirmedCount" = rsac."unconfirmedCount",
+          "printedCount" = rsac."printedCount",
+          "waitingPickupCount" = rsac."waitingPickupCount",
+          "shippedCount" = rsac."shippedCount",
+          "deliveredCount" = rsac."deliveredCount",
+          "canceledCount" = rsac."canceledCount",
+          "deletedCount" = rsac."deletedCount",
+          "rtsCount" = rsac."rtsCount",
+          "restockingCount" = rsac."restockingCount",
+          "abandonedCount" = rsac."abandonedCount",
+          "codPos" = rsac."codPos",
+          "deliveredCodPos" = rsac."deliveredCodPos",
+          "shippedCodPos" = rsac."shippedCodPos",
+          "waitingPickupCodPos" = rsac."waitingPickupCodPos",
+          "rtsCodPos" = rsac."rtsCodPos",
+          "canceledCodPos" = rsac."canceledCodPos",
+          "restockingCodPos" = rsac."restockingCodPos",
+          "confirmedCodPos" = rsac."confirmedCodPos",
+          "unconfirmedCodPos" = rsac."unconfirmedCodPos",
+          "abandonedCodPos" = rsac."abandonedCodPos",
           "cogsPos" = rsac."cogsPos",
           "cogsCanceledPos" = rsac."cogsCanceledPos",
           "cogsRestockingPos" = rsac."cogsRestockingPos",
           "cogsRtsPos" = rsac."cogsRtsPos",
           "cogsDeliveredPos" = rsac."cogsDeliveredPos",
+          "sfPos" = rsac."sfPos",
+          "ffPos" = rsac."ffPos",
+          "ifPos" = rsac."ifPos",
+          "sfSdrPos" = rsac."sfSdrPos",
+          "ffSdrPos" = rsac."ffSdrPos",
+          "ifSdrPos" = rsac."ifSdrPos",
+          "codFeePos" = rsac."codFeePos",
+          "codFeeDeliveredPos" = rsac."codFeeDeliveredPos",
           "updatedAt" = NOW()
-        FROM rsa_cogs rsac
+        FROM rsa_rollup rsac
         WHERE rsa."tenantId" = rsac."tenantId"
           AND rsa.date = rsac.date
           AND rsa."campaignKey" = rsac."campaignKey"
           AND rsa."mappingKey" = rsac."mappingKey"
           AND rsa."teamCodeKey" = rsac."teamCodeKey"
           AND (
-            COALESCE(rsa."cogsPos", 0) <> rsac."cogsPos"
+            COALESCE(rsa."purchasesPos", 0) <> rsac."purchasesPos"
+            OR COALESCE(rsa."codPos", 0) <> rsac."codPos"
+            OR COALESCE(rsa."cogsPos", 0) <> rsac."cogsPos"
             OR COALESCE(rsa."cogsCanceledPos", 0) <> rsac."cogsCanceledPos"
             OR COALESCE(rsa."cogsRestockingPos", 0) <> rsac."cogsRestockingPos"
             OR COALESCE(rsa."cogsRtsPos", 0) <> rsac."cogsRtsPos"
@@ -2097,7 +2762,7 @@ async function backfill2026OrderCogsAndReports() {
       updatedReconcileMarketing += rmCount;
       updatedReconcileSales += rsCount;
       updatedReconcileAttribution += rsaCount;
-      console.log(`✓ Reconciled rollups for ${mStart.slice(0, 7)}: rm=${rmCount} (matched=${rmMatchedCount}, fallback=${rmFallbackCount}), rs=${rsCount}, rsa=${rsaCount}`);
+      console.log(`✓ Reconciled rollups for ${mStart.slice(0, 7)}: rm=${rmCount} (canon=${rmCanonicalizedCount}, synth=${rmSyntheticUpsertedCount}, recomputed=${rmRecomputedCount}), rs=${rsCount}, rsa=${rsaCount}`);
     }
 
     console.log('✓ Reconciled 2026 report rollups:', JSON.stringify({
@@ -2158,10 +2823,129 @@ async function backfill2026OrderCogsAndReports() {
       FROM pos_orders o
       WHERE o."tenantId" = 'd917e03f-bc56-4371-a844-66cf2aee6270'
     `);
+    const nbmBusinessPerformanceCheck = await prisma.$queryRawUnsafe<any[]>(`
+      WITH active_shops AS (
+        SELECT "shopId"
+        FROM pos_stores
+        WHERE "tenantId" = 'd917e03f-bc56-4371-a844-66cf2aee6270'
+          AND status = 'ACTIVE'
+          AND (enabled = true OR enabled IS NULL)
+          AND "shopId" NOT IN ('715088566', 'kangen_store', 'evah_fragrances_store')
+      ),
+      targets AS MATERIALIZED (
+        SELECT r.*
+        FROM reconcile_marketing r
+        WHERE r."tenantId" = 'd917e03f-bc56-4371-a844-66cf2aee6270'
+          AND r.date >= DATE '2026-01-01'
+          AND r."teamId" IN ('83bf4287-bfee-4c22-93a0-7d34a97f7703'::uuid, 'df2b59d1-9434-44d0-8b68-7e93e668ccda'::uuid)
+          AND (r."currentAbandonedCount" <> 0 OR r."repurchaseCurrentAbandonedCount" <> 0)
+      ),
+      ownership AS MATERIALIZED (
+        SELECT w.date, j.value->>'shopId' AS shop, j.value->>'posOrderId' AS external_id, COUNT(*) AS owners
+        FROM reconcile_marketing w
+        CROSS JOIN LATERAL jsonb_array_elements(
+          CASE WHEN jsonb_typeof(w."matchedOrders") = 'array' THEN w."matchedOrders" ELSE '[]'::jsonb END
+        ) j
+        WHERE w."tenantId" = 'd917e03f-bc56-4371-a844-66cf2aee6270'
+          AND w.date IN (SELECT DISTINCT date FROM targets)
+        GROUP BY w.date, j.value->>'shopId', j.value->>'posOrderId'
+      ),
+      abandoned_evidence AS (
+        SELECT
+          t.id,
+          jsonb_typeof(t."matchedOrders") IS DISTINCT FROM 'array'
+            OR COUNT(*) FILTER (WHERE j.value IS NOT NULL AND (
+              jsonb_typeof(j.value) IS DISTINCT FROM 'object'
+              OR jsonb_typeof(j.value->'shopId') IS DISTINCT FROM 'string'
+              OR jsonb_typeof(j.value->'posOrderId') IS DISTINCT FROM 'string'
+              OR COALESCE(j.value->>'shopId', '') = ''
+              OR COALESCE(j.value->>'posOrderId', '') = ''
+              OR own.owners IS DISTINCT FROM 1
+              OR o.id IS NULL
+              OR CASE WHEN jsonb_typeof(j.value->'cod') = 'number'
+                THEN (j.value->>'cod')::numeric IS DISTINCT FROM o.cod ELSE TRUE END
+            )) > 0
+            OR COUNT(o.id) FILTER (WHERE NOT o."isVoid" AND o.status IS DISTINCT FROM 7) <> t."purchasesPos"
+            OR COALESCE(SUM(o.cod) FILTER (WHERE NOT o."isVoid" AND o.status IS DISTINCT FROM 7), 0) <> t."codPos"
+            OR COALESCE(SUM(o.cogs) FILTER (WHERE NOT o."isVoid" AND o.status IS DISTINCT FROM 7), 0) <> t."cogsPos"
+            OR COUNT(o.id) FILTER (WHERE NOT o."isVoid" AND o.status IS DISTINCT FROM 7 AND o."isRepurchase") <> t."repurchaseCount"
+            OR COALESCE(SUM(o.cod) FILTER (WHERE NOT o."isVoid" AND o.status IS DISTINCT FROM 7 AND o."isRepurchase"), 0) <> t."repurchaseCodPos"
+            OR COALESCE(SUM(o.cogs) FILTER (WHERE NOT o."isVoid" AND o.status IS DISTINCT FROM 7 AND o."isRepurchase"), 0) <> t."repurchaseCogsPos"
+            OR COALESCE(SUM(o.cogs) FILTER (WHERE NOT o."isVoid" AND o.status = 6), 0) <> t."cogsCanceledPos"
+            OR COALESCE(SUM(o.cogs) FILTER (WHERE NOT o."isVoid" AND o.status = 6 AND o."isRepurchase"), 0) <> t."repurchaseCogsCanceledPos"
+            OR COALESCE(SUM(o.cogs) FILTER (WHERE NOT o."isVoid" AND o.status = 11), 0) <> t."cogsRestockingPos"
+            OR COALESCE(SUM(o.cogs) FILTER (WHERE NOT o."isVoid" AND o.status = 11 AND o."isRepurchase"), 0) <> t."repurchaseCogsRestockingPos"
+            OR COALESCE(SUM(o.cogs) FILTER (WHERE NOT o."isVoid" AND o.status IN (4, 5)), 0) <> t."cogsRtsPos"
+            OR COALESCE(SUM(o.cogs) FILTER (WHERE NOT o."isVoid" AND o.status IN (4, 5) AND o."isRepurchase"), 0) <> t."repurchaseCogsRtsPos"
+            OR COALESCE(SUM(o.cogs) FILTER (WHERE NOT o."isVoid" AND o.status = 3), 0) <> t."cogsDeliveredPos"
+            OR COALESCE(SUM(o.cogs) FILTER (WHERE NOT o."isVoid" AND o.status = 3 AND o."isRepurchase"), 0) <> t."repurchaseCogsDeliveredPos"
+            OR COUNT(o.id) FILTER (WHERE NOT o."isVoid" AND o.status = 0 AND o."isAbandoned") <> t."currentAbandonedCount"
+            OR COALESCE(SUM(o.cod) FILTER (WHERE NOT o."isVoid" AND o.status = 0 AND o."isAbandoned"), 0) <> t."currentAbandonedCodPos"
+            OR COUNT(o.id) FILTER (WHERE NOT o."isVoid" AND o.status = 0 AND o."isAbandoned" AND o."isRepurchase") <> t."repurchaseCurrentAbandonedCount"
+            OR COALESCE(SUM(o.cod) FILTER (WHERE NOT o."isVoid" AND o.status = 0 AND o."isAbandoned" AND o."isRepurchase"), 0) <> t."repurchaseCurrentAbandonedCodPos"
+            AS invalid
+        FROM targets t
+        LEFT JOIN LATERAL jsonb_array_elements(
+          CASE WHEN jsonb_typeof(t."matchedOrders") = 'array' THEN t."matchedOrders" ELSE '[]'::jsonb END
+        ) j ON TRUE
+        LEFT JOIN ownership own
+          ON own.date = t.date AND own.shop = j.value->>'shopId' AND own.external_id = j.value->>'posOrderId'
+        LEFT JOIN pos_orders o
+          ON o."tenantId" = 'd917e03f-bc56-4371-a844-66cf2aee6270'::uuid
+         AND o."shopId" = j.value->>'shopId'
+         AND o."posOrderId" = j.value->>'posOrderId'
+         AND o."dateLocal" = TO_CHAR(t.date, 'YYYY-MM-DD')
+         AND o."shopId" IN (SELECT "shopId" FROM active_shops)
+         AND o."teamId" IN ('83bf4287-bfee-4c22-93a0-7d34a97f7703'::uuid, 'df2b59d1-9434-44d0-8b68-7e93e668ccda'::uuid)
+        GROUP BY t.id, t."matchedOrders", t."purchasesPos", t."codPos", t."cogsPos",
+          t."repurchaseCount", t."repurchaseCodPos", t."repurchaseCogsPos",
+          t."currentAbandonedCount", t."repurchaseCurrentAbandonedCount",
+          t."currentAbandonedCodPos", t."repurchaseCurrentAbandonedCodPos",
+          t."cogsCanceledPos", t."repurchaseCogsCanceledPos", t."cogsRestockingPos", t."repurchaseCogsRestockingPos",
+          t."cogsRtsPos", t."repurchaseCogsRtsPos", t."cogsDeliveredPos", t."repurchaseCogsDeliveredPos"
+      ),
+      rm_2026 AS (
+        SELECT
+          COALESCE(SUM("purchasesPos"), 0)::int AS rm_purchases,
+          ROUND(COALESCE(SUM("codPos"), 0)::numeric, 2)::text AS rm_cod,
+          ROUND(COALESCE(SUM("cogsPos"), 0)::numeric, 2)::text AS rm_cogs,
+          COALESCE(SUM("deliveredCount"), 0)::int AS rm_delivered,
+          COALESCE(SUM("canceledCount"), 0)::int AS rm_canceled,
+          COALESCE(SUM("rtsCount"), 0)::int AS rm_rts,
+          COALESCE(SUM("currentAbandonedCount"), 0)::int AS rm_abandoned
+        FROM reconcile_marketing
+        WHERE "tenantId" = 'd917e03f-bc56-4371-a844-66cf2aee6270'
+          AND date >= DATE '2026-01-01'
+          AND "teamId" IN ('83bf4287-bfee-4c22-93a0-7d34a97f7703'::uuid, 'df2b59d1-9434-44d0-8b68-7e93e668ccda'::uuid)
+      ),
+      pos_2026 AS (
+        SELECT
+          COUNT(*)::int AS pos_purchases,
+          ROUND(COALESCE(SUM(cod), 0)::numeric, 2)::text AS pos_cod,
+          ROUND(COALESCE(SUM(cogs), 0)::numeric, 2)::text AS pos_cogs,
+          COUNT(*) FILTER (WHERE status = 3)::int AS pos_delivered,
+          COUNT(*) FILTER (WHERE status = 6)::int AS pos_canceled,
+          COUNT(*) FILTER (WHERE status IN (4, 5))::int AS pos_rts,
+          COUNT(*) FILTER (WHERE status = 0 AND "isAbandoned" = true)::int AS pos_abandoned
+        FROM pos_orders
+        WHERE "tenantId" = 'd917e03f-bc56-4371-a844-66cf2aee6270'
+          AND "dateLocal" >= '2026-01-01'
+          AND COALESCE("isVoid", false) = false
+          AND status IS DISTINCT FROM 7
+          AND "shopId" IN (SELECT "shopId" FROM active_shops)
+          AND "teamId" IN ('83bf4287-bfee-4c22-93a0-7d34a97f7703'::uuid, 'df2b59d1-9434-44d0-8b68-7e93e668ccda'::uuid)
+      )
+      SELECT
+        (SELECT COUNT(*)::int FROM abandoned_evidence WHERE invalid) AS "invalidAbandonedRows",
+        rm_2026.*,
+        pos_2026.*
+      FROM rm_2026, pos_2026
+    `);
     console.log('SmileOrganics AFTER backfill:', JSON.stringify(smileAfter));
     console.log('Overall 2026 orders AFTER backfill:', JSON.stringify(summary2026After));
     console.log('Overall ALL-TIME orders & catalog AFTER backfill:', JSON.stringify(summaryAllTimeAfter));
     console.log('Next Big Move COGS summary AFTER backfill:', JSON.stringify(nbmSummaryAfter));
+    console.log('Next Big Move Business Performance parity check:', JSON.stringify(nbmBusinessPerformanceCheck));
 
     await prisma.$executeRawUnsafe(`
       ANALYZE pos_orders, reconcile_marketing, reconcile_sales, reconcile_sales_attribution, pos_products, pos_product_cogs, pos_stores
@@ -2979,12 +3763,11 @@ async function backfillAdSpendStoreAndTeamAttribution() {
 
         const targetStore = (resolvedStoreId ? storeById.get(resolvedStoreId) : undefined) || storeById.get(defaultTenantStoreId) || activeStores[0];
         if (!targetStore) continue;
-        const isSuperAdminStore = isBusinessReportExcludedStore(targetStore);
-        const targetTeamId = isSuperAdminStore
-          ? targetStore.teamId || defaultTeam.id
-          : row.teamId && !isSuperAdminOnlyTeamId(row.teamId) && validTeamIds.has(row.teamId.toLowerCase())
+        const targetTeamId =
+          targetStore.teamId ||
+          (row.teamId && !isSuperAdminOnlyTeamId(row.teamId) && validTeamIds.has(row.teamId.toLowerCase())
             ? row.teamId
-            : targetStore.teamId || defaultTeam.id;
+            : defaultTeam.id);
         const targetTeamCode = targetTeamId ? teamCodeById.get(targetTeamId.toLowerCase()) || row.teamCode : row.teamCode;
 
         let candidateShops: string[] =
@@ -3093,12 +3876,11 @@ async function backfillAdSpendStoreAndTeamAttribution() {
           defaultTenantStoreId;
         const st = storeById.get(votedStoreId);
         if (!st) continue;
-        const isSuperAdminStore = isBusinessReportExcludedStore(st);
-        const targetTeamId = isSuperAdminStore
-          ? st.teamId || defaultTeam.id
-          : m.teamId && !isSuperAdminOnlyTeamId(m.teamId) && validTeamIds.has(m.teamId.toLowerCase())
+        const targetTeamId =
+          st.teamId ||
+          (m.teamId && !isSuperAdminOnlyTeamId(m.teamId) && validTeamIds.has(m.teamId.toLowerCase())
             ? m.teamId
-            : st.teamId || defaultTeam.id;
+            : defaultTeam.id);
         const targetTeamCode = targetTeamId ? teamCodeById.get(targetTeamId.toLowerCase()) || m.teamCode : m.teamCode;
         const targetMapping =
           m.mapping && m.mapping.trim().length > 0

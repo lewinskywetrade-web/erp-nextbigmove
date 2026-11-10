@@ -1067,9 +1067,7 @@ export class SalesAnalyticsService {
       const effectiveTeamIds = hasExcludedStores
         ? scope.teamIds.length > 0
           ? scope.teamIds.filter((id) => !isSuperAdminOnlyTeamId(id))
-          : mode === 'product'
-            ? businessReportTeamIds
-            : []
+          : businessReportTeamIds
         : scope.teamIds;
       const effectiveScope = {
         ...scope,
@@ -2163,15 +2161,24 @@ export class SalesAnalyticsService {
     const scopeStores = hasExcludedStores
       ? rawScopeStores.filter((store) => !isBusinessReportExcludedStore(store))
       : rawScopeStores;
+    const businessReportTeamIds = hasExcludedStores
+      ? Array.from(
+          new Set(
+            scopeStores
+              .map((store) => store.teamId)
+              .filter((id): id is string => Boolean(id) && !isSuperAdminOnlyTeamId(id)),
+          ),
+        ).sort()
+      : [];
     const teamIds = hasExcludedStores
-      ? requestedTeamIds.filter((id) => !isSuperAdminOnlyTeamId(id))
+      ? requestedTeamIds.length > 0
+        ? requestedTeamIds.filter((id) => !isSuperAdminOnlyTeamId(id))
+        : businessReportTeamIds
       : requestedTeamIds;
     const teamWhere = hasExcludedStores
       ? teamIds.length > 0
         ? { teamId: { in: teamIds } }
-        : requestedTeamIds.length > 0
-          ? { teamId: { in: [] as string[] } }
-          : rawTeamWhere
+        : { teamId: { in: [] as string[] } }
       : rawTeamWhere;
     const scopeKey = (stores: typeof scopeStores) => stores.map(store => `${store.id}:${store.shopId}:${store.name}:${store.teamId ?? ''}`).sort();
     const cacheVersion = await this.analyticsCache.getVersion(tenantId);
@@ -2218,7 +2225,11 @@ export class SalesAnalyticsService {
         if (typeof value === 'number') target[key] = (target[key] || 0) + value;
       }
     };
-    const empty = () => Object.fromEntries(metricFields.map(key => [key, 0])) as Record<string, number>;
+    const empty = () => ({
+      ...(Object.fromEntries(metricFields.map(key => [key, 0])) as Record<string, number>),
+      cogsCurrentAbandonedPos: 0,
+      repurchaseCogsCurrentAbandonedPos: 0,
+    }) as any;
 
     // All source identities and all pages share one read-only snapshot. The
     // projection deliberately excludes snapshots, names and customer details.

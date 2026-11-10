@@ -72,12 +72,18 @@ export class ReconcileMarketingService {
         status: 'ACTIVE',
         OR: [{ enabled: true }, { enabled: null }],
       },
-      select: { id: true, shopId: true },
+      select: { id: true, shopId: true, teamId: true },
     });
     const activeShopIds = Array.from(new Set(activeStores.map((store) => store.shopId)));
     // shopId (external) -> PosStore.id (internal UUID), so an unmatched order can
     // fall back to a store-scoped "Unassigned" mapping keyed like the pv:: keys.
     const storeIdByShopId = new Map(activeStores.map((store) => [store.shopId, store.id]));
+    const teamIdByShopId = new Map(
+      activeStores.map((store) => [store.shopId, (store as any).teamId ?? null]),
+    );
+    const teamIdByStoreId = new Map(
+      activeStores.map((store) => [store.id.toLowerCase(), (store as any).teamId ?? null]),
+    );
 
     // Load Meta insights for the day
     const metaInsights = await this.prisma.metaAdInsight.findMany({
@@ -223,6 +229,10 @@ export class ReconcileMarketingService {
         if (candidates && candidates.length > 1) ambiguousOrderCount += 1;
         continue;
       }
+      const orderTeamId = order.teamId ?? teamIdByShopId.get(order.shopId) ?? null;
+      if (candidates[0].teamId && orderTeamId && candidates[0].teamId !== orderTeamId) {
+        continue;
+      }
       const ownerId = candidates[0].adId;
       let bucket = posAggByAdId.get(ownerId);
       if (!bucket) {
@@ -262,6 +272,19 @@ export class ReconcileMarketingService {
           : insight.dateCreated
           ? new Date(insight.dateCreated)
           : null;
+      const resolvedMapping = resolveInsightMapping(insight);
+      const mappedStoreId =
+        resolvedMapping?.startsWith('pv::') || resolvedMapping?.startsWith('ua::')
+          ? resolvedMapping.split('::')[1]?.trim().toLowerCase()
+          : null;
+      const firstMatchedOrder = agg?.orders?.[0];
+      const matchedOrderTeamId = firstMatchedOrder
+        ? (firstMatchedOrder.teamId ?? teamIdByShopId.get(firstMatchedOrder.shopId) ?? null)
+        : null;
+      const effectiveInsightTeamId =
+        insight.teamId ??
+        matchedOrderTeamId ??
+        (mappedStoreId ? (teamIdByStoreId.get(mappedStoreId) ?? null) : null);
 
       await this.prisma.reconcileMarketing.upsert({
         where: {
@@ -273,7 +296,7 @@ export class ReconcileMarketingService {
         },
         create: {
           tenantId,
-          teamId: insight.teamId ?? null,
+          teamId: effectiveInsightTeamId,
           date: dayStart,
           adId: insight.adId,
           normalizedAdId: norm || null,
@@ -284,7 +307,7 @@ export class ReconcileMarketingService {
           adName: insight.adName,
           marketingAssociate: insight.marketingAssociate
             || deriveAssociateFromAdName(insight.adName),
-          mapping: resolveInsightMapping(insight),
+          mapping: resolvedMapping,
           teamCode: insight.teamCode || null,
           dateCreated: metaDateCreated,
           spend: insight.spend,
@@ -372,7 +395,7 @@ export class ReconcileMarketingService {
           shops,
         },
         update: {
-          teamId: insight.teamId ?? null,
+          teamId: effectiveInsightTeamId,
           normalizedAdId: norm || null,
           accountId: insight.accountId,
           campaignId: insight.campaignId,
@@ -381,7 +404,7 @@ export class ReconcileMarketingService {
           adName: insight.adName,
           marketingAssociate: insight.marketingAssociate
             || deriveAssociateFromAdName(insight.adName),
-          mapping: resolveInsightMapping(insight),
+          mapping: resolvedMapping,
           teamCode: insight.teamCode || null,
           dateCreated: metaDateCreated,
           spend: insight.spend,
@@ -497,7 +520,7 @@ export class ReconcileMarketingService {
         },
         create: {
           tenantId,
-          teamId: order.teamId ?? null,
+          teamId: order.teamId ?? teamIdByShopId.get(order.shopId) ?? null,
           date: dayStart,
           adId: syntheticAdId,
           normalizedAdId: null,
@@ -603,7 +626,7 @@ export class ReconcileMarketingService {
           shops: [order.shopId],
         },
         update: {
-          teamId: order.teamId ?? null,
+          teamId: order.teamId ?? teamIdByShopId.get(order.shopId) ?? null,
           purchasesPos: syntheticAgg.purchasesPos,
           codPos: syntheticAgg.codPos,
           processedPurchasesPos: syntheticAgg.processedPurchasesPos,
@@ -962,6 +985,116 @@ export class ReconcileMarketingService {
         FROM resolved_orders ro
         WHERE o.id = ro.order_id
           AND (COALESCE(o.cogs, 0) <> ro.calc_cogs OR COALESCE(o."totalQuantity", 0) <= 0)
+        `,
+        tenantId,
+        date,
+      );
+
+      await (this.prisma as any).$executeRawUnsafe(
+        `
+        UPDATE pos_orders o
+        SET "teamId" = s."teamId"
+        FROM pos_stores s
+        WHERE o."tenantId" = $1
+          AND o."dateLocal" = $2
+          AND s."tenantId" = o."tenantId"
+          AND s."shopId" = o."shopId"
+          AND s.status = 'ACTIVE'
+          AND (s.enabled = true OR s.enabled IS NULL)
+          AND s."teamId" IS NOT NULL
+          AND o."teamId" IS DISTINCT FROM s."teamId"
+        `,
+        tenantId,
+        date,
+      );
+
+      await (this.prisma as any).$executeRawUnsafe(
+        `
+        WITH orders_needing_items AS (
+          SELECT
+            o.id,
+            GREATEST(COALESCE(o."totalQuantity", 1), 1) AS fallback_qty,
+            CASE
+              WHEN jsonb_typeof(o."orderSnapshot") = 'object'
+               AND jsonb_typeof(o."orderSnapshot"->'items') = 'array'
+               AND jsonb_array_length(o."orderSnapshot"->'items') > 0
+              THEN o."orderSnapshot"->'items'
+              WHEN jsonb_typeof(o."itemData") = 'array'
+               AND jsonb_array_length(o."itemData") > 0
+              THEN o."itemData"
+              ELSE NULL
+            END AS raw_arr,
+            CASE
+              WHEN jsonb_typeof(o."orderSnapshot") = 'object'
+               AND o."orderSnapshot" ? 'items'
+               AND jsonb_typeof(o."orderSnapshot"->'items') <> 'null'
+              THEN o."orderSnapshot"->'items'
+              ELSE o."itemData"
+            END AS effective_arr
+          FROM pos_orders o
+          WHERE o."tenantId" = $1
+            AND o."dateLocal" = $2
+        ),
+        invalid_item_orders AS (
+          SELECT
+            oni.id,
+            CASE
+              WHEN oni.raw_arr IS NOT NULL THEN (
+                SELECT jsonb_agg(
+                  CASE
+                    WHEN jsonb_typeof(elem) = 'object' THEN
+                      jsonb_set(
+                        elem,
+                        '{quantity}',
+                        to_jsonb(
+                          CASE
+                            WHEN jsonb_typeof(elem->'quantity') = 'number'
+                             AND (elem->>'quantity') ~ '^[1-9][0-9]*$'
+                             AND (elem->>'quantity')::bigint <= 100000
+                            THEN (elem->>'quantity')::int
+                            WHEN jsonb_typeof(elem->'quantity') = 'string'
+                             AND BTRIM(elem->>'quantity') ~ '^[1-9][0-9]*$'
+                             AND BTRIM(elem->>'quantity')::bigint <= 100000
+                            THEN BTRIM(elem->>'quantity')::int
+                            ELSE 1
+                          END
+                        ),
+                        true
+                      )
+                    ELSE jsonb_build_object('quantity', 1)
+                  END
+                )
+                FROM jsonb_array_elements(oni.raw_arr) AS elem
+              )
+              ELSE jsonb_build_array(jsonb_build_object('quantity', oni.fallback_qty))
+            END AS fixed_items
+          FROM orders_needing_items oni
+          WHERE oni.effective_arr IS NULL
+             OR jsonb_typeof(oni.effective_arr) <> 'array'
+             OR jsonb_array_length(oni.effective_arr) = 0
+             OR EXISTS (
+               SELECT 1
+               FROM jsonb_array_elements(
+                 CASE WHEN jsonb_typeof(oni.effective_arr) = 'array' THEN oni.effective_arr ELSE '[]'::jsonb END
+               ) AS elem
+               WHERE jsonb_typeof(elem) <> 'object'
+                  OR NOT (
+                    (jsonb_typeof(elem->'quantity') = 'number' AND (elem->>'quantity') ~ '^[1-9][0-9]*$' AND (elem->>'quantity')::bigint <= 100000)
+                    OR (jsonb_typeof(elem->'quantity') = 'string' AND BTRIM(elem->>'quantity') ~ '^[1-9][0-9]*$' AND BTRIM(elem->>'quantity')::bigint <= 100000)
+                  )
+             )
+        )
+        UPDATE pos_orders o
+        SET
+          "itemData" = iio.fixed_items,
+          "orderSnapshot" = jsonb_set(
+            CASE WHEN jsonb_typeof(o."orderSnapshot") = 'object' THEN o."orderSnapshot" ELSE '{}'::jsonb END,
+            '{items}',
+            iio.fixed_items,
+            true
+          )
+        FROM invalid_item_orders iio
+        WHERE o.id = iio.id
         `,
         tenantId,
         date,
