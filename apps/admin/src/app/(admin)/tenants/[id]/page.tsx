@@ -51,8 +51,16 @@ const updateTenantSchema = z.object({
     .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'Slug must be lowercase alphanumeric with hyphens'),
   planType: z.enum(['trial', 'starter', 'professional', 'enterprise']),
   status: z.enum(['TRIAL', 'ACTIVE', 'SUSPENDED', 'CANCELLED']),
-  maxUsers: z.number().min(1).max(10000),
-  maxIntegrations: z.number().min(1).max(100),
+  maxUsers: z
+    .number({ invalid_type_error: 'Enter the maximum number of users' })
+    .int('Use a whole number')
+    .min(1, 'Max users must be at least 1')
+    .max(10000, 'Max users cannot exceed 10,000'),
+  maxIntegrations: z
+    .number({ invalid_type_error: 'Enter the maximum number of integrations' })
+    .int('Use a whole number')
+    .min(1, 'Max integrations must be at least 1')
+    .max(100, 'Max integrations cannot exceed 100'),
   wmsFulfillmentGoLiveAt: z.string().nullable().optional(),
   billingCompanyName: z.string().max(160).nullable().optional(),
   billingAddress: z.string().max(600).nullable().optional(),
@@ -101,24 +109,32 @@ export default function TenantDetailsPage() {
   const {
     register,
     handleSubmit,
-    setValue,
+    reset,
     formState: { errors, isDirty },
   } = useForm<UpdateTenantForm>({
     resolver: zodResolver(updateTenantSchema),
   });
 
-  const getErrorMessage = (error: unknown, fallback: string) => {
-    if (
-      typeof error === 'object'
-      && error !== null
-      && 'response' in error
-      && typeof (error as { response?: unknown }).response === 'object'
-      && (error as { response?: { data?: unknown } }).response?.data
-      && typeof (error as { response?: { data?: { message?: unknown } } }).response?.data?.message === 'string'
-    ) {
-      return (error as { response?: { data?: { message?: string } } }).response?.data?.message ?? fallback;
-    }
+  // Keep the form baseline equal to the saved tenant so "unsaved changes"
+  // and the Save button reflect real edits only.
+  const resetFormFromTenant = (tenantData: TenantRecord) => {
+    reset({
+      name: tenantData.name,
+      slug: tenantData.slug,
+      planType: tenantData.planType,
+      status: tenantData.status,
+      maxUsers: tenantData.maxUsers,
+      maxIntegrations: tenantData.maxIntegrations,
+      wmsFulfillmentGoLiveAt: toDateTimeLocalInputValue(tenantData.wmsFulfillmentGoLiveAt),
+      billingCompanyName: tenantData.billingCompanyName ?? '',
+      billingAddress: tenantData.billingAddress ?? '',
+    });
+  };
 
+  const getErrorMessage = (error: unknown, fallback: string) => {
+    const message = (error as { response?: { data?: { message?: unknown } } })?.response?.data?.message;
+    if (typeof message === 'string' && message.trim()) return message;
+    if (Array.isArray(message) && message.length) return message.map(String).join('. ');
     return fallback;
   };
 
@@ -142,16 +158,7 @@ export default function TenantDetailsPage() {
 
         const tenantData: TenantRecord = response.data;
         setTenant(tenantData);
-
-        setValue('name', tenantData.name);
-        setValue('slug', tenantData.slug);
-        setValue('planType', tenantData.planType);
-        setValue('status', tenantData.status);
-        setValue('maxUsers', tenantData.maxUsers);
-        setValue('maxIntegrations', tenantData.maxIntegrations);
-        setValue('wmsFulfillmentGoLiveAt', toDateTimeLocalInputValue(tenantData.wmsFulfillmentGoLiveAt));
-        setValue('billingCompanyName', tenantData.billingCompanyName ?? '');
-        setValue('billingAddress', tenantData.billingAddress ?? '');
+        resetFormFromTenant(tenantData);
       } catch (error: unknown) {
         setError(getErrorMessage(error, 'Failed to load tenant'));
       } finally {
@@ -160,7 +167,20 @@ export default function TenantDetailsPage() {
     };
 
     fetchTenant();
-  }, [canRead, tenantId, router, setValue]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canRead, tenantId, router]);
+
+  // Arriving from "Create tenant": confirm and point to the next steps.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('created') === '1') {
+      setSuccessMessage('Tenant created. Next: connect their stores under View integrations, then review users.');
+      params.delete('created');
+      const query = params.toString();
+      window.history.replaceState(null, '', `${window.location.pathname}${query ? `?${query}` : ''}`);
+    }
+  }, []);
 
   const refreshTenant = async () => {
     try {
@@ -169,6 +189,7 @@ export default function TenantDetailsPage() {
         headers: { Authorization: `Bearer ${token}` },
       });
       setTenant(response.data);
+      resetFormFromTenant(response.data);
     } catch {
       /* no-op */
     }
@@ -219,11 +240,12 @@ export default function TenantDetailsPage() {
         { status },
         { headers: { Authorization: `Bearer ${token}` } },
       );
+      setError('');
       setSuccessMessage(`Tenant status set to ${formatTenantStatus(status)}`);
-      setValue('status', status);
       await refreshTenant();
     } catch (error: unknown) {
-      setError(getErrorMessage(error, `Failed to set status to ${status}`));
+      setSuccessMessage('');
+      setError(getErrorMessage(error, `Failed to set status to ${formatTenantStatus(status)}`));
     }
   };
 
@@ -231,12 +253,32 @@ export default function TenantDetailsPage() {
     if (!tenant?.slug) {
       return;
     }
+    let copied = false;
     try {
       await navigator.clipboard.writeText(tenant.slug);
+      copied = true;
+    } catch {
+      // Clipboard API can be unavailable (permissions/insecure context);
+      // fall back to a temporary selection.
+      try {
+        const textarea = document.createElement('textarea');
+        textarea.value = tenant.slug;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        copied = document.execCommand('copy');
+        document.body.removeChild(textarea);
+      } catch {
+        copied = false;
+      }
+    }
+    if (copied) {
       setSlugCopied(true);
       setTimeout(() => setSlugCopied(false), 1500);
-    } catch {
-      /* ignore */
+    } else {
+      setError('Could not copy the slug. Select it and copy manually.');
     }
   };
 
@@ -406,6 +448,9 @@ export default function TenantDetailsPage() {
                   className="input"
                   disabled={!canEdit}
                 />
+                {errors.maxUsers ? (
+                  <p className="mt-1.5 text-[12px] text-rose-600">{errors.maxUsers.message}</p>
+                ) : null}
               </WmsFormField>
 
               <WmsFormField label="Max integrations">
@@ -417,6 +462,9 @@ export default function TenantDetailsPage() {
                   className="input"
                   disabled={!canEdit}
                 />
+                {errors.maxIntegrations ? (
+                  <p className="mt-1.5 text-[12px] text-rose-600">{errors.maxIntegrations.message}</p>
+                ) : null}
               </WmsFormField>
             </div>
           </WmsCompactPanel>
@@ -554,13 +602,13 @@ export default function TenantDetailsPage() {
               {tenant.status !== 'ACTIVE' ? (
                 <QuickActionButton
                   icon={<CheckCircle2 className="h-3.5 w-3.5" />}
-                  label="Activate tenant"
+                  label={tenant.status === 'TRIAL' ? 'Activate tenant (end trial)' : 'Activate tenant'}
                   onClick={() => handleStatusAction('ACTIVE')}
                   tone="primary"
                   disabled={!canEdit}
                 />
               ) : null}
-              {tenant.status === 'ACTIVE' ? (
+              {tenant.status === 'ACTIVE' || tenant.status === 'TRIAL' ? (
                 <QuickActionButton
                   icon={<PauseCircle className="h-3.5 w-3.5" />}
                   label="Suspend tenant"
@@ -587,23 +635,31 @@ export default function TenantDetailsPage() {
           <WmsCompactPanel title="Danger zone" icon={<AlertTriangle className='panel-icon' />}>
             <div className="p-5">
               <h3 className="text-[1.1rem] font-semibold tracking-tight text-primary">Cancel tenant</h3>
-              <p className="mt-1.5 text-[13px] leading-5 text-[#6f8290]">
-                Cancellation disables the tenant. Data is retained for compliance.
-              </p>
-              <button
-                type="button"
-                onClick={() =>
-                  handleStatusAction(
-                    'CANCELLED',
-                    'Cancel this tenant? The organization will lose access immediately.',
-                  )
-                }
-                className="btn btn-md btn-destructive btn-icon mt-3 w-full"
-                disabled={!canEdit}
-              >
-                <AlertTriangle className="h-3.5 w-3.5" />
-                Cancel tenant
-              </button>
+              {tenant.status === 'CANCELLED' ? (
+                <p className="mt-1.5 text-[13px] leading-5 text-[#6f8290]">
+                  This tenant is cancelled and its users cannot sign in. Use Activate tenant above to restore access.
+                </p>
+              ) : (
+                <>
+                  <p className="mt-1.5 text-[13px] leading-5 text-[#6f8290]">
+                    Cancellation disables the tenant. Data is retained for compliance.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleStatusAction(
+                        'CANCELLED',
+                        'Cancel this tenant? The organization will lose access immediately.',
+                      )
+                    }
+                    className="btn btn-md btn-destructive btn-icon mt-3 w-full"
+                    disabled={!canEdit}
+                  >
+                    <AlertTriangle className="h-3.5 w-3.5" />
+                    Cancel tenant
+                  </button>
+                </>
+              )}
             </div>
           </WmsCompactPanel>
         </aside>

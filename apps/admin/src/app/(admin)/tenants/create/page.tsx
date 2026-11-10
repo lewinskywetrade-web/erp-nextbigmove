@@ -25,8 +25,11 @@ const createTenantSchema = z.object({
     .string()
     .min(2, 'Tenant slug must be at least 2 characters')
     .max(50)
-    .regex(/^[a-z0-9-]+$/, 'Slug must contain only lowercase letters, numbers, and hyphens'),
-  email: z.string().email('Invalid email address'),
+    .regex(
+      /^[a-z0-9]+(?:-[a-z0-9]+)*$/,
+      'Slug must use lowercase letters and numbers, separated by single hyphens (no hyphen at the start or end)',
+    ),
+  email: z.string().trim().email('Invalid email address'),
   password: z
     .string()
     .min(8, 'Password must be at least 8 characters')
@@ -39,9 +42,22 @@ const createTenantSchema = z.object({
   lastName: z.string().min(2, 'Last name must be at least 2 characters').max(50),
   planType: z.enum(['trial', 'starter', 'professional', 'enterprise']),
   status: z.enum(['TRIAL', 'ACTIVE', 'SUSPENDED', 'CANCELLED']),
-  maxUsers: z.number().min(1).max(10000),
-  maxIntegrations: z.number().min(1).max(100),
-  trialDays: z.number().min(1).max(14).optional(),
+  maxUsers: z
+    .number({ invalid_type_error: 'Enter the maximum number of users' })
+    .int('Use a whole number')
+    .min(1, 'Max users must be at least 1')
+    .max(10000, 'Max users cannot exceed 10,000'),
+  maxIntegrations: z
+    .number({ invalid_type_error: 'Enter the maximum number of integrations' })
+    .int('Use a whole number')
+    .min(1, 'Max integrations must be at least 1')
+    .max(100, 'Max integrations cannot exceed 100'),
+  trialDays: z
+    .number({ invalid_type_error: 'Enter the trial length in days' })
+    .int('Use a whole number')
+    .min(1, 'Trial must be at least 1 day')
+    .max(14, 'Trial cannot exceed 14 days')
+    .optional(),
   billingCompanyName: z.string().max(160).nullable().optional(),
   billingAddress: z.string().max(600).nullable().optional(),
 });
@@ -113,7 +129,9 @@ const createTenantSlugFromName = (value: string) =>
   value
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
-    .replace(/(^-|-$)/g, '');
+    .replace(/(^-|-$)/g, '')
+    .slice(0, 50)
+    .replace(/-+$/g, '');
 
 const sanitizeTenantSlugInput = (value: string) => value.toLowerCase().replace(/[^a-z0-9-]+/g, '');
 
@@ -175,25 +193,18 @@ export default function CreateTenantPage() {
   });
 
   const getErrorMessage = (error: unknown, fallback: string) => {
-    if (
-      typeof error === 'object'
-      && error !== null
-      && 'response' in error
-      && typeof (error as { response?: unknown }).response === 'object'
-      && (error as { response?: { data?: unknown } }).response?.data
-      && typeof (error as { response?: { data?: { message?: unknown } } }).response?.data?.message === 'string'
-    ) {
-      return (error as { response?: { data?: { message?: string } } }).response?.data?.message ?? fallback;
-    }
-
+    const message = (error as { response?: { data?: { message?: unknown } } })?.response?.data?.message;
+    if (typeof message === 'string' && message.trim()) return message;
+    if (Array.isArray(message) && message.length) return message.map(String).join('. ');
     return fallback;
   };
 
   const planType = watch('planType');
+  const status = watch('status');
   const trialDaysField = register('trialDays', { valueAsNumber: true });
 
   const handleTenantNameChange = (name: string) => {
-    setValue('tenantSlug', createTenantSlugFromName(name));
+    setValue('tenantSlug', createTenantSlugFromName(name), { shouldValidate: false });
   };
 
   const handlePlanSelect = (preset: PlanPreset) => {
@@ -214,15 +225,27 @@ export default function CreateTenantPage() {
         return;
       }
 
-      await apiClient.post('/tenants', data, {
+      const response = await apiClient.post('/tenants', {
+        ...data,
+        tenantName: data.tenantName.trim(),
+        email: data.email.trim().toLowerCase(),
+        firstName: data.firstName.trim(),
+        lastName: data.lastName.trim(),
+        // A trial length only applies to tenants that start on trial.
+        trialDays: data.status === 'TRIAL' ? data.trialDays : undefined,
+        billingCompanyName: data.billingCompanyName?.trim() || undefined,
+        billingAddress: data.billingAddress?.trim() || undefined,
+      }, {
         headers: { Authorization: `Bearer ${token}` },
       });
 
-      router.push('/tenants');
+      const createdId = (response.data as { tenant?: { id?: string } })?.tenant?.id;
+      router.push(createdId ? `/tenants/${createdId}?created=1` : '/tenants');
     } catch (error: unknown) {
       setError(getErrorMessage(error, 'Failed to create tenant. Please try again.'));
-    } finally {
       setIsLoading(false);
+      // The notice renders at the top of the form.
+      window.scrollTo({ top: 0, behavior: 'smooth' });
     }
   };
 
@@ -401,7 +424,7 @@ export default function CreateTenantPage() {
                 </select>
               </WmsFormField>
 
-              {planType === 'trial' ? (
+              {status === 'TRIAL' ? (
                 <WmsFormField label="Trial duration (days)">
                   <input
                     {...trialDaysField}
@@ -421,6 +444,9 @@ export default function CreateTenantPage() {
                     }}
                     className="input"
                   />
+                  {errors.trialDays ? (
+                    <p className="mt-1.5 text-[12px] text-rose-600">{errors.trialDays.message}</p>
+                  ) : null}
                 </WmsFormField>
               ) : null}
 
@@ -432,6 +458,9 @@ export default function CreateTenantPage() {
                   max={10000}
                   className="input"
                 />
+                {errors.maxUsers ? (
+                  <p className="mt-1.5 text-[12px] text-rose-600">{errors.maxUsers.message}</p>
+                ) : null}
               </WmsFormField>
 
               <WmsFormField label="Max integrations">
@@ -442,6 +471,9 @@ export default function CreateTenantPage() {
                   max={100}
                   className="input"
                 />
+                {errors.maxIntegrations ? (
+                  <p className="mt-1.5 text-[12px] text-rose-600">{errors.maxIntegrations.message}</p>
+                ) : null}
               </WmsFormField>
             </div>
           </div>

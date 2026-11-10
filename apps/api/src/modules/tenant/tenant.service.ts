@@ -20,8 +20,6 @@ export class TenantService {
   async createTenant(createTenantDto: CreateTenantDto) {
     const {
       tenantName,
-      tenantSlug,
-      email,
       password,
       firstName,
       lastName,
@@ -33,6 +31,10 @@ export class TenantService {
       billingCompanyName,
       billingAddress,
     } = createTenantDto;
+    const tenantSlug = createTenantDto.tenantSlug.trim().toLowerCase();
+    // Login lowercases the email, so the owner must be stored the same way or
+    // the new partner admin can never sign in.
+    const email = createTenantDto.email.trim().toLowerCase();
 
     // Check if tenant slug already exists
     const existingTenant = await this.prisma.tenant.findUnique({
@@ -43,14 +45,18 @@ export class TenantService {
       throw new ConflictException('Tenant slug already exists');
     }
 
-    // Check if user email already exists (across all tenants)
+    // Check if user email already exists (across all tenants, any letter case)
     const existingUser = await this.prisma.user.findFirst({
-      where: { email },
+      where: { email: { equals: email, mode: 'insensitive' } },
     });
 
     if (existingUser) {
       throw new ConflictException('Email already registered');
     }
+
+    const trialEndsAt = status === 'TRIAL' && trialDays && trialDays > 0
+      ? new Date(Date.now() + trialDays * 24 * 60 * 60 * 1000)
+      : null;
 
     // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -62,13 +68,14 @@ export class TenantService {
     const result = await this.prisma.$transaction(async (tx) => {
       const tenant = await tx.tenant.create({
         data: {
-          name: tenantName,
+          name: tenantName.trim(),
           slug: tenantSlug,
           encryptionKey,
           status: status as any,
           planType,
           maxUsers,
           maxIntegrations,
+          trialEndsAt,
           billingCompanyName: billingCompanyName?.trim() || null,
           billingAddress: billingAddress?.trim() || null,
         },
@@ -79,8 +86,8 @@ export class TenantService {
         data: {
           email,
           password: hashedPassword,
-          firstName,
-          lastName,
+          firstName: firstName.trim(),
+          lastName: lastName.trim(),
           tenantId: tenant.id,
           role: 'USER',
           status: 'ACTIVE',
@@ -246,6 +253,11 @@ export class TenantService {
       updateData.wmsFulfillmentGoLiveAt = updateTenantDto.wmsFulfillmentGoLiveAt
         ? new Date(updateTenantDto.wmsFulfillmentGoLiveAt)
         : null;
+    }
+
+    // A trial end date only applies while the tenant is on trial.
+    if (updateTenantDto.status && updateTenantDto.status !== 'TRIAL') {
+      updateData.trialEndsAt = null;
     }
 
     const updatedTenant = await this.prisma.tenant.update({

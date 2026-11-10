@@ -35,6 +35,8 @@ model Tenant {
   billingCompanyName     String?
   billingAddress         String?
   wmsFulfillmentGoLiveAt DateTime?
+  // End of a TRIAL plan, set from the admin "Trial duration (days)" field.
+  trialEndsAt            DateTime?
 
   // Timestamps
   createdAt DateTime @default(now())

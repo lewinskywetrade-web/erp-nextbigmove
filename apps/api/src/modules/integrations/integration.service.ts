@@ -321,10 +321,14 @@ export class IntegrationService {
       && reconcileIntervalRaw <= 3600
         ? Math.floor(reconcileIntervalRaw)
         : undefined;
-    const reconcileIntervalSeconds = Math.max(
-      configuredReconcileIntervalSeconds ?? this.getDefaultWebhookReconcileIntervalSeconds(),
-      Math.ceil(this.getMinimumWebhookReconcileDelayMs() / 1000),
-    );
+    // Show the effective window: legacy minimums (300s) are capped to seconds.
+    const reconcileIntervalSeconds = Math.max(10, Math.round(resolvePancakeReconcileDelayMs({
+      configuredMs: Math.max(
+        configuredReconcileIntervalSeconds ?? this.getDefaultWebhookReconcileIntervalSeconds(),
+        Math.ceil(this.getMinimumWebhookReconcileDelayMs() / 1000),
+      ) * 1000,
+      maxDelayMs: Number(process.env.PANCAKE_WEBHOOK_RECONCILE_MAX_DELAY_MS),
+    }) / 1000));
     const reconcileModeRaw = typeof webhook.reconcileMode === 'string' ? webhook.reconcileMode : '';
     const configuredReconcileMode: 'incremental' | 'full_reset' | undefined =
       reconcileModeRaw === 'incremental' || reconcileModeRaw === 'full_reset'
@@ -1470,10 +1474,12 @@ export class IntegrationService {
   }
 
   private getDefaultWebhookReconcileIntervalSeconds(): number {
-    const delayMs = Math.max(
-      0,
-      Number(process.env.PANCAKE_WEBHOOK_RECONCILE_DELAY_MS || 300000),
-    );
+    // Report the effective (capped) window so the WMS settings screen does not
+    // advertise the legacy five-minute delay.
+    const delayMs = resolvePancakeReconcileDelayMs({
+      configuredMs: Math.max(0, Number(process.env.PANCAKE_WEBHOOK_RECONCILE_DELAY_MS || 300000)),
+      maxDelayMs: Number(process.env.PANCAKE_WEBHOOK_RECONCILE_MAX_DELAY_MS),
+    });
     return Math.max(10, Math.round(delayMs / 1000));
   }
 

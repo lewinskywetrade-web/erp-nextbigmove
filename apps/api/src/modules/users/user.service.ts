@@ -184,12 +184,19 @@ export class UserService {
 
   async create(dto: CreateUserDto) {
     const tenantId = this.getTenant();
+    // Login lowercases the email; store it the same way so the user can sign in.
+    const email = dto.email.trim().toLowerCase();
 
     const existing = await this.prisma.user.findFirst({
-      where: { email: dto.email, tenantId },
+      where: { email: { equals: email, mode: 'insensitive' } },
+      select: { tenantId: true },
     });
     if (existing) {
-      throw new ConflictException('Email already exists in this tenant');
+      // Login resolves one identity per email, so a second row in another
+      // tenant would make sign-in ambiguous. Grant access instead.
+      throw new ConflictException(existing.tenantId === tenantId
+        ? 'Email already exists in this tenant'
+        : 'An account with this email already exists. Use "Add existing user" to give it access to this tenant.');
     }
 
     this.assertWmsRoleAssignmentAccess(dto.wmsRoleId);
@@ -214,7 +221,7 @@ export class UserService {
 
     const user = await this.prisma.user.create({
       data: {
-        email: dto.email,
+        email,
         password: hashed,
         firstName: dto.firstName,
         lastName: dto.lastName,
@@ -280,7 +287,9 @@ export class UserService {
       });
     }
 
-    return user;
+    // Never return the password hash to the client.
+    const { password: _password, ...safeUser } = user;
+    return safeUser;
   }
 
   async findAll() {

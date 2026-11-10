@@ -3024,9 +3024,29 @@ async function diagnoseErpFreshness() {
   }
 }
 
+/** Login lowercases the typed email, so accounts saved with capital letters
+ * (older tenant/user creation paths) could never sign in. Normalize them when
+ * no other account shares the same email in any letter case. Idempotent. */
+async function normalizeUserEmails() {
+  try {
+    const updated = await prisma.$executeRawUnsafe(`
+      UPDATE users u SET email = lower(btrim(u.email)), "updatedAt" = now()
+      WHERE u.email <> lower(btrim(u.email))
+        AND NOT EXISTS (
+          SELECT 1 FROM users o WHERE o.id <> u.id AND lower(btrim(o.email)) = lower(btrim(u.email))
+        )`);
+    const [conflicts] = await prisma.$queryRawUnsafe<any[]>(`
+      SELECT count(*)::int AS n FROM users u WHERE u.email <> lower(btrim(u.email))`);
+    console.log(`✓ Normalized user emails to lowercase: updated=${updated}, leftWithCaseConflicts=${conflicts?.n ?? 0}`);
+  } catch (err: any) {
+    console.error('Warning during user email normalization:', err?.message || err);
+  }
+}
+
 async function main() {
   console.log('Starting database seed...');
   await ensureSuperAdmin();
+  await normalizeUserEmails();
   await seedPermissions();
   await seedRoles();
   await ensureDefaultTeamsAndBackfill();
