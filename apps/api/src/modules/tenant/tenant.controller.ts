@@ -52,6 +52,12 @@ export class TenantController {
   /**
    * Get a single tenant
    */
+  @Get(':id/users')
+  @Permissions('wms.partners.read')
+  async findUsers(@Param('id') id: string) {
+    return this.tenantService.findUsers(id);
+  }
+
   @Get(':id')
   @Permissions('wms.partners.read')
   async findOne(@Param('id') id: string) {

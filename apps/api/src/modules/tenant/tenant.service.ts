@@ -160,6 +160,60 @@ export class TenantService {
   }
 
   /**
+   * List a partner's ERP user accounts for the WMS Partners screen: accounts
+   * homed in the tenant plus identities granted active membership. Warehouse
+   * staff (WMS-workspace roles) are excluded, matching the tenant's own
+   * Settings → Users grid. Roles are scoped to this tenant only.
+   */
+  async findUsers(id: string) {
+    const tenant = await this.prisma.tenant.findUnique({ where: { id }, select: { id: true, name: true } });
+    if (!tenant) {
+      throw new NotFoundException('Tenant not found');
+    }
+
+    const users = await this.prisma.user.findMany({
+      where: {
+        OR: [
+          { tenantId: id },
+          { tenantMemberships: { some: { tenantId: id, status: 'ACTIVE' } } },
+        ],
+        NOT: {
+          userRoleAssignments: { some: { workspace: toStoredPermissionWorkspace('wms') } },
+        },
+      },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        role: true,
+        status: true,
+        tenantId: true,
+        createdAt: true,
+        lastLoginAt: true,
+        userRoleAssignments: {
+          where: { tenantId: id },
+          select: {
+            role: { select: { name: true, key: true } },
+            team: { select: { name: true } },
+          },
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    return {
+      tenant,
+      users: users.map(({ userRoleAssignments, tenantId, ...user }) => ({
+        ...user,
+        membership: tenantId === id ? 'HOME' : 'GRANTED',
+        roles: Array.from(new Set(userRoleAssignments.map((assignment) => assignment.role?.name).filter(Boolean))),
+        teams: Array.from(new Set(userRoleAssignments.map((assignment) => assignment.team?.name).filter(Boolean))),
+      })),
+    };
+  }
+
+  /**
    * Update a tenant
    */
   async update(id: string, updateTenantDto: UpdateTenantDto) {
