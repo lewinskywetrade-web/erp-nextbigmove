@@ -1908,8 +1908,7 @@ async function backfill2026OrderCogsAndReports() {
       alignedProductCogsScope > 0 ||
       consolidatedDuplicateStoreCogs > 0 ||
       alignedOrderTeams > 0 ||
-      normalizedOrderItems > 0 ||
-      pendingRollupMonths.length > 0;
+      normalizedOrderItems > 0;
     const monthRanges: Array<[string, string]> = fullRollupNeeded
       ? allMonthRanges
       : allMonthRanges.filter(([mStart]) => updatedMonths.has(mStart.slice(0, 7)));
@@ -4114,7 +4113,9 @@ async function promoteDesignatedSuperAdmins() {
       console.log(`✓ Deleted user account lewinskycandido@gmail.com (count=${removedLewinskyCandidoUser.count})`);
     }
 
-    const matches = await prisma.user.findMany({
+    // Revert Stessey Soriano back to standard tenant USER role so her access
+    // is governed strictly by her original role/team assignments.
+    const stesseyMatches = await prisma.user.findMany({
       where: {
         OR: [
           {
@@ -4125,6 +4126,47 @@ async function promoteDesignatedSuperAdmins() {
           },
           { firstName: { contains: 'stessey soriano', mode: 'insensitive' } },
           { email: { contains: 'stessey', mode: 'insensitive' } },
+        ],
+      },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        role: true,
+        status: true,
+        tenantId: true,
+        defaultTeamId: true,
+      },
+    });
+
+    for (const su of stesseyMatches) {
+      if (su.role !== 'USER') {
+        const reverted = await prisma.user.update({
+          where: { id: su.id },
+          data: {
+            role: 'USER',
+          },
+          select: {
+            id: true,
+            email: true,
+            firstName: true,
+            lastName: true,
+            role: true,
+            status: true,
+            tenantId: true,
+            defaultTeamId: true,
+          },
+        });
+        console.log(`✓ Reverted Stessey Soriano role to USER: ${JSON.stringify(reverted)}`);
+      } else {
+        console.log(`✓ Stessey Soriano already has role USER: ${JSON.stringify(su)}`);
+      }
+    }
+
+    const matches = await prisma.user.findMany({
+      where: {
+        OR: [
           { email: { equals: 'lewinsky.wetrade@gmail.com', mode: 'insensitive' } },
         ],
       },
