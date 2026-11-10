@@ -254,19 +254,19 @@ export default function CreateTenantPage() {
 
   return (
     <WmsPageShell
-      title="Create tenant"
+      title="Create client"
       actions={
         <Link
           href="/tenants"
           className="btn btn-lg btn-outline btn-icon"
         >
           <ArrowLeft className="h-3.5 w-3.5" />
-          Back to tenants
+          Back to clients
         </Link>
       }
     >
       {!canWrite ? (
-        <WmsInlineNotice tone="error">You do not have permission to create partners.</WmsInlineNotice>
+        <WmsInlineNotice tone="error">You do not have permission to create clients.</WmsInlineNotice>
       ) : null}
       {error ? <WmsInlineNotice tone="error">{error}</WmsInlineNotice> : null}
 
@@ -293,7 +293,7 @@ export default function CreateTenantPage() {
 
             <div className="sm:col-span-2">
               <WmsFormField
-                label="Tenant slug"
+                label="Client slug"
                 hint="Used in URLs. Lowercase letters, numbers, and hyphens only."
               >
                 <input
@@ -548,7 +548,7 @@ export default function CreateTenantPage() {
             <div>
               <WmsFormField
                 label="Billing company name"
-                hint="Default bill-to company name used when WMS generates invoices for this partner."
+                hint="Default bill-to company name used when WMS generates invoices for this client."
               >
                 <input
                   {...register('billingCompanyName')}
@@ -565,12 +565,12 @@ export default function CreateTenantPage() {
             <div>
               <WmsFormField
                 label="Billing address"
-                hint="Default bill-to address shown on WMS invoices for this partner."
+                hint="Default bill-to address shown on WMS invoices for this client."
               >
                 <textarea
                   {...register('billingAddress')}
                   className="input min-h-[120px] py-3"
-                  placeholder="Partner billing address"
+                  placeholder="Client billing address"
                 />
               </WmsFormField>
               {errors.billingAddress ? (
@@ -592,7 +592,7 @@ export default function CreateTenantPage() {
             disabled={isLoading || !canWrite}
             className="btn btn-md btn-primary"
           >
-            {isLoading ? 'Creating…' : 'Create tenant'}
+            {isLoading ? 'Creating…' : 'Create client'}
           </button>
         </div>
       </form>

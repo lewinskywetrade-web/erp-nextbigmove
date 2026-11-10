@@ -171,7 +171,7 @@ export function ForecastScreen() {
               )}
 
               <WmsSearchableSelect
-                label="Partner"
+                label="Client"
                 value={controller.selectedTenantId ?? ''}
                 onChange={(value) => controller.changeTenant(value || undefined)}
                 options={controller.tenantOptions.map((tenant) => ({
@@ -180,8 +180,8 @@ export function ForecastScreen() {
                   selectedLabel: tenant.name,
                   hint: tenant.slug ?? undefined,
                 }))}
-                placeholder="Search partners..."
-                allLabel="All partners"
+                placeholder="Search clients..."
+                allLabel="All clients"
                 hideInlineLabel
               />
 

@@ -42,7 +42,7 @@ export function ProfileSummaryCard({
       </div>
       <div className="mt-4 space-y-2 rounded-xl border border-slate-200 bg-slate-50/85 dark:bg-background-secondary dark:border-border px-4 py-3 text-sm text-slate-600 dark:text-slate-300">
         <div className="flex items-center justify-between">
-          <span>Tenant</span>
+          <span>Client</span>
           <span className="font-semibold text-foreground">{tenantName || '—'}</span>
         </div>
         <div className="flex items-center justify-between">

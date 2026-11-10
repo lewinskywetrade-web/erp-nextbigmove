@@ -49,12 +49,12 @@ export default function AiSettingsPage() {
       {!controller.config.permissions.canManageConnections ? (
         <div className="flex gap-3 rounded-xl border border-info/30 bg-info-soft/30 p-4">
           <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-info" />
-          <div><p className="text-sm font-semibold text-foreground">Connection managed by tenant admin</p><p className="mt-1 text-sm text-muted">You can view this tenant’s connection status and allowed defaults. Ask the tenant administrator to connect or disconnect an account.</p></div>
+          <div><p className="text-sm font-semibold text-foreground">Connection managed by client admin</p><p className="mt-1 text-sm text-muted">You can view this client’s connection status and allowed defaults. Ask the client administrator to connect or disconnect an account.</p></div>
         </div>
       ) : null}
 
       <section>
-        <div className="mb-3"><h2 className="text-base font-semibold text-foreground">Tenant connections</h2><p className="mt-1 text-sm text-muted">Each provider is isolated to the active tenant and shows whether it is ready before users begin an analysis.</p></div>
+        <div className="mb-3"><h2 className="text-base font-semibold text-foreground">Client connections</h2><p className="mt-1 text-sm text-muted">Each provider is isolated to the active client and shows whether it is ready before users begin an analysis.</p></div>
         <div className="grid gap-4 lg:grid-cols-2">
           {controller.config.providers.map((status) => (
             <AiProviderCard

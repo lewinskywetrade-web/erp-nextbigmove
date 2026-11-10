@@ -54,7 +54,7 @@ export function OutboundRecordDetailPanel({ record, onClose }: OutboundRecordDet
           <div className="mt-4 grid gap-3 sm:grid-cols-2">
             <Detail label="Barcode" value={record.unit.barcode} />
             <Detail label="Tracking" value={record.trackingCode ?? 'Not assigned'} />
-            <Detail label="Partner" value={record.tenant.name} />
+            <Detail label="Client" value={record.tenant.name} />
             <Detail label="Store" value={record.store.name} />
             <Detail label="Warehouse" value={`${record.warehouse.code} · ${record.warehouse.name}`} />
             <Detail label="Variation" value={record.product.variationId} />

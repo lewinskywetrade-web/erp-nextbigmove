@@ -47,7 +47,7 @@ export const WMS_NAV_ITEMS: WmsNavItem[] = [
   },
   {
     href: '/tenants',
-    label: 'Partners',
+    label: 'Clients',
     icon: Building2,
     permission: 'wms.partners.read',
   },
@@ -135,14 +135,9 @@ export const WMS_NAV_ITEMS: WmsNavItem[] = [
     permission: 'wms.forecast.read',
   },
   {
+    href: '/reports',
     label: 'Reports',
     icon: ClipboardList,
-    children: [
-      {
-        href: '/reports',
-        label: 'Month-End Stock',
-        permission: 'wms.reports.month_end_stock.read',
-      },
-    ],
+    permission: ['wms.reports.month_end_stock.read', 'wms.inventory.read', 'wms.partners.read'],
   },
 ];

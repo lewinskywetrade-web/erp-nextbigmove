@@ -31,12 +31,12 @@ export function WmsScopeFilterFields({
     <>
       {onTenantChange ? (
         <WmsSearchableSelect
-          label="Partner"
+          label="Client"
           value={selectedTenantId ?? ''}
           onChange={(value) => onTenantChange(value || undefined)}
           options={tenantOptions}
-          placeholder="Search partners…"
-          allLabel={allowAllTenants ? 'All partners' : 'Select partner'}
+          placeholder="Search clients…"
+          allLabel={allowAllTenants ? 'All clients' : 'Select client'}
           clearable={allowAllTenants}
           hideInlineLabel={true}
         />

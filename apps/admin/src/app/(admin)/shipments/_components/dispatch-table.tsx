@@ -109,7 +109,7 @@ function DispatchOutboundRow({
       <td className="px-5 py-4">
         <div className="min-w-0">
           <p className="font-semibold text-primary">#{task.posOrderId}</p>
-          <p className="mt-1 text-sm text-[#678090]">{task.store?.tenantName ?? 'Tenant'}</p>
+          <p className="mt-1 text-sm text-[#678090]">{task.store?.tenantName ?? 'Client'}</p>
         </div>
       </td>
       <td className="px-5 py-4 text-sm text-primary">{task.customer.name ?? 'Unknown customer'}</td>
@@ -168,7 +168,7 @@ function DispatchReturnRow({
       <td className="px-5 py-4">
         <div className="min-w-0">
           <p className="font-semibold text-primary">#{task.posOrderId}</p>
-          <p className="mt-1 text-sm text-[#678090]">{task.store?.tenantName ?? 'Tenant'}</p>
+          <p className="mt-1 text-sm text-[#678090]">{task.store?.tenantName ?? 'Client'}</p>
         </div>
       </td>
       <td className="px-5 py-4 text-sm text-primary">{task.customer.name ?? 'Unknown customer'}</td>

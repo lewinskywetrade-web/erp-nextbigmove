@@ -54,3 +54,95 @@ export type PosOrdersReportTotals = {
   qty: PosOrdersReportQtyBlock;
   revenue: PosOrdersReportRevenueBlock;
 };
+
+export type ErpDailyInventoryMovementRow = {
+  rowId: string;
+  tenantId: string;
+  tenantName: string;
+  storeId: string;
+  storeName: string;
+  shopId: string;
+  productId: string;
+  variationId: string | null;
+  variantCode: string | null;
+  variantDisplayId: string | null;
+  variantName: string;
+  receivedInQty: number;
+  manualInQty: number;
+  restockedInQty: number;
+  totalInQty: number;
+  putAwayMovedQty: number;
+  dispatchedOutQty: number;
+  packedOutQty: number;
+  adjustedOutQty: number;
+  totalOutQty: number;
+  netChangeQty: number;
+  receivedQty: number;
+  stagedQty: number;
+  awaitingPutAwayQty: number;
+  putAwayQty: number;
+  reservedQty: number;
+  inBinQty: number;
+  onHandQty: number;
+  lastMovementAt: string | null;
+};
+
+export type ErpDailyInventorySubscription = {
+  tenantId: string;
+  tenantName: string;
+  enabled: boolean;
+  recipients: string[];
+  defaultRecipients: string[];
+  effectiveRecipients: string[];
+  sendTimeManila: string;
+  lastSentAt: string | null;
+  lastSentDate: string | null;
+  lastDeliveryStatus: string | null;
+  lastDeliveryMode: string | null;
+  lastError: string | null;
+};
+
+export type ErpDailyInventoryReportResponse = {
+  report: {
+    key: 'DAILY_INVENTORY_INS_OUTS';
+    label: string;
+    generatedAt: string;
+    startDate: string;
+    endDate: string;
+    timezone: string;
+  };
+  filters: {
+    stores: Array<{
+      id: string;
+      tenantId: string;
+      tenantName: string;
+      shopId: string;
+      name: string;
+    }>;
+    selectedStoreIds: string[];
+    effectiveStoreIds: string[];
+  };
+  totals: {
+    variantCount: number;
+    activeMovedVariantCount: number;
+    receivedInQty: number;
+    manualInQty: number;
+    restockedInQty: number;
+    totalInQty: number;
+    putAwayMovedQty: number;
+    dispatchedOutQty: number;
+    packedOutQty: number;
+    adjustedOutQty: number;
+    totalOutQty: number;
+    netChangeQty: number;
+    receivedQty: number;
+    stagedQty: number;
+    awaitingPutAwayQty: number;
+    putAwayQty: number;
+    reservedQty: number;
+    inBinQty: number;
+    onHandQty: number;
+  };
+  rows: ErpDailyInventoryMovementRow[];
+  subscriptions: ErpDailyInventorySubscription[];
+};

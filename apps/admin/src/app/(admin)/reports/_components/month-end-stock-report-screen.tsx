@@ -68,8 +68,8 @@ export function MonthEndStockReportScreen() {
 
             <div className="flex flex-wrap items-center gap-2">
               <WmsCheckboxMultiSelect
-                label="Partner"
-                allLabel="All partners"
+                label="Client"
+                allLabel="All clients"
                 options={(controller.data?.filters.partners ?? []).map((partner) => ({
                   value: partner.id,
                   label: partner.name,
@@ -77,7 +77,7 @@ export function MonthEndStockReportScreen() {
                 }))}
                 selectedValues={controller.selectedTenantIds}
                 onChange={controller.setSelectedTenantIds}
-                placeholder="Search partners…"
+                placeholder="Search clients…"
               />
               <WmsCheckboxMultiSelect
                 label="Store"

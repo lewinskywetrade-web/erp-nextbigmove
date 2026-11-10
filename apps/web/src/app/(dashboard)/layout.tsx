@@ -99,7 +99,7 @@ const baseNavigation: NavLink[] = [
   {
     href: '/reports',
     label: 'Reports',
-    description: 'Tenant-wide POS exports',
+    description: 'Client-wide POS & inventory exports',
     icon: <FileSpreadsheet className={iconClasses} />,
   },
   {
@@ -1219,7 +1219,7 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
                   onClick={() => setIsTenantMenuOpen((prev) => !prev)}
                   className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3 py-1 text-sm font-semibold text-foreground shadow-sm hover:border-primary/60 focus:border-primary focus:outline-none disabled:opacity-60"
                 >
-                  <span>Workspace:</span>
+                  <span>Client:</span>
                   <span className="text-primary">
                     {memberships.find((m) => m.tenantId === activeTenantId)?.name ?? 'Choose'}
                   </span>

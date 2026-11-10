@@ -23,7 +23,7 @@ export function TenantsTable({ tenants, isLoading }: TenantsTableProps) {
       <table className="min-w-full border-separate border-spacing-0">
         <thead>
           <tr className="bg-[#eaf0f4] text-left">
-            <HeaderCell>Tenant</HeaderCell>
+            <HeaderCell>Client</HeaderCell>
             <HeaderCell>Status</HeaderCell>
             <HeaderCell>Plan</HeaderCell>
             <HeaderCell>Users</HeaderCell>
@@ -51,9 +51,9 @@ export function TenantsTable({ tenants, isLoading }: TenantsTableProps) {
                   <span className="flex h-12 w-12 items-center justify-center rounded-full border border-[#dce4ea] bg-[#fbfcfc] text-[#5e8196]">
                     <Building2 className="h-5 w-5" />
                   </span>
-                  <p className="text-sm font-semibold text-primary">No tenants yet</p>
+                  <p className="text-sm font-semibold text-primary">No clients yet</p>
                   <p className="text-[12.5px] text-[#7b8e9c]">
-                    Create your first tenant organization to get started.
+                    Create your first client organization to get started.
                   </p>
                 </div>
               </td>

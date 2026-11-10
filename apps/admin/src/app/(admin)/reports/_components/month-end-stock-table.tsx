@@ -38,7 +38,7 @@ export function MonthEndStockTable({ rows, isLoading }: { rows: MonthEndStockRow
           <input
             value={search}
             onChange={(event) => { setSearch(event.target.value); setPage(1); }}
-            placeholder="Search variant, store, or partner"
+            placeholder="Search variant, store, or client"
             className="min-w-0 flex-1 border-0 bg-transparent text-sm text-primary outline-none placeholder:text-[#94a3b8]"
           />
         </label>
@@ -48,7 +48,7 @@ export function MonthEndStockTable({ rows, isLoading }: { rows: MonthEndStockRow
         <table className="w-full min-w-[840px] border-collapse text-left text-sm">
           <thead className="bg-[#f6f8fa] text-[10px] font-semibold uppercase tracking-[0.14em] text-[#6f8290]">
             <tr>
-              <th className="px-4 py-3">Partner</th>
+              <th className="px-4 py-3">Client</th>
               <th className="px-4 py-3">Store</th>
               <th className="px-4 py-3">Variant</th>
               <th className="px-4 py-3 text-right">Put away</th>

@@ -111,7 +111,7 @@ export default function TenantsPage() {
   return (
     <div className="space-y-5">
       <WmsPageShell
-        title="Tenants"
+        title="Clients"
         actions={
           canWrite ? (
             <Link
@@ -119,18 +119,18 @@ export default function TenantsPage() {
               className="btn btn-md btn-primary btn-icon"
             >
               <Plus className="h-4 w-4" />
-              New Tenant
+              New Client
             </Link>
           ) : null
         }
       >
         {!canRead ? (
-          <WmsInlineNotice tone="error">You do not have permission to view partners.</WmsInlineNotice>
+          <WmsInlineNotice tone="error">You do not have permission to view clients.</WmsInlineNotice>
         ) : null}
         {error ? <WmsInlineNotice tone="error">{error}</WmsInlineNotice> : null}
 
         <div className="grid gap-3 xl:grid-cols-4">
-          <InsightCard label="Total tenants" value={summary.total.toLocaleString()} />
+          <InsightCard label="Total clients" value={summary.total.toLocaleString()} />
           <InsightCard label="Active" value={summary.active.toLocaleString()} tone="success" />
           <InsightCard label="Trial" value={summary.trial.toLocaleString()} tone="info" />
           <InsightCard label="Suspended" value={summary.suspended.toLocaleString()} tone="warning" />
@@ -160,7 +160,7 @@ export default function TenantsPage() {
                 <span className="font-semibold text-primary">
                   {tenants.length.toLocaleString()}
                 </span>{' '}
-                tenant{tenants.length === 1 ? '' : 's'}
+                client{tenants.length === 1 ? '' : 's'}
               </span>
               <span className="pill pill-neutral">
                 {isLoading ? 'Loading…' : 'Up to date'}

@@ -678,7 +678,7 @@ export default function UsersPage() {
                       Default team
                     </label>
                     <div className="rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] px-4 py-2 text-sm text-[#94A3B8]">
-                      All Teams (Tenant Admin)
+                      All Teams (Client Admin)
                     </div>
                   </div>
                 ) : (
@@ -808,7 +808,7 @@ export default function UsersPage() {
                     Default team
                   </label>
                   <div className="rounded-xl border border-[#E2E8F0] bg-[#F8FAFC] px-4 py-2 text-sm text-[#94A3B8]">
-                    All Teams (Tenant Admin)
+                    All Teams (Client Admin)
                   </div>
                 </div>
               ) : (

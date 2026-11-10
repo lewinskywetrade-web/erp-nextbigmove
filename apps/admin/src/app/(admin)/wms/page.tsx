@@ -23,7 +23,7 @@ const readinessCards = [
 }>;
 
 const setupChips = ['Access', 'Warehouses', 'Products', 'Receiving', 'Inventory'];
-const planModules = ['Partners', 'Purchasing', 'Warehouses', 'Products', 'Receiving', 'Inventory'];
+const planModules = ['Clients', 'Purchasing', 'Warehouses', 'Products', 'Receiving', 'Inventory'];
 
 export default function WmsHomePage() {
   const { data, isLoading, error } = useQuery({
@@ -100,7 +100,7 @@ export default function WmsHomePage() {
             <div className="flex items-center justify-between rounded-xl border border-[#dce4ea] bg-[#fbfcfc] px-4 py-3.5">
               <div>
                 <p className="text-[13px] font-semibold text-primary">
-                  {data?.tenantReady ? 'Partner context ready' : 'Partner context pending'}
+                  {data?.tenantReady ? 'Client context ready' : 'Client context pending'}
                 </p>
                 <p className="mt-1 text-[12px] text-[#617685]">{data?.context?.userRole ?? 'Unknown role'}</p>
               </div>

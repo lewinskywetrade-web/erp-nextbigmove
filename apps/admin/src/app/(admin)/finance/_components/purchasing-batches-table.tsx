@@ -51,8 +51,8 @@ export function PurchasingBatchesTable({
               ))
             ) : !tenantReady ? (
               <StateRow
-                title="Tenant context required"
-                message="Open a tenant context first before reviewing purchasing batches."
+                title="Client context required"
+                message="Select a client first before reviewing purchasing batches."
               />
             ) : batches.length === 0 ? (
               <StateRow

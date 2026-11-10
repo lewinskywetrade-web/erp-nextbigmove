@@ -138,12 +138,12 @@ export function OutboundRecordsFilterBar({
       </div>
 
       <WmsSearchableSelect
-        label="Partner"
+        label="Client"
         value={selectedTenantId ?? ''}
         onChange={(value) => onTenantChange(value || undefined)}
         options={tenantOptions}
-        placeholder="Search partners…"
-        allLabel="All partners"
+        placeholder="Search clients…"
+        allLabel="All clients"
         hideInlineLabel
       />
 

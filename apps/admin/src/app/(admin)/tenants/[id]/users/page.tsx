@@ -112,19 +112,19 @@ export default function PartnerUsersPage() {
   const backAction = (
     <Link href={`/tenants/${tenantId}`} className="btn btn-md btn-outline btn-icon">
       <ArrowLeft className="h-3.5 w-3.5" />
-      Partner
+      Client
     </Link>
   );
 
   return (
     <WmsPageShell
-      title={data ? `${data.tenant.name} users` : 'Partner users'}
-      breadcrumb="Partners / Manage"
-      description="ERP user accounts that belong to this partner, with their roles and teams in this partner."
+      title={data ? `${data.tenant.name} users` : 'Client users'}
+      breadcrumb="Clients / Manage"
+      description="ERP user accounts that belong to this client, with their roles and teams in this client."
       actions={backAction}
     >
       {!canRead ? (
-        <WmsInlineNotice tone="error">You do not have permission to view partners.</WmsInlineNotice>
+        <WmsInlineNotice tone="error">You do not have permission to view clients.</WmsInlineNotice>
       ) : null}
       {error ? <WmsInlineNotice tone="error">{error}</WmsInlineNotice> : null}
 

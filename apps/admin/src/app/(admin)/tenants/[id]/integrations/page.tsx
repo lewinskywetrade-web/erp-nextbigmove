@@ -300,16 +300,16 @@ export default function PartnerIntegrationsPage() {
 
   if (isLoading) {
     return (
-      <WmsPageShell title="Partner integrations" breadcrumb="Partners">
-        <WmsInlineNotice tone="info">Loading partner integrations…</WmsInlineNotice>
+      <WmsPageShell title="Client integrations" breadcrumb="Clients">
+        <WmsInlineNotice tone="info">Loading client integrations…</WmsInlineNotice>
       </WmsPageShell>
     );
   }
 
   if (!overview) {
     return (
-      <WmsPageShell title="Partner integrations" breadcrumb="Partners">
-        <WmsInlineNotice tone="error">{error || 'Partner integrations not found'}</WmsInlineNotice>
+      <WmsPageShell title="Client integrations" breadcrumb="Clients">
+        <WmsInlineNotice tone="error">{error || 'Client integrations not found'}</WmsInlineNotice>
       </WmsPageShell>
     );
   }
@@ -317,13 +317,13 @@ export default function PartnerIntegrationsPage() {
   return (
     <WmsPageShell
       title={`${overview.partner.name} integrations`}
-      breadcrumb="Partners / Manage"
-      description="Partner-level POS store connections and Pancake webhook health for WMS operations."
+      breadcrumb="Clients / Manage"
+      description="Client-level POS store connections and Pancake webhook health for WMS operations."
       actions={
         <>
           <Link href={`/tenants/${overview.partner.id}`} className="btn btn-md btn-outline btn-icon">
             <ArrowLeft className="h-3.5 w-3.5" />
-            Partner
+            Client
           </Link>
           <span className={getTenantStatusClassName(overview.partner.status)}>
             {formatTenantStatus(overview.partner.status)}

@@ -306,17 +306,17 @@ export default function TenantDetailsPage() {
 
   if (isLoading) {
     return (
-      <WmsPageShell title="Tenant" breadcrumb="Tenants">
-        <WmsInlineNotice tone="info">Loading tenant…</WmsInlineNotice>
+      <WmsPageShell title="Client" breadcrumb="Clients">
+        <WmsInlineNotice tone="info">Loading client…</WmsInlineNotice>
       </WmsPageShell>
     );
   }
 
   if (!tenant) {
     return (
-      <WmsPageShell title="Tenant" breadcrumb="Tenants">
+      <WmsPageShell title="Client" breadcrumb="Clients">
         <WmsInlineNotice tone="error">
-          {canRead ? 'Tenant not found' : 'You do not have permission to view partners.'}
+          {canRead ? 'Client not found' : 'You do not have permission to view clients.'}
         </WmsInlineNotice>
       </WmsPageShell>
     );
@@ -371,7 +371,7 @@ export default function TenantDetailsPage() {
         </WmsInlineNotice>
       ) : null}
       {!canEdit ? (
-        <WmsInlineNotice tone="info">You have read-only access to this partner.</WmsInlineNotice>
+        <WmsInlineNotice tone="info">You have read-only access to this client.</WmsInlineNotice>
       ) : null}
 
       <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_minmax(320px,360px)]">
@@ -388,7 +388,7 @@ export default function TenantDetailsPage() {
               </div>
 
               <div className="sm:col-span-2">
-                <WmsFormField label="Tenant slug" hint="Appears in URLs. Lowercase letters, numbers, and hyphens only.">
+                <WmsFormField label="Client slug" hint="Appears in URLs. Lowercase letters, numbers, and hyphens only.">
                   <div className="flex items-center gap-2">
                     <input
                       {...register('slug')}
@@ -553,7 +553,7 @@ export default function TenantDetailsPage() {
               <div>
                 <WmsFormField
                   label="Fulfillment go-live"
-                  hint="Only POS orders inserted at or after this timestamp will enter WMS pick and pack queues for this tenant."
+                  hint="Only POS orders inserted at or after this timestamp will enter WMS pick and pack queues for this client."
                 >
                   <input
                     {...register('wmsFulfillmentGoLiveAt')}
@@ -577,13 +577,13 @@ export default function TenantDetailsPage() {
               <div>
                 <WmsFormField
                   label="Billing company name"
-                  hint="This becomes the default bill-to company name for this partner on WMS invoices."
+                  hint="This becomes the default bill-to company name for this client on WMS invoices."
                 >
                   <input
                     {...register('billingCompanyName')}
                     type="text"
                     className="input"
-                    placeholder="Defaults to tenant name if left blank"
+                    placeholder="Defaults to client name if left blank"
                     disabled={!canEdit}
                   />
                 </WmsFormField>
@@ -595,12 +595,12 @@ export default function TenantDetailsPage() {
               <div>
                 <WmsFormField
                   label="Billing address"
-                  hint="Shown in the invoice bill-to block for this partner."
+                  hint="Shown in the invoice bill-to block for this client."
                 >
                   <textarea
                     {...register('billingAddress')}
                     className="input min-h-[120px] py-3"
-                    placeholder="Partner billing address"
+                    placeholder="Client billing address"
                     disabled={!canEdit}
                   />
                 </WmsFormField>
@@ -681,7 +681,7 @@ export default function TenantDetailsPage() {
               {tenant.status !== 'ACTIVE' ? (
                 <QuickActionButton
                   icon={<CheckCircle2 className="h-3.5 w-3.5" />}
-                  label={tenant.status === 'TRIAL' ? 'Activate tenant (end trial)' : 'Activate tenant'}
+                  label={tenant.status === 'TRIAL' ? 'Activate client (end trial)' : 'Activate client'}
                   onClick={() => handleStatusAction('ACTIVE')}
                   tone="primary"
                   disabled={!canEdit}
@@ -690,9 +690,9 @@ export default function TenantDetailsPage() {
               {tenant.status === 'ACTIVE' || tenant.status === 'TRIAL' ? (
                 <QuickActionButton
                   icon={<PauseCircle className="h-3.5 w-3.5" />}
-                  label="Suspend tenant"
+                  label="Suspend client"
                   onClick={() =>
-                    handleStatusAction('SUSPENDED', 'Are you sure you want to suspend this tenant?')
+                    handleStatusAction('SUSPENDED', 'Are you sure you want to suspend this client?')
                   }
                   tone="warning"
                   disabled={!canEdit}
@@ -708,34 +708,39 @@ export default function TenantDetailsPage() {
                 label="View integrations"
                 href={`/tenants/${tenant.id}/integrations`}
               />
+              <QuickActionButton
+                icon={<ArrowLeftRight className="h-3.5 w-3.5" />}
+                label="Daily Ins & Outs / Auto-Email"
+                href="/reports"
+              />
             </div>
           </WmsCompactPanel>
 
           <WmsCompactPanel title="Danger zone" icon={<AlertTriangle className='panel-icon' />}>
             <div className="p-5">
-              <h3 className="text-[1.1rem] font-semibold tracking-tight text-primary">Cancel tenant</h3>
+              <h3 className="text-[1.1rem] font-semibold tracking-tight text-primary">Cancel client</h3>
               {tenant.status === 'CANCELLED' ? (
                 <p className="mt-1.5 text-[13px] leading-5 text-[#6f8290]">
-                  This tenant is cancelled and its users cannot sign in. Use Activate tenant above to restore access.
+                  This client is cancelled and its users cannot sign in. Use Activate client above to restore access.
                 </p>
               ) : (
                 <>
                   <p className="mt-1.5 text-[13px] leading-5 text-[#6f8290]">
-                    Cancellation disables the tenant. Data is retained for compliance.
+                    Cancellation disables the client. Data is retained for compliance.
                   </p>
                   <button
                     type="button"
                     onClick={() =>
                       handleStatusAction(
                         'CANCELLED',
-                        'Cancel this tenant? The organization will lose access immediately.',
+                        'Cancel this client? The organization will lose access immediately.',
                       )
                     }
                     className="btn btn-md btn-destructive btn-icon mt-3 w-full"
                     disabled={!canEdit}
                   >
                     <AlertTriangle className="h-3.5 w-3.5" />
-                    Cancel tenant
+                    Cancel client
                   </button>
                 </>
               )}

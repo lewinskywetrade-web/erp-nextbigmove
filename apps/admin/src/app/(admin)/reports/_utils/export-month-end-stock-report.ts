@@ -1,7 +1,7 @@
 import type { MonthEndStockReportResponse, MonthEndStockRow } from '../_types/month-end-stock-report';
 
 const HEADERS = [
-  'Partner',
+  'Client',
   'Store',
   'Shop ID',
   'Variant name',

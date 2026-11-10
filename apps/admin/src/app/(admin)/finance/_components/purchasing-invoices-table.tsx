@@ -54,8 +54,8 @@ export function PurchasingInvoicesTable({
               ))
             ) : !tenantReady ? (
               <StateRow
-                title="Tenant context required"
-                message="Open a tenant context first before reviewing invoices."
+                title="Client context required"
+                message="Select a client first before reviewing invoices."
               />
             ) : invoices.length === 0 ? (
               <StateRow

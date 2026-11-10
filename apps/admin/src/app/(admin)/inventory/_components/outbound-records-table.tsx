@@ -26,7 +26,7 @@ export function OutboundRecordsTable({ records, isLoading, tenantReady, onView }
             <HeaderCell>Activity</HeaderCell>
             <HeaderCell>Unit</HeaderCell>
             <HeaderCell>Product</HeaderCell>
-            <HeaderCell>Partner / Store</HeaderCell>
+            <HeaderCell>Client / Store</HeaderCell>
             <HeaderCell>Order / Tracking</HeaderCell>
             <HeaderCell>Warehouse</HeaderCell>
             <HeaderCell>Current status</HeaderCell>
@@ -37,7 +37,7 @@ export function OutboundRecordsTable({ records, isLoading, tenantReady, onView }
           {isLoading ? (
             <EmptyRow>Loading outbound records…</EmptyRow>
           ) : !tenantReady ? (
-            <EmptyRow>No partner scope is available for outbound records.</EmptyRow>
+            <EmptyRow>No client scope is available for outbound records.</EmptyRow>
           ) : records.length === 0 ? (
             <EmptyRow>No outbound items match the selected filters and dates.</EmptyRow>
           ) : records.map((record) => (
