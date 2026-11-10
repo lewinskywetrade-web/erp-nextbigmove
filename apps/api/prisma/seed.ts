@@ -1675,7 +1675,7 @@ async function backfill2026OrderCogsAndReports() {
         AND (COALESCE(o.cogs, 0) <> ro.calc_cogs OR COALESCE(o."totalQuantity", 0) <= 0)
     `);
     if (updatedRemainingZeroOrders > 0) {
-      for (const m of pendingZeroMonths) updatedMonths.add(m);
+      for (const m of Array.from(pendingZeroMonths)) updatedMonths.add(m);
     }
     console.log(`✓ Updated ${updatedOrders} 2026 POS orders and ${updatedRemainingZeroOrders} catch-all remaining zero-COGS POS orders`);
 
