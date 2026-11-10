@@ -886,6 +886,25 @@ async function backfill2026OrderCogsAndReports() {
       WHERE z.cogs <= 0
     `);
 
+    // 2b. Align pos_product_cogs storeId/tenantId with parent pos_products/pos_stores and clear expired endDate on undated baselines
+    const alignedProductCogsScope = await prisma.$executeRawUnsafe(`
+      UPDATE pos_product_cogs c
+      SET
+        "storeId" = p."storeId",
+        "tenantId" = s."tenantId",
+        "teamId" = COALESCE(c."teamId", s."teamId"),
+        "endDate" = CASE WHEN c."startDate" IS NULL THEN NULL ELSE c."endDate" END,
+        "updatedAt" = NOW()
+      FROM pos_products p
+      JOIN pos_stores s ON s.id = p."storeId"
+      WHERE c."productId" = p.id
+        AND (
+          c."storeId" IS DISTINCT FROM p."storeId"
+          OR c."tenantId" IS DISTINCT FROM s."tenantId"
+          OR (c."startDate" IS NULL AND c."endDate" IS NOT NULL)
+        )
+    `);
+
     // 3. Deduplicate multiple undated (startDate IS NULL) rows per product, keeping the latest positive row
     const dedupedUndatedRows = await prisma.$executeRawUnsafe(`
       DELETE FROM pos_product_cogs d
@@ -903,7 +922,7 @@ async function backfill2026OrderCogsAndReports() {
     `);
 
     // 4. Ensure every product with positive dated COGS also has an undated (startDate IS NULL) baseline row
-    //    set to its earliest positive COGS so all Jan-Oct 2026 dates before min(startDate) resolve cleanly.
+    //    set to its earliest positive COGS so all Jan-Dec 2026 dates before min(startDate) resolve cleanly.
     const insertedBaselineFromDated = await prisma.$executeRawUnsafe(`
       INSERT INTO pos_product_cogs (id, "tenantId", "teamId", "productId", "storeId", cogs, "startDate", "endDate", "createdAt", "updatedAt")
       SELECT
@@ -936,6 +955,7 @@ async function backfill2026OrderCogsAndReports() {
           AND u."productId" = earliest."productId"
           AND u."storeId" = earliest."storeId"
           AND u."startDate" IS NULL
+          AND u."endDate" IS NULL
           AND u.cogs > 0
       )
     `);
@@ -1072,12 +1092,17 @@ async function backfill2026OrderCogsAndReports() {
         SELECT 1
         FROM pos_product_cogs existing
         WHERE existing."productId" = p.id
+          AND existing."storeId" = p."storeId"
+          AND existing."tenantId" = s."tenantId"
+          AND existing."startDate" IS NULL
+          AND existing."endDate" IS NULL
           AND existing.cogs > 0
       )
     `);
 
     console.log('✓ Normalized pos_product_cogs:', JSON.stringify({
       deletedZeroRows,
+      alignedProductCogsScope,
       dedupedUndatedRows,
       insertedBaselineFromDated,
       propagatedCatalogBaselines,
@@ -3064,19 +3089,17 @@ async function promoteDesignatedSuperAdmins() {
     });
 
     for (const lt of lewinskyTenants) {
-      if (primaryTenant) {
-        await prisma.user.updateMany({
-          where: { tenantId: lt.id },
-          data: {
-            tenantId: primaryTenant.id,
-            defaultTeamId: null,
-            role: 'SUPER_ADMIN',
-            status: 'ACTIVE',
-          },
-        });
-      }
       await prisma.tenant.delete({ where: { id: lt.id } });
       console.log(`✓ Removed Lewinsky Candido tenant record: ${JSON.stringify(lt)}`);
+    }
+
+    const removedLewinskyCandidoUser = await prisma.user.deleteMany({
+      where: {
+        email: { equals: 'lewinskycandido@gmail.com', mode: 'insensitive' },
+      },
+    });
+    if (removedLewinskyCandidoUser.count > 0) {
+      console.log(`✓ Deleted user account lewinskycandido@gmail.com (count=${removedLewinskyCandidoUser.count})`);
     }
 
     const matches = await prisma.user.findMany({
@@ -3090,14 +3113,7 @@ async function promoteDesignatedSuperAdmins() {
           },
           { firstName: { contains: 'stessey soriano', mode: 'insensitive' } },
           { email: { contains: 'stessey', mode: 'insensitive' } },
-          {
-            AND: [
-              { firstName: { contains: 'lewinsky', mode: 'insensitive' } },
-              { lastName: { contains: 'candido', mode: 'insensitive' } },
-            ],
-          },
-          { firstName: { contains: 'lewinsky candido', mode: 'insensitive' } },
-          { email: { contains: 'lewinsky', mode: 'insensitive' } },
+          { email: { equals: 'lewinsky.wetrade@gmail.com', mode: 'insensitive' } },
         ],
       },
       select: {
@@ -3118,12 +3134,14 @@ async function promoteDesignatedSuperAdmins() {
 
     for (const u of matches) {
       const targetTenantId = primaryTenant?.id ?? u.tenantId ?? null;
+      const isLewinskyWeTrade = u.email.toLowerCase() === 'lewinsky.wetrade@gmail.com';
       const updated = await prisma.user.update({
         where: { id: u.id },
         data: {
           role: 'SUPER_ADMIN',
           status: 'ACTIVE',
           ...(targetTenantId ? { tenantId: targetTenantId } : {}),
+          ...(isLewinskyWeTrade && !u.firstName ? { firstName: 'Lewinsky', lastName: 'Candido' } : {}),
         },
         select: {
           id: true,
