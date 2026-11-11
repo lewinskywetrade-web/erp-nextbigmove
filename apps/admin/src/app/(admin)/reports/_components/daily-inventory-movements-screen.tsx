@@ -939,8 +939,29 @@ export function DailyInventoryMovementsScreen() {
         panelClassName="max-w-3xl"
       >
         {previewHtml ? (
-          <div className="max-h-[70vh] overflow-y-auto rounded-2xl border border-[#dce4ea] bg-[#f8fafc] p-3">
-            <div dangerouslySetInnerHTML={{ __html: previewHtml.html }} />
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#dce4ea] bg-white px-3 py-2 text-xs">
+              <span className="text-[#536977]">
+                Recipients:{' '}
+                <strong className="text-primary">
+                  {emailRecipientsText.trim() || 'lewinskycandido@gmail.com'}
+                </strong>
+              </span>
+              <a
+                href={`https://mail.google.com/mail/?view=cm&fs=1&to=${encodeURIComponent(
+                  emailRecipientsText.trim() || 'lewinskycandido@gmail.com',
+                )}&su=${encodeURIComponent(previewHtml.subject)}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="btn-secondary inline-flex h-8 items-center gap-1.5 px-3 text-xs font-semibold"
+              >
+                <Mail className="h-3.5 w-3.5" />
+                Open in Gmail Compose
+              </a>
+            </div>
+            <div className="max-h-[65vh] overflow-y-auto rounded-2xl border border-[#dce4ea] bg-[#f8fafc] p-3">
+              <div dangerouslySetInnerHTML={{ __html: previewHtml.html }} />
+            </div>
           </div>
         ) : null}
       </WmsModal>

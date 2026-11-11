@@ -748,11 +748,18 @@ export class WmsReportsService {
       emailsByTenant.set(user.tenantId, list);
     }
 
+    const configuredFallbackRecipient = (
+      process.env.WMS_DAILY_REPORT_DEFAULT_RECIPIENT || 'lewinskycandido@gmail.com'
+    )
+      .trim()
+      .toLowerCase();
+
     return tenants.map((tenant) => {
       const parsed = this.extractSubscriptionFromSettings(tenant.settings);
       const defaultRecipients = Array.from(
         new Set(
           [
+            configuredFallbackRecipient,
             ...(tenant.billingEmail ? [tenant.billingEmail.trim().toLowerCase()] : []),
             ...(emailsByTenant.get(tenant.id) ?? []),
           ].filter(Boolean),
