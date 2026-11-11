@@ -3,16 +3,24 @@ import {
   ConflictException,
   NotFoundException,
   BadRequestException,
+  Logger,
+  Optional,
 } from '@nestjs/common';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { CreateTenantDto, UpdateTenantDto } from './dto';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { toStoredPermissionWorkspace } from '../../common/rbac/permission-workspace';
+import { WmsFulfillmentSyncService } from '../wms-fulfillment/wms-fulfillment-sync.service';
 
 @Injectable()
 export class TenantService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly logger = new Logger(TenantService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    @Optional() private readonly wmsFulfillmentSyncService?: WmsFulfillmentSyncService,
+  ) {}
 
   /**
    * Create a new tenant with admin user from admin panel
@@ -272,6 +280,35 @@ export class TenantService {
         },
       },
     });
+
+    if ('wmsFulfillmentGoLiveAt' in updateTenantDto && this.wmsFulfillmentSyncService) {
+      try {
+        const activeStores = await this.prisma.posStore.findMany({
+          where: {
+            tenantId: id,
+            status: 'ACTIVE',
+            NOT: { enabled: false },
+          },
+          select: {
+            id: true,
+            tenantId: true,
+            shopId: true,
+          },
+        });
+        if (activeStores.length > 0) {
+          await this.wmsFulfillmentSyncService.syncConfirmedPickingOrders({
+            tenantId: id,
+            storeId: null,
+            stores: activeStores,
+            actorId: null,
+          });
+        }
+      } catch (err: any) {
+        this.logger.warn(
+          `Failed to reconcile WMS fulfillment queue after updating wmsFulfillmentGoLiveAt for tenant ${id}: ${err?.message || err}`,
+        );
+      }
+    }
 
     return this.sanitizeTenant(updatedTenant);
   }

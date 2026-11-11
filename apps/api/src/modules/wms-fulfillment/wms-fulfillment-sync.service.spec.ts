@@ -1,5 +1,5 @@
 import { describe, expect, it, jest } from '@jest/globals';
-import { WmsFulfillmentOrderStatus } from '@prisma/client';
+import { WmsFulfillmentAssignmentMode, WmsFulfillmentOrderStatus } from '@prisma/client';
 import { WMS_DEMAND_QUEUE_REFRESH_JOB } from './wms-fulfillment.constants';
 import { WmsFulfillmentSyncService } from './wms-fulfillment-sync.service';
 
@@ -501,5 +501,114 @@ describe('WmsFulfillmentSyncService line extraction & ISSUE recovery', () => {
       tenantId: 'tenant-1',
       storeId: 'store-1',
     });
+  });
+
+  it('cancels pre-go-live unbasketed ISSUE fulfillment orders when wmsFulfillmentGoLiveAt is set', async () => {
+    const goLiveAt = new Date('2026-11-09T00:00:00+08:00');
+    const orderUpdate = jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({});
+    const lineUpdateMany = jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({ count: 0 });
+    const demandDeleteMany = jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({ count: 0 });
+
+    const tx = {
+      wmsFulfillmentOrder: {
+        findMany: jest.fn<() => Promise<any[]>>().mockResolvedValue([
+          {
+            id: 'fulfillment-june-1',
+            tenantId: 'tenant-1',
+            storeId: 'store-1',
+            posOrderId: '7438256341302',
+            status: WmsFulfillmentOrderStatus.ISSUE,
+            assignmentMode: WmsFulfillmentAssignmentMode.BASKET_DEMAND,
+            basketId: null,
+            basketUnits: [],
+            lines: [],
+            posOrder: {
+              status: 1,
+              isVoid: false,
+              insertedAt: new Date('2026-06-17T04:15:00.000Z'),
+            },
+          },
+        ]),
+        update: orderUpdate,
+      },
+      wmsFulfillmentLine: {
+        updateMany: lineUpdateMany,
+      },
+      wmsBasketPickDemand: {
+        deleteMany: demandDeleteMany,
+      },
+    };
+
+    const prisma = {
+      tenant: {
+        findMany: jest.fn<() => Promise<any[]>>().mockResolvedValue([
+          {
+            id: 'tenant-1',
+            wmsFulfillmentGoLiveAt: goLiveAt,
+          },
+        ]),
+      },
+      posOrder: {
+        findMany: jest.fn<() => Promise<any[]>>().mockResolvedValue([{ id: 'pos-order-june-1' }]),
+      },
+      $transaction: jest.fn(async (callback: any) => callback(tx)),
+    };
+    const queue = {
+      add: jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({ id: 'refresh-job-june' }),
+    };
+
+    const service = new WmsFulfillmentSyncService(prisma as any, {} as any, queue as any);
+
+    const result = await (service as any).syncCanceledPickingOrders(
+      {
+        tenantId: 'tenant-1',
+        storeId: 'store-1',
+        stores: [{ id: 'store-1', tenantId: 'tenant-1', shopId: 'shop-1' }],
+        actorId: null,
+      },
+      [{ id: 'store-1', tenantId: 'tenant-1', shopId: 'shop-1' }],
+    );
+
+    expect(result).toEqual({ cleanedOrders: 1 });
+    expect(orderUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'fulfillment-june-1' },
+      data: expect.objectContaining({
+        status: WmsFulfillmentOrderStatus.CANCELED,
+        issueReason: 'Excluded before client WMS fulfillment go-live.',
+      }),
+    }));
+  });
+
+  it('scopes refreshDemandFulfillmentQueue to orders at or after wmsFulfillmentGoLiveAt', async () => {
+    const goLiveAt = new Date('2026-11-09T00:00:00+08:00');
+    const findMany = jest.fn<(...args: any[]) => Promise<any[]>>().mockResolvedValue([]);
+    const prisma = {
+      tenant: {
+        findUnique: jest.fn<() => Promise<any>>().mockResolvedValue({
+          wmsFulfillmentGoLiveAt: goLiveAt,
+        }),
+      },
+      wmsFulfillmentOrder: {
+        findMany,
+      },
+    };
+
+    const service = new WmsFulfillmentSyncService(prisma as any, {} as any, {} as any);
+    await (service as any).refreshDemandFulfillmentQueue({
+      tenantId: 'tenant-1',
+      storeId: 'store-1',
+    });
+
+    expect(findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        posOrder: {
+          is: expect.objectContaining({
+            status: 1,
+            isVoid: false,
+            insertedAt: { gte: goLiveAt },
+          }),
+        },
+      }),
+    }));
   });
 });

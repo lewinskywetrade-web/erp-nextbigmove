@@ -3063,14 +3063,23 @@ export class WmsMobileService {
       ? (query.status as WmsFulfillmentOrderStatus)
       : { in: [...ACTIVE_PICKING_ORDER_STATUSES] };
     const ownedOnly = Boolean(query.ownedOnly && userId && !pickQueueAccess.canViewAll);
-    const fulfillmentGoLiveWhere = this.buildFulfillmentGoLiveWhere(
-      await this.getFulfillmentGoLiveAt(tenantId),
-    );
+    const effectiveGoLiveTenantId = tenantId ?? activeStore?.tenantId ?? null;
+    const singleTenantGoLiveAt = await this.getFulfillmentGoLiveAt(effectiveGoLiveTenantId);
+    const multiTenantGoLiveFilters = effectiveGoLiveTenantId
+      ? []
+      : await this.buildTenantGoLiveFulfillmentOrderFilters(
+          Array.from(new Set(stores.map((store) => store.tenantId))),
+        );
+    const goLiveAndClauses: Prisma.WmsFulfillmentOrderWhereInput[] = singleTenantGoLiveAt
+      ? [this.buildFulfillmentGoLiveWhere(singleTenantGoLiveAt)]
+      : multiTenantGoLiveFilters.length > 0
+        ? [{ OR: multiTenantGoLiveFilters }]
+        : [];
     const confirmedPickOrderWhere = this.buildConfirmedPickPosOrderWhere();
     const scopedWhere: Prisma.WmsFulfillmentOrderWhereInput = {
       ...(tenantId ? { tenantId } : {}),
       ...(activeStore ? { storeId: activeStore.id } : {}),
-      ...fulfillmentGoLiveWhere,
+      ...(goLiveAndClauses.length > 0 ? { AND: goLiveAndClauses } : {}),
     };
     const normalizedSearch = query.search?.trim() || null;
     const searchWhere: Prisma.WmsFulfillmentOrderWhereInput = normalizedSearch
@@ -3698,13 +3707,22 @@ export class WmsMobileService {
       throw new ForbiddenException('Selected store is not available for STOX packing');
     }
 
-    const fulfillmentGoLiveWhere = this.buildFulfillmentGoLiveWhere(
-      await this.getFulfillmentGoLiveAt(tenantId),
-    );
+    const effectiveGoLiveTenantId = tenantId ?? activeStore?.tenantId ?? null;
+    const singleTenantGoLiveAt = await this.getFulfillmentGoLiveAt(effectiveGoLiveTenantId);
+    const multiTenantGoLiveFilters = effectiveGoLiveTenantId
+      ? []
+      : await this.buildTenantGoLiveFulfillmentOrderFilters(
+          Array.from(new Set(stores.map((store) => store.tenantId))),
+        );
+    const goLiveAndClauses: Prisma.WmsFulfillmentOrderWhereInput[] = singleTenantGoLiveAt
+      ? [this.buildFulfillmentGoLiveWhere(singleTenantGoLiveAt)]
+      : multiTenantGoLiveFilters.length > 0
+        ? [{ OR: multiTenantGoLiveFilters }]
+        : [];
     const scopedWhere: Prisma.WmsFulfillmentOrderWhereInput = {
       ...(tenantId ? { tenantId } : {}),
       ...(activeStore ? { storeId: activeStore.id } : {}),
-      ...fulfillmentGoLiveWhere,
+      ...(goLiveAndClauses.length > 0 ? { AND: goLiveAndClauses } : {}),
     };
     const normalizedSearch = query.search?.trim() || null;
     const searchWhere: Prisma.WmsFulfillmentOrderWhereInput = normalizedSearch

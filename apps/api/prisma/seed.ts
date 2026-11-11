@@ -4473,6 +4473,27 @@ async function syncToniosPosConnectionAndOrders() {
         continue;
       }
 
+      let effectiveGoLiveAt = store.tenant.wmsFulfillmentGoLiveAt;
+      if (!effectiveGoLiveAt) {
+        const earliestNovOrder = await prisma.posOrder.findFirst({
+          where: {
+            tenantId: store.tenantId,
+            shopId: store.shopId,
+            dateLocal: { gte: '2026-11-09' },
+          },
+          orderBy: { insertedAt: 'asc' },
+          select: { insertedAt: true },
+        });
+        const manilaNov9Cutoff = new Date('2026-11-09T00:00:00+08:00');
+        effectiveGoLiveAt = earliestNovOrder?.insertedAt && earliestNovOrder.insertedAt < manilaNov9Cutoff
+          ? earliestNovOrder.insertedAt
+          : manilaNov9Cutoff;
+        await prisma.tenant.update({
+          where: { id: store.tenantId },
+          data: { wmsFulfillmentGoLiveAt: effectiveGoLiveAt },
+        });
+      }
+
       if (!ownership) {
         await prisma.posShopOwnership.create({
           data: {
@@ -4685,11 +4706,12 @@ async function syncToniosPosConnectionAndOrders() {
         console.warn(`[TONIOS_DIAG] Recent orders window fetch warning for store=${store.id}: ${err?.message || 'Unknown error'}`);
       }
 
-      // Explicitly inspect open fulfillment orders and confirmed DB orders (including Order #2)
+      // Explicitly inspect open post-go-live fulfillment orders and confirmed DB orders
       const trackedDbOrders = await prisma.posOrder.findMany({
         where: {
           tenantId: store.tenantId,
           shopId: store.shopId,
+          ...(effectiveGoLiveAt ? { insertedAt: { gte: effectiveGoLiveAt } } : {}),
           OR: [
             { status: 1, isVoid: false },
             {
@@ -5135,7 +5157,28 @@ async function reconcileToniosWmsFulfillmentQueue() {
         return Array.from(grouped.values());
       };
 
-      // 1. Cancel unpicked fulfillment orders whose POS order is canceled (6) or void
+      let effectiveGoLiveAt = store.tenant.wmsFulfillmentGoLiveAt;
+      if (!effectiveGoLiveAt) {
+        const earliestNovOrder = await prisma.posOrder.findFirst({
+          where: {
+            tenantId: store.tenantId,
+            shopId: store.shopId,
+            dateLocal: { gte: '2026-11-09' },
+          },
+          orderBy: { insertedAt: 'asc' },
+          select: { insertedAt: true },
+        });
+        const manilaNov9Cutoff = new Date('2026-11-09T00:00:00+08:00');
+        effectiveGoLiveAt = earliestNovOrder?.insertedAt && earliestNovOrder.insertedAt < manilaNov9Cutoff
+          ? earliestNovOrder.insertedAt
+          : manilaNov9Cutoff;
+        await prisma.tenant.update({
+          where: { id: store.tenantId },
+          data: { wmsFulfillmentGoLiveAt: effectiveGoLiveAt },
+        });
+      }
+
+      // 1. Cancel unpicked fulfillment orders whose POS order is canceled (6), void, or pre-go-live
       const unpickedCanceledOrders = await prisma.wmsFulfillmentOrder.findMany({
         where: {
           tenantId: store.tenantId,
@@ -5152,28 +5195,50 @@ async function reconcileToniosWmsFulfillmentQueue() {
           },
           posOrder: {
             is: {
-              OR: [{ status: 6 }, { isVoid: true }],
+              OR: [
+                { status: 6 },
+                { isVoid: true },
+                ...(effectiveGoLiveAt ? [{ insertedAt: { lt: effectiveGoLiveAt } }] : []),
+              ],
             },
           },
         },
-        select: { id: true },
+        select: {
+          id: true,
+          posOrder: {
+            select: {
+              status: true,
+              isVoid: true,
+              insertedAt: true,
+            },
+          },
+        },
       });
 
+      let canceledPreGoLiveCount = 0;
       for (const canceledOrder of unpickedCanceledOrders) {
+        const isPosCanceledOrVoid =
+          canceledOrder.posOrder?.status === 6 || Boolean(canceledOrder.posOrder?.isVoid);
+        const cancelReason = isPosCanceledOrVoid
+          ? 'Order was canceled in POS.'
+          : 'Excluded before client WMS fulfillment go-live.';
+        if (!isPosCanceledOrVoid) {
+          canceledPreGoLiveCount += 1;
+        }
         await prisma.wmsFulfillmentLine.updateMany({
           where: { fulfillmentOrderId: canceledOrder.id },
           data: {
             quantityAllocated: 0,
             quantityPicked: 0,
             status: WmsFulfillmentLineStatus.CANCELED,
-            issueReason: 'Order was canceled in POS.',
+            issueReason: cancelReason,
           },
         });
         await prisma.wmsFulfillmentOrder.update({
           where: { id: canceledOrder.id },
           data: {
             status: WmsFulfillmentOrderStatus.CANCELED,
-            issueReason: 'Order was canceled in POS.',
+            issueReason: cancelReason,
             allocatedQuantity: 0,
             pickedQuantity: 0,
             completedAt: now,
@@ -5182,15 +5247,15 @@ async function reconcileToniosWmsFulfillmentQueue() {
         });
       }
 
-      // 2. Sync all confirmed (status=1, isVoid=false) POS orders for this store
+      // 2. Sync all confirmed (status=1, isVoid=false) post-go-live POS orders for this store
       const confirmedPosOrders = await prisma.posOrder.findMany({
         where: {
           tenantId: store.tenantId,
           shopId: store.shopId,
           status: 1,
           isVoid: false,
-          ...(store.tenant.wmsFulfillmentGoLiveAt
-            ? { insertedAt: { gte: store.tenant.wmsFulfillmentGoLiveAt } }
+          ...(effectiveGoLiveAt
+            ? { insertedAt: { gte: effectiveGoLiveAt } }
             : {}),
         },
         orderBy: [{ dateLocal: 'asc' }, { insertedAt: 'asc' }],
@@ -5384,7 +5449,11 @@ async function reconcileToniosWmsFulfillmentQueue() {
             ],
           },
           posOrder: {
-            is: { status: 1, isVoid: false },
+            is: {
+              status: 1,
+              isVoid: false,
+              ...(effectiveGoLiveAt ? { insertedAt: { gte: effectiveGoLiveAt } } : {}),
+            },
           },
         },
         include: {
@@ -5524,12 +5593,19 @@ async function reconcileToniosWmsFulfillmentQueue() {
         });
       }
 
-      const fulfillmentStatsAfter = await prisma.wmsFulfillmentOrder.groupBy({
+      const activeQueueStatsAfter = await prisma.wmsFulfillmentOrder.groupBy({
         by: ['status', 'issueReason'],
         where: {
           tenantId: store.tenantId,
           storeId: store.id,
-          posOrder: { is: { status: 1, isVoid: false } },
+          status: { not: WmsFulfillmentOrderStatus.CANCELED },
+          posOrder: {
+            is: {
+              status: 1,
+              isVoid: false,
+              ...(effectiveGoLiveAt ? { insertedAt: { gte: effectiveGoLiveAt } } : {}),
+            },
+          },
         },
         _count: { _all: true },
       });
@@ -5537,7 +5613,14 @@ async function reconcileToniosWmsFulfillmentQueue() {
         where: {
           tenantId: store.tenantId,
           storeId: store.id,
-          posOrder: { is: { status: 1, isVoid: false } },
+          status: { not: WmsFulfillmentOrderStatus.CANCELED },
+          posOrder: {
+            is: {
+              status: 1,
+              isVoid: false,
+              ...(effectiveGoLiveAt ? { insertedAt: { gte: effectiveGoLiveAt } } : {}),
+            },
+          },
         },
         select: {
           posOrderId: true,
@@ -5566,11 +5649,13 @@ async function reconcileToniosWmsFulfillmentQueue() {
       console.log('[TONIOS_DIAG_AFTER]', JSON.stringify({
         storeId: store.id,
         shopId: store.shopId,
+        wmsFulfillmentGoLiveAt: effectiveGoLiveAt ? effectiveGoLiveAt.toISOString() : null,
         canceledStaleFulfillmentCount: unpickedCanceledOrders.length,
+        canceledPreGoLiveCount,
         createdFulfillmentCount,
         recoveredIssueCount,
         putawayBinUnitCount: putawayBinUnits.length,
-        fulfillmentStatsAfter,
+        fulfillmentStatsAfter: activeQueueStatsAfter,
         sampleQueueAfter,
       }));
     }
@@ -5588,6 +5673,7 @@ async function main() {
   await seedRoles();
   await ensureDefaultTeamsAndBackfill();
   await syncToniosPosConnectionAndOrders();
+  await reconcileToniosWmsFulfillmentQueue();
   await backfillAdSpendStoreAndTeamAttribution();
   await backfill2026OrderCogsAndReports();
   await reconcileToniosWmsFulfillmentQueue();

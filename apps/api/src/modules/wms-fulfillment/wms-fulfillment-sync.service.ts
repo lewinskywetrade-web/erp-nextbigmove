@@ -1017,45 +1017,91 @@ export class WmsFulfillmentSyncService {
     );
     const shopIds = Array.from(new Set(scopedStores.map((store) => store.shopId)));
     const tenantIds = Array.from(new Set(scopedStores.map((store) => store.tenantId)));
-    const tenantGoLiveFilters = await this.buildTenantGoLiveOrderFilters(tenantIds);
-    const canceledPosOrders = await this.prisma.posOrder.findMany({
-      where: {
-        shopId: { in: shopIds },
-        tenantId: params.tenantId ? params.tenantId : { in: tenantIds },
-        OR: [
-          { status: CANCELED_POS_ORDER_STATUS },
-          { isVoid: true },
-        ],
-        AND: [
-          {
-            OR: tenantGoLiveFilters,
+    const goLiveByTenantId = await this.getTenantGoLiveMap(tenantIds);
+    const preGoLiveFilters: Prisma.PosOrderWhereInput[] = [];
+    for (const [tid, goLiveAt] of goLiveByTenantId.entries()) {
+      if (goLiveAt) {
+        preGoLiveFilters.push({
+          tenantId: tid,
+          insertedAt: {
+            lt: goLiveAt,
           },
-          ...(refs.length > 0
-            ? [{
+        });
+      }
+    }
+
+    const canceledPosBranch: Prisma.PosOrderWhereInput = {
+      OR: [
+        { status: CANCELED_POS_ORDER_STATUS },
+        { isVoid: true },
+      ],
+      ...(refs.length > 0
+        ? {
+            AND: [
+              {
                 OR: refs.map((ref) => ({
                   shopId: ref.shopId,
                   posOrderId: ref.posOrderId,
                 })),
-              }]
-            : []),
-        ],
-        wmsFulfillmentOrders: {
-          some: {
-            status: {
-              in: [
-                WmsFulfillmentOrderStatus.READY,
-                WmsFulfillmentOrderStatus.RESTOCKING,
-                WmsFulfillmentOrderStatus.PARTIAL,
-                WmsFulfillmentOrderStatus.ISSUE,
-                WmsFulfillmentOrderStatus.IN_PICKING,
-                WmsFulfillmentOrderStatus.READY_FOR_PACK,
-                WmsFulfillmentOrderStatus.PICKED,
-                WmsFulfillmentOrderStatus.PACKING,
-                WmsFulfillmentOrderStatus.PACKED,
-              ],
-            },
+              },
+            ],
+          }
+        : {}),
+      wmsFulfillmentOrders: {
+        some: {
+          status: {
+            in: [
+              WmsFulfillmentOrderStatus.READY,
+              WmsFulfillmentOrderStatus.RESTOCKING,
+              WmsFulfillmentOrderStatus.PARTIAL,
+              WmsFulfillmentOrderStatus.ISSUE,
+              WmsFulfillmentOrderStatus.IN_PICKING,
+              WmsFulfillmentOrderStatus.READY_FOR_PACK,
+              WmsFulfillmentOrderStatus.PICKED,
+              WmsFulfillmentOrderStatus.PACKING,
+              WmsFulfillmentOrderStatus.PACKED,
+            ],
           },
         },
+      },
+    };
+
+    const preGoLiveUnpickedBranch: Prisma.PosOrderWhereInput | null =
+      refs.length === 0 && preGoLiveFilters.length > 0
+        ? {
+            OR: preGoLiveFilters,
+            wmsFulfillmentOrders: {
+              some: {
+                basketId: null,
+                status: {
+                  in: [
+                    WmsFulfillmentOrderStatus.READY,
+                    WmsFulfillmentOrderStatus.RESTOCKING,
+                    WmsFulfillmentOrderStatus.PARTIAL,
+                    WmsFulfillmentOrderStatus.ISSUE,
+                  ],
+                },
+                basketUnits: {
+                  none: {
+                    status: {
+                      in: [...ACTIVE_BASKET_UNIT_STATUSES],
+                    },
+                  },
+                },
+              },
+            },
+          }
+        : null;
+
+    const canceledPosOrders = await this.prisma.posOrder.findMany({
+      where: {
+        shopId: { in: shopIds },
+        tenantId: params.tenantId ? params.tenantId : { in: tenantIds },
+        ...(preGoLiveUnpickedBranch
+          ? {
+              OR: [canceledPosBranch, preGoLiveUnpickedBranch],
+            }
+          : canceledPosBranch),
       },
       select: {
         id: true,
@@ -1083,6 +1129,7 @@ export class WmsFulfillmentSyncService {
             select: {
               status: true,
               isVoid: true,
+              insertedAt: true,
             },
           },
           lines: true,
@@ -1113,17 +1160,42 @@ export class WmsFulfillmentSyncService {
 
       const affectedBasketIds = new Set<string>();
       const scopeKeys = new Set<string>();
+      let cleanedCount = 0;
 
       for (const order of fulfillmentOrders) {
-        if ((order.posOrder?.status ?? null) !== CANCELED_POS_ORDER_STATUS && !order.posOrder?.isVoid) {
+        const isCanceledInPos =
+          (order.posOrder?.status ?? null) === CANCELED_POS_ORDER_STATUS
+          || Boolean(order.posOrder?.isVoid);
+        const tenantGoLiveAt = goLiveByTenantId.get(order.tenantId) ?? null;
+        const isPreGoLiveUnpicked = Boolean(
+          tenantGoLiveAt
+          && order.posOrder?.insertedAt
+          && order.posOrder.insertedAt < tenantGoLiveAt
+          && !order.basketId
+          && (order.basketUnits ?? []).length === 0
+          && (
+            order.status === WmsFulfillmentOrderStatus.READY
+            || order.status === WmsFulfillmentOrderStatus.RESTOCKING
+            || order.status === WmsFulfillmentOrderStatus.PARTIAL
+            || order.status === WmsFulfillmentOrderStatus.ISSUE
+          ),
+        );
+
+        if (!isCanceledInPos && !isPreGoLiveUnpicked) {
           continue;
         }
+
+        const cancelReason = isCanceledInPos
+          ? 'Order was canceled in POS.'
+          : 'Excluded before client WMS fulfillment go-live.';
+        cleanedCount += 1;
 
         if (order.assignmentMode === WmsFulfillmentAssignmentMode.BASKET_DEMAND) {
           await this.releaseCanceledDemandOrderTx(tx, {
             order,
             actorId: params.actorId,
             now,
+            reason: cancelReason,
           });
 
           if (order.basketId) {
@@ -1146,7 +1218,7 @@ export class WmsFulfillmentSyncService {
             quantityAllocated: 0,
             quantityPicked: 0,
             status: WmsFulfillmentLineStatus.CANCELED,
-            issueReason: 'Order was canceled in POS.',
+            issueReason: cancelReason,
           },
         });
 
@@ -1154,7 +1226,7 @@ export class WmsFulfillmentSyncService {
           where: { id: order.id },
           data: {
             status: WmsFulfillmentOrderStatus.CANCELED,
-            issueReason: 'Order was canceled in POS.',
+            issueReason: cancelReason,
             allocatedQuantity: 0,
             pickedQuantity: 0,
             claimedById: null,
@@ -1172,7 +1244,7 @@ export class WmsFulfillmentSyncService {
       }
 
       return {
-        cleanedOrders: fulfillmentOrders.length,
+        cleanedOrders: cleanedCount,
         refreshScopes: Array.from(scopeKeys).flatMap((scopeKey) => {
           const [tenantId, storeId] = scopeKey.split('::');
           return tenantId && storeId ? [{ tenantId, storeId }] : [];
@@ -1190,15 +1262,18 @@ export class WmsFulfillmentSyncService {
     return { cleanedOrders: result.cleanedOrders };
   }
 
-  private async buildTenantGoLiveOrderFilters(tenantIds: string[]): Promise<Prisma.PosOrderWhereInput[]> {
+  private async getTenantGoLiveMap(tenantIds: string[]): Promise<Map<string, Date | null>> {
     const uniqueTenantIds = Array.from(new Set(
       tenantIds
         .map((tenantId) => tenantId?.trim())
         .filter((tenantId): tenantId is string => Boolean(tenantId)),
     ));
 
-    if (uniqueTenantIds.length === 0) {
-      return [];
+    if (
+      uniqueTenantIds.length === 0
+      || typeof (this.prisma as any).tenant?.findMany !== 'function'
+    ) {
+      return new Map();
     }
 
     const tenants = await this.prisma.tenant.findMany({
@@ -1212,9 +1287,51 @@ export class WmsFulfillmentSyncService {
         wmsFulfillmentGoLiveAt: true,
       },
     });
-    const goLiveByTenantId = new Map(
+
+    return new Map(
       tenants.map((tenant) => [tenant.id, tenant.wmsFulfillmentGoLiveAt] as const),
     );
+  }
+
+  private async resolveDemandQueueGoLiveAt(
+    client: Pick<PrismaService, 'tenant' | 'posStore'> | Prisma.TransactionClient,
+    params: { tenantId: string | null; storeId: string },
+  ): Promise<Date | null> {
+    if (params.tenantId && typeof (client as any).tenant?.findUnique === 'function') {
+      const tenant = await client.tenant.findUnique({
+        where: { id: params.tenantId },
+        select: { wmsFulfillmentGoLiveAt: true },
+      });
+      return tenant?.wmsFulfillmentGoLiveAt ?? null;
+    }
+
+    if (params.storeId && typeof (client as any).posStore?.findUnique === 'function') {
+      const store = await client.posStore.findUnique({
+        where: { id: params.storeId },
+        select: {
+          tenant: {
+            select: { wmsFulfillmentGoLiveAt: true },
+          },
+        },
+      });
+      return store?.tenant?.wmsFulfillmentGoLiveAt ?? null;
+    }
+
+    return null;
+  }
+
+  private async buildTenantGoLiveOrderFilters(tenantIds: string[]): Promise<Prisma.PosOrderWhereInput[]> {
+    const uniqueTenantIds = Array.from(new Set(
+      tenantIds
+        .map((tenantId) => tenantId?.trim())
+        .filter((tenantId): tenantId is string => Boolean(tenantId)),
+    ));
+
+    if (uniqueTenantIds.length === 0) {
+      return [];
+    }
+
+    const goLiveByTenantId = await this.getTenantGoLiveMap(uniqueTenantIds);
 
     return uniqueTenantIds.map((tenantId) => {
       const goLiveAt = goLiveByTenantId.get(tenantId) ?? null;
@@ -1804,6 +1921,7 @@ export class WmsFulfillmentSyncService {
     limit?: number | null;
   }) {
     const now = new Date();
+    const goLiveAt = await this.resolveDemandQueueGoLiveAt(this.prisma, params);
     const variationIds = Array.from(new Set(
       (params.variationIds ?? [])
         .map((variationId) => variationId?.trim())
@@ -1839,6 +1957,13 @@ export class WmsFulfillmentSyncService {
           is: {
             status: CONFIRMED_POS_ORDER_STATUS,
             isVoid: false,
+            ...(goLiveAt
+              ? {
+                  insertedAt: {
+                    gte: goLiveAt,
+                  },
+                }
+              : {}),
           },
         },
         ...(variationIds.length > 0
@@ -1977,6 +2102,7 @@ export class WmsFulfillmentSyncService {
     },
     now: Date,
   ) {
+    const goLiveAt = await this.resolveDemandQueueGoLiveAt(tx, params);
     const variationIds = Array.from(new Set(
       (params.variationIds ?? [])
         .map((variationId) => variationId?.trim())
@@ -2012,6 +2138,13 @@ export class WmsFulfillmentSyncService {
           is: {
             status: CONFIRMED_POS_ORDER_STATUS,
             isVoid: false,
+            ...(goLiveAt
+              ? {
+                  insertedAt: {
+                    gte: goLiveAt,
+                  },
+                }
+              : {}),
           },
         },
         ...(variationIds.length > 0
@@ -2073,8 +2206,10 @@ export class WmsFulfillmentSyncService {
       order: any;
       actorId: string | null;
       now: Date;
+      reason?: string;
     },
   ) {
+    const cancelReason = params.reason ?? 'Order was canceled in POS.';
     const basketId = params.order.basketId as string | null;
     const activeBasketUnits = Array.isArray(params.order.basketUnits) ? params.order.basketUnits : [];
     const restorableUnitIds = activeBasketUnits
@@ -2166,7 +2301,7 @@ export class WmsFulfillmentSyncService {
         quantityAllocated: 0,
         quantityPicked: 0,
         status: WmsFulfillmentLineStatus.CANCELED,
-        issueReason: 'Order was canceled in POS.',
+        issueReason: cancelReason,
       },
     });
 
@@ -2174,7 +2309,7 @@ export class WmsFulfillmentSyncService {
       where: { id: params.order.id },
       data: {
         status: WmsFulfillmentOrderStatus.CANCELED,
-        issueReason: 'Order was canceled in POS.',
+        issueReason: cancelReason,
         allocatedQuantity: 0,
         pickedQuantity: 0,
         claimedById: null,
