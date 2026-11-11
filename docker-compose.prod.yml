@@ -107,6 +107,8 @@ services:
       SEED_ADMIN_LAST_NAME: ${SEED_ADMIN_LAST_NAME}
       RESEND_API_KEY: ${RESEND_API_KEY:-}
       DAILY_REPORT_EMAIL_FROM: ${DAILY_REPORT_EMAIL_FROM:-WeTrade WMS <wms-inventory-update@wetrade.com.ph>}
+      OPS_DIGEST_TOKEN: ${OPS_DIGEST_TOKEN:-}
+      OPS_DIGEST_EMAIL_TO: ${OPS_DIGEST_EMAIL_TO:-lewinskycandido@gmail.com}
     ports:
       - "3001:3001"
     volumes:

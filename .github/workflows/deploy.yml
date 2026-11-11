@@ -31,6 +31,7 @@ jobs:
           SSH_USER: ${{ secrets.SSH_USER }}
           PROD_ENV_FILE: ${{ secrets.PROD_ENV_FILE }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          OPS_DIGEST_TOKEN: ${{ secrets.OPS_DIGEST_TOKEN }}
           DEPLOY_SHA: ${{ github.sha }}
         run: |
           set -e
@@ -75,6 +76,9 @@ jobs:
             printf '%s\n' "$PROD_ENV_FILE"
             if [ -n "${RESEND_API_KEY:-}" ]; then
               printf 'RESEND_API_KEY=%s\n' "$RESEND_API_KEY"
+            fi
+            if [ -n "${OPS_DIGEST_TOKEN:-}" ]; then
+              printf 'OPS_DIGEST_TOKEN=%s\n' "$OPS_DIGEST_TOKEN"
             fi
           } | ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$SSH_USER@$SSH_HOST" "cat > /opt/erp/.env.prod"
 

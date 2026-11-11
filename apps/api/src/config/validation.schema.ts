@@ -130,4 +130,6 @@ export default Joi.object({
   CREATIVE_AI_RETAIN_SOURCE_VIDEO: Joi.string().valid('true', 'false').default('false'),
   CREATIVE_AI_WORKSPACE_RETENTION_DAYS: Joi.number().integer().min(1).default(14),
   CREATIVE_AI_STALE_RUN_GRACE_MS: Joi.number().integer().min(10000).default(120000),
+  OPS_DIGEST_TOKEN: Joi.string().min(32).allow('', null),
+  OPS_DIGEST_EMAIL_TO: Joi.string().allow('', null),
 });

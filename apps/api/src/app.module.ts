@@ -38,6 +38,7 @@ import { WmsIntegrationsModule } from './modules/wms-integrations/wms-integratio
 import { WmsReportsModule } from './modules/wms-reports/wms-reports.module';
 import { CreativeAgentModule } from './modules/creative-agent/creative-agent.module';
 import { AiSettingsModule } from './modules/ai-settings/ai-settings.module';
+import { OpsDigestModule } from './modules/ops-digest/ops-digest.module';
 
 @Module({
   imports: [
@@ -128,6 +129,7 @@ import { AiSettingsModule } from './modules/ai-settings/ai-settings.module';
     WmsReportsModule,
     CreativeAgentModule,
     AiSettingsModule,
+    OpsDigestModule,
   ],
   controllers: [],
   providers: [{ provide: APP_INTERCEPTOR, useClass: WmsPartnerCostInterceptor }],
