@@ -213,7 +213,7 @@ export class WmsDailyInventoryEmailService implements OnModuleInit {
       process.env.DAILY_REPORT_EMAIL_FROM
       || process.env.SMTP_FROM
       || process.env.EMAIL_FROM
-      || 'WMS Reports <reports@wetrade-wms.local>';
+      || 'WeTrade WMS <wms-inventory-update@wetrade.com.ph>';
 
     const outcome = await this.deliverEmail({
       from: fromAddress,
@@ -285,7 +285,7 @@ export class WmsDailyInventoryEmailService implements OnModuleInit {
         return { delivered: true, status: 'SENT', mode: 'WEBHOOK' };
       }
 
-      if (process.env.SMTP_HOST) {
+      if (process.env.SMTP_HOST || process.env.SMTP_PASS || process.env.GMAIL_APP_PASSWORD) {
         await this.sendViaSmtp(payload);
         return { delivered: true, status: 'SENT', mode: 'SMTP' };
       }
@@ -408,11 +408,11 @@ export class WmsDailyInventoryEmailService implements OnModuleInit {
   }
 
   private async sendViaSmtp(payload: EmailPayload) {
-    const host = process.env.SMTP_HOST!;
+    const host = process.env.SMTP_HOST || 'smtp.gmail.com';
     const port = Number(process.env.SMTP_PORT || 465);
     const secure = process.env.SMTP_SECURE !== 'false' && port === 465;
-    const user = process.env.SMTP_USER || '';
-    const pass = process.env.SMTP_PASS || '';
+    const user = process.env.SMTP_USER || 'wms-inventory-update@wetrade.com.ph';
+    const pass = (process.env.SMTP_PASS || process.env.GMAIL_APP_PASSWORD || '').replace(/\s+/g, '');
     const fromEmailMatch = payload.from.match(/<([^>]+)>/);
     const fromEnvelope = fromEmailMatch ? fromEmailMatch[1] : payload.from;
 
