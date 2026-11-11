@@ -942,14 +942,18 @@ export function DailyInventoryMovementsScreen() {
           <div className="space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#dce4ea] bg-white px-3 py-2 text-xs">
               <span className="text-[#536977]">
-                Recipients:{' '}
+                Client Recipients:{' '}
                 <strong className="text-primary">
-                  {emailRecipientsText.trim() || 'lewinskycandido@gmail.com'}
+                  {emailRecipientsText.trim() ||
+                    selectedSubscription?.effectiveRecipients.join(', ') ||
+                    'Client default email'}
                 </strong>
               </span>
               <a
                 href={`https://mail.google.com/mail/?view=cm&fs=1&to=${encodeURIComponent(
-                  emailRecipientsText.trim() || 'lewinskycandido@gmail.com',
+                  emailRecipientsText.trim() ||
+                    selectedSubscription?.effectiveRecipients.join(',') ||
+                    '',
                 )}&su=${encodeURIComponent(previewHtml.subject)}`}
                 target="_blank"
                 rel="noopener noreferrer"
