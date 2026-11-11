@@ -41,6 +41,7 @@ import {
   rotatePartnerWebhookApiKey,
   removePartnerPosStore,
   syncPartnerPosStoreAll,
+  syncPartnerPosStoreOrders,
   syncPartnerPosStoreProducts,
   syncPartnerPosStoreTags,
   syncPartnerPosStoreWarehouses,
@@ -218,6 +219,10 @@ export default function PartnerIntegrationsPage() {
     await runIntegrationAction(
       actionKey,
       () => {
+        if (target === 'orders') {
+          return syncPartnerPosStoreOrders(tenantId, store.id);
+        }
+
         if (target === 'products') {
           return syncPartnerPosStoreProducts(tenantId, store.id);
         }
@@ -756,7 +761,7 @@ function StoreSyncActions({
         </button>
       ) : null}
       {access.canSync
-        ? (['all', 'products', 'tags', 'warehouses'] as StoreSyncTarget[]).map((target) => {
+        ? (['all', 'orders', 'products', 'tags', 'warehouses'] as StoreSyncTarget[]).map((target) => {
             const actionKey = getStoreActionKey(store.id, target);
             const isCurrent = pendingAction === actionKey;
             const isPrimary = target === 'all';
@@ -1471,7 +1476,7 @@ function buildIntegrationAccess(
   };
 }
 
-type StoreSyncTarget = 'all' | 'products' | 'tags' | 'warehouses';
+type StoreSyncTarget = 'all' | 'orders' | 'products' | 'tags' | 'warehouses';
 type StoreActionTarget = StoreSyncTarget | 'edit' | 'remove';
 type StoreStatus = NonNullable<UpdatePartnerPosStoreInput['status']>;
 
@@ -1479,6 +1484,7 @@ const POS_STORES_PAGE_SIZE = 10;
 
 const STORE_SYNC_LABELS: Record<StoreSyncTarget, string> = {
   all: 'Sync all',
+  orders: 'Orders',
   products: 'Products',
   tags: 'Tags',
   warehouses: 'Warehouses',

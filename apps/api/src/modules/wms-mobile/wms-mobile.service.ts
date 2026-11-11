@@ -10465,15 +10465,16 @@ export class WmsMobileService {
 
       const variationInfo = this.asJsonRecord(item.variation_info);
       [
-        this.readString(item.variation_id),
-        this.readString(item.variationId),
-        this.readString(item.product_id),
-        this.readString(item.productId),
-        this.readString(item.product_display_id),
-        this.readString(item.productDisplayId),
-        this.readString(variationInfo?.display_id),
-        this.readString(variationInfo?.product_display_id),
-        this.readString(variationInfo?.barcode),
+        this.readIdentifier(item.variation_id),
+        this.readIdentifier(item.variationId),
+        this.readIdentifier(variationInfo?.id),
+        this.readIdentifier(item.product_id),
+        this.readIdentifier(item.productId),
+        this.readIdentifier(item.product_display_id),
+        this.readIdentifier(item.productDisplayId),
+        this.readIdentifier(variationInfo?.display_id),
+        this.readIdentifier(variationInfo?.product_display_id),
+        this.readIdentifier(variationInfo?.barcode),
       ].forEach((value) => {
         if (value) {
           identifiers.add(value);
@@ -10520,15 +10521,19 @@ export class WmsMobileService {
         continue;
       }
 
-      const sourceVariationId = this.readString(item.variation_id) ?? this.readString(item.variationId);
-      const sourceProductId = this.readString(item.product_id) ?? this.readString(item.productId);
       const variationInfo = this.asJsonRecord(item.variation_info);
+      const sourceProductId = this.readIdentifier(item.product_id) ?? this.readIdentifier(item.productId);
+      const variationInfoId = this.readIdentifier(variationInfo?.id);
+      const sourceVariationId =
+        this.readIdentifier(item.variation_id)
+        ?? this.readIdentifier(item.variationId)
+        ?? (variationInfoId && variationInfoId !== sourceProductId ? variationInfoId : null);
       const sourceDisplayIds = [
-        this.readString(item.product_display_id),
-        this.readString(item.productDisplayId),
-        this.readString(variationInfo?.product_display_id),
-        this.readString(variationInfo?.display_id),
-        this.readString(variationInfo?.barcode),
+        this.readIdentifier(item.product_display_id),
+        this.readIdentifier(item.productDisplayId),
+        this.readIdentifier(variationInfo?.product_display_id),
+        this.readIdentifier(variationInfo?.display_id),
+        this.readIdentifier(variationInfo?.barcode),
       ].filter(Boolean) as string[];
       const resolvedProduct =
         (sourceVariationId ? productByVariationId.get(sourceVariationId) : null)
@@ -10559,9 +10564,11 @@ export class WmsMobileService {
         ?? `Variation ${variationId}`;
       const productDisplayId =
         resolvedProduct?.customId
-        ?? this.readString(variationInfo?.display_id)
-        ?? this.readString(variationInfo?.product_display_id)
-        ?? this.readString(variationInfo?.barcode);
+        ?? this.readIdentifier(item.productDisplayId)
+        ?? this.readIdentifier(item.product_display_id)
+        ?? this.readIdentifier(variationInfo?.display_id)
+        ?? this.readIdentifier(variationInfo?.product_display_id)
+        ?? this.readIdentifier(variationInfo?.barcode);
 
       const existing = groupedLines.get(variationId);
       if (existing) {
@@ -10593,8 +10600,8 @@ export class WmsMobileService {
   private extractPosWarehouseRef(orderSnapshot: Prisma.JsonValue | null) {
     const snapshot = this.asJsonRecord(orderSnapshot);
     return (
-      this.readString(snapshot?.warehouse_id)
-      ?? this.readString(snapshot?.warehouseId)
+      this.readIdentifier(snapshot?.warehouse_id)
+      ?? this.readIdentifier(snapshot?.warehouseId)
       ?? null
     );
   }
@@ -11942,14 +11949,14 @@ export class WmsMobileService {
       }
 
       const comparisonKey = this.buildDemandComparisonKey({
-        variationId: this.readString(item.variation_id) ?? this.readString(item.variationId) ?? null,
-        productId: this.readString(item.product_id) ?? this.readString(item.productId) ?? null,
+        variationId: this.readIdentifier(item.variation_id) ?? this.readIdentifier(item.variationId) ?? null,
+        productId: this.readIdentifier(item.product_id) ?? this.readIdentifier(item.productId) ?? null,
         productDisplayId:
-          this.readString(item.product_display_id)
-          ?? this.readString(item.productDisplayId)
-          ?? this.readString(variationInfo?.display_id)
-          ?? this.readString(variationInfo?.product_display_id)
-          ?? this.readString(variationInfo?.barcode)
+          this.readIdentifier(item.product_display_id)
+          ?? this.readIdentifier(item.productDisplayId)
+          ?? this.readIdentifier(variationInfo?.display_id)
+          ?? this.readIdentifier(variationInfo?.product_display_id)
+          ?? this.readIdentifier(variationInfo?.barcode)
           ?? null,
         productName:
           this.readString(variationInfo?.name)
@@ -11978,24 +11985,24 @@ export class WmsMobileService {
 
       const comparisonKey = this.buildDemandComparisonKey({
         variationId:
-          this.readString(lineSnapshot?.sourceVariationId)
-          ?? this.readString(sourceItem?.variation_id)
-          ?? this.readString(sourceItem?.variationId)
+          this.readIdentifier(lineSnapshot?.sourceVariationId)
+          ?? this.readIdentifier(sourceItem?.variation_id)
+          ?? this.readIdentifier(sourceItem?.variationId)
           ?? line.variationId
           ?? null,
         productId:
-          this.readString(lineSnapshot?.sourceProductId)
-          ?? this.readString(sourceItem?.product_id)
-          ?? this.readString(sourceItem?.productId)
+          this.readIdentifier(lineSnapshot?.sourceProductId)
+          ?? this.readIdentifier(sourceItem?.product_id)
+          ?? this.readIdentifier(sourceItem?.productId)
           ?? line.productId
           ?? null,
         productDisplayId:
-          this.readString(lineSnapshot?.productDisplayId)
-          ?? this.readString(sourceItem?.product_display_id)
-          ?? this.readString(sourceItem?.productDisplayId)
-          ?? this.readString(variationInfo?.display_id)
-          ?? this.readString(variationInfo?.product_display_id)
-          ?? this.readString(variationInfo?.barcode)
+          this.readIdentifier(lineSnapshot?.productDisplayId)
+          ?? this.readIdentifier(sourceItem?.product_display_id)
+          ?? this.readIdentifier(sourceItem?.productDisplayId)
+          ?? this.readIdentifier(variationInfo?.display_id)
+          ?? this.readIdentifier(variationInfo?.product_display_id)
+          ?? this.readIdentifier(variationInfo?.barcode)
           ?? line.productDisplayId
           ?? null,
         productName:
@@ -15469,6 +15476,19 @@ export class WmsMobileService {
     return typeof value === 'string' && value.trim().length > 0
       ? value.trim()
       : null;
+  }
+
+  private readIdentifier(value: unknown): string | null {
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      return trimmed.length > 0 ? trimmed : null;
+    }
+
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return String(value);
+    }
+
+    return null;
   }
 
   private readPositiveInt(value: unknown) {

@@ -262,18 +262,38 @@ export class WmsIntegrationsService {
     );
   }
 
+  async syncStoreOrders(tenantId: string, storeId: string, baseUrl: string) {
+    const result = await this.integrationService.syncPancakeOrdersByStoreId(
+      storeId,
+      tenantId,
+      { days: 14, repairIssueOrders: true },
+    );
+
+    return this.buildActionResponse(
+      tenantId,
+      baseUrl,
+      'posStores.syncOrders',
+      result,
+    );
+  }
+
   async syncStoreAll(tenantId: string, storeId: string, baseUrl: string) {
     const [products, tags, warehouses] = await Promise.all([
       this.integrationService.syncPancakeProductsByStoreId(storeId, tenantId),
       this.integrationService.syncPancakeTagsByStoreId(storeId, tenantId),
       this.integrationService.syncPancakeWarehousesByStoreId(storeId, tenantId),
     ]);
+    const orders = await this.integrationService.syncPancakeOrdersByStoreId(
+      storeId,
+      tenantId,
+      { days: 14, repairIssueOrders: true },
+    );
 
     return this.buildActionResponse(
       tenantId,
       baseUrl,
       'posStores.syncAll',
-      { products, tags, warehouses },
+      { products, tags, warehouses, orders },
     );
   }
 

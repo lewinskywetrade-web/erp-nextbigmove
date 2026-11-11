@@ -1,6 +1,7 @@
 import {
   Injectable,
   Inject,
+  Optional,
   NotFoundException,
   ConflictException,
   ForbiddenException,
@@ -18,6 +19,7 @@ import {
   IntegrationStatus,
   PosProductCogs,
   Prisma,
+  WmsFulfillmentOrderStatus,
   WmsProductProfileStatus,
 } from '@prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
@@ -71,6 +73,7 @@ import { assertValidProductCogs } from './product-cogs-validation';
 import { ProductCogsRefreshPublisherService } from './services/product-cogs-refresh-publisher.service';
 import { lockCogsProduct, productCogsToday, findApplicableProductCogs, writeCurrentProductCogs } from '../product-cogs/current-product-cogs';
 import { assertWmsManagedCogsEditable, WmsCogsSyncService } from '../product-cogs/wms-cogs-sync.service';
+import { WmsFulfillmentSyncService } from '../wms-fulfillment/wms-fulfillment-sync.service';
 import {
   missingPancakeShopCurrency,
   normalizePancakeRetailPrice,
@@ -244,6 +247,8 @@ export class IntegrationService {
     private readonly cacheManager: Cache,
     private readonly productCogsRefresh: ProductCogsRefreshPublisherService,
     private readonly wmsCogsSync: WmsCogsSyncService,
+    @Optional()
+    private readonly wmsFulfillmentSyncService?: WmsFulfillmentSyncService,
   ) {}
 
   private getPosGeoCacheTtlMs(): number {
@@ -3043,7 +3048,7 @@ export class IntegrationService {
                 tenantId,
                 teamId: effectiveTeamId,
                 status: 'ACTIVE',
-                enabled: false,
+                enabled: true,
                 sharedTeams:
                   validSharedIds.length > 0
                     ? {
@@ -3070,18 +3075,41 @@ export class IntegrationService {
               shopAvatarUrl,
               apiKey: entry.apiKey,
               status: 'ACTIVE',
-              enabled: null,
+              enabled: true,
             },
           });
 
-          // Auto-fetch products (best-effort)
+          if (shopId) {
+            try {
+              const existingOwnership = await this.prisma.posShopOwnership.findUnique({
+                where: { shopId },
+                select: { shopId: true },
+              });
+              if (!existingOwnership) {
+                await this.posShopOwnershipService.claimShopOwnership({
+                  storeId: createdStore.id,
+                  reason: 'Auto-claimed during POS store import',
+                });
+              }
+            } catch (ownershipError: any) {
+              this.logger.warn(
+                `Bulk import: shop ownership registration skipped for shop=${shopId}: ${ownershipError?.message || 'Unknown error'}`,
+              );
+            }
+          }
+
+          // Auto-fetch catalog & recent orders (best-effort)
           try {
             await this.syncPancakeProductsByStoreId(createdStore.id, tenantId);
             await this.syncPancakeTagsByStoreId(createdStore.id, tenantId);
             await this.syncPancakeWarehousesByStoreId(createdStore.id, tenantId);
-          } catch (fetchError) {
+            await this.syncPancakeOrdersByStoreId(createdStore.id, tenantId, {
+              days: 14,
+              repairIssueOrders: true,
+            });
+          } catch (fetchError: any) {
             this.logger.warn(
-              `Bulk import: product/tag/warehouse fetch failed for integration ${integration.id}: ${fetchError.message}`,
+              `Bulk import: product/tag/warehouse/order fetch failed for integration ${integration.id}: ${fetchError?.message || 'Unknown error'}`,
             );
           }
 
@@ -3693,6 +3721,7 @@ export class IntegrationService {
       { id: store.id, tenantId, teamId: store.teamId ?? null },
       tags,
     );
+    await this.markPosStoreSynced(store);
 
     const grouped = tags.filter((tag) => !!tag.groupId).length;
     const individual = tags.length - grouped;
@@ -3733,6 +3762,7 @@ export class IntegrationService {
 
     const warehouses = await this.fetchWarehousesFromPancake(store.shopId, apiKey);
     await this.upsertStoreWarehouses(store.id, warehouses);
+    await this.markPosStoreSynced(store);
 
     return {
       synced: warehouses.length,
@@ -5526,10 +5556,297 @@ export class IntegrationService {
 
     const products = await this.fetchProductsFromPancake(store.shopId, apiKeyToUse);
     await this.upsertStoreProducts(store.id, products);
+    await this.markPosStoreSynced(store);
 
     return {
       storeId: store.id,
       syncedCount: products.length,
+    };
+  }
+
+  private async markPosStoreSynced(
+    store: {
+      id: string;
+      integrationId?: string | null;
+      status?: string | null;
+      enabled?: boolean | null;
+    },
+    syncedAt = new Date(),
+  ): Promise<void> {
+    const shouldEnsureEnabled = store.status === 'ACTIVE' && store.enabled !== false;
+
+    try {
+      if (typeof (this.prisma as any).posStore?.update === 'function') {
+        await this.prisma.posStore.update({
+          where: { id: store.id },
+          data: {
+            lastSyncAt: syncedAt,
+            ...(store.status === 'ACTIVE' && store.enabled === null ? { enabled: true } : {}),
+          },
+        });
+      }
+
+      if (store.integrationId && typeof (this.prisma as any).integration?.updateMany === 'function') {
+        await this.prisma.integration.updateMany({
+          where: { id: store.integrationId },
+          data: {
+            lastSyncAt: syncedAt,
+            syncStatus: 'SUCCESS',
+            syncError: null,
+            ...(shouldEnsureEnabled ? { enabled: true, status: IntegrationStatus.ACTIVE } : {}),
+          },
+        });
+      }
+    } catch (error: any) {
+      this.logger.warn(
+        `Failed to stamp sync metadata for POS store ${store.id}: ${error?.message || 'Unknown error'}`,
+      );
+    }
+  }
+
+  private async fetchRecentOrdersWindowFromPancake(
+    shopId: string,
+    apiKey: string,
+    days: number,
+  ): Promise<any[]> {
+    const safeDays = Math.min(Math.max(Math.trunc(days) || 14, 1), 60);
+    const nowUnix = dayjs().utc().unix();
+    const startUnix = dayjs().subtract(safeDays, 'day').startOf('day').utc().unix();
+    const url = `https://pos.pages.fm/api/v1/shops/${encodeURIComponent(shopId)}/orders`;
+    const orders: any[] = [];
+    let currentPage = 1;
+    let totalPages = 1;
+    const maxPages = 50;
+
+    while (currentPage <= totalPages && currentPage <= maxPages) {
+      const params = new URLSearchParams({
+        api_key: apiKey,
+        updateStatus: 'updated_at',
+        startDateTime: String(startUnix),
+        endDateTime: String(nowUnix + 60),
+        page_number: String(currentPage),
+      });
+
+      const response = await fetch(`${url}?${params.toString()}`, {
+        method: 'GET',
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(25_000),
+      });
+
+      if (!response.ok) {
+        throw new ConflictException(`Failed to fetch orders from Pancake POS (HTTP ${response.status})`);
+      }
+
+      const data = await response.json().catch(() => null);
+      if (data?.success === false) {
+        throw new ConflictException(
+          (typeof data?.message === 'string' && data.message.trim()) || 'Pancake POS rejected order sync request',
+        );
+      }
+
+      const pageOrders = Array.isArray(data?.orders)
+        ? data.orders
+        : Array.isArray(data?.data)
+          ? data.data
+          : [];
+      if (pageOrders.length > 0) {
+        orders.push(...pageOrders);
+      }
+
+      const pageNum = Number.parseInt(String(data?.page_number ?? currentPage), 10) || currentPage;
+      const reportedTotalPages = Number.parseInt(String(data?.total_pages ?? pageNum), 10) || pageNum;
+      totalPages = Math.max(pageNum, reportedTotalPages);
+      if (pageNum >= totalPages || pageOrders.length === 0) {
+        break;
+      }
+      currentPage = pageNum + 1;
+    }
+
+    return orders;
+  }
+
+  private async fetchSingleOrderFromPancake(
+    shopId: string,
+    posOrderId: string,
+    apiKey: string,
+  ): Promise<any | null> {
+    const params = new URLSearchParams({ api_key: apiKey });
+    const url = `https://pos.pages.fm/api/v1/shops/${encodeURIComponent(shopId)}/orders/${encodeURIComponent(posOrderId)}?${params.toString()}`;
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        redirect: 'error',
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(20_000),
+      });
+      if (!response.ok) {
+        return null;
+      }
+      const body = await response.json().catch(() => null);
+      if (body?.success === true && body.data && typeof body.data === 'object' && !Array.isArray(body.data)) {
+        return body.data;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  async syncPancakeOrdersByStoreId(
+    storeId: string,
+    tenantIdOverride?: string,
+    options?: {
+      days?: number;
+      repairIssueOrders?: boolean;
+    },
+  ) {
+    const store = tenantIdOverride
+      ? await this.prisma.posStore.findFirst({
+          where: {
+            id: storeId,
+            tenantId: tenantIdOverride,
+          },
+        })
+      : await this.getPosStore(storeId);
+
+    if (!store) {
+      throw new NotFoundException(`Store with ID ${storeId} not found`);
+    }
+
+    const tenantId = store.tenantId;
+    const apiKey = await this.resolveStoreApiKeyForWebhook(tenantId, {
+      id: store.id,
+      integrationId: store.integrationId,
+      apiKey: store.apiKey,
+    });
+
+    if (!apiKey) {
+      throw new ConflictException('Missing API key for this store');
+    }
+
+    if (store.shopId && store.status === 'ACTIVE' && store.enabled !== false) {
+      const existingOwnership = await this.prisma.posShopOwnership.findUnique({
+        where: { shopId: store.shopId },
+        select: { shopId: true },
+      });
+      if (!existingOwnership) {
+        try {
+          await this.posShopOwnershipService.claimShopOwnership({
+            storeId: store.id,
+            reason: 'Auto-claimed during POS store order sync',
+          });
+        } catch (error: any) {
+          this.logger.warn(
+            `Skipped auto-claiming shop ownership during order sync for shop=${store.shopId}: ${error?.message || 'Unknown error'}`,
+          );
+        }
+      }
+    }
+
+    const recentOrders = await this.fetchRecentOrdersWindowFromPancake(
+      store.shopId,
+      apiKey,
+      options?.days ?? 14,
+    );
+
+    const byOrderId = new Map<string, any>();
+    for (const rawOrder of recentOrders) {
+      const id = rawOrder?.id?.toString?.()?.trim?.();
+      if (id) {
+        byOrderId.set(id, rawOrder);
+      }
+    }
+
+    let repairedLookupCount = 0;
+    if (options?.repairIssueOrders !== false) {
+      const openFulfillmentOrders = await this.prisma.wmsFulfillmentOrder.findMany({
+        where: {
+          tenantId,
+          storeId: store.id,
+          status: {
+            in: [
+              WmsFulfillmentOrderStatus.ISSUE,
+              WmsFulfillmentOrderStatus.RESTOCKING,
+              WmsFulfillmentOrderStatus.PARTIAL,
+              WmsFulfillmentOrderStatus.READY,
+            ],
+          },
+        },
+        select: {
+          posOrderId: true,
+          status: true,
+        },
+        orderBy: [
+          { status: 'asc' },
+          { createdAt: 'asc' },
+        ],
+        take: 80,
+      });
+
+      const missingIds = Array.from(
+        new Set(
+          openFulfillmentOrders
+            .map((row) => row.posOrderId?.trim())
+            .filter((id): id is string => Boolean(id) && !byOrderId.has(id)),
+        ),
+      ).slice(0, 50);
+
+      for (const posOrderId of missingIds) {
+        const fetched = await this.fetchSingleOrderFromPancake(store.shopId, posOrderId, apiKey);
+        if (fetched) {
+          byOrderId.set(posOrderId, fetched);
+          repairedLookupCount += 1;
+        }
+      }
+    }
+
+    const rawOrders = Array.from(byOrderId.values());
+    let upsertedCount = 0;
+
+    if (rawOrders.length > 0) {
+      const routing = await this.posShopOwnershipService.resolveOrderRoutes(tenantId, rawOrders);
+      const matchingRoute = routing.routes.find(
+        (route) => route.tenantId === tenantId && route.store.id === store.id,
+      );
+      const ordersForStore = matchingRoute?.orders ?? [];
+      if (ordersForStore.length > 0) {
+        const upsertResult = await this.posOrderService.upsertPosOrdersWithOutcomes(
+          tenantId,
+          store.id,
+          ordersForStore,
+          store.teamId ?? null,
+        );
+        upsertedCount = upsertResult.upserted;
+      }
+    }
+
+    await this.ensureStoreOrdersHavePositiveCogs(tenantId, store.shopId);
+
+    let wmsSyncedOrders = 0;
+    if (this.wmsFulfillmentSyncService && store.status === 'ACTIVE' && store.enabled !== false) {
+      const syncResult = await this.wmsFulfillmentSyncService.syncConfirmedPickingOrders({
+        tenantId,
+        storeId: store.id,
+        actorId: null,
+        stores: [{
+          id: store.id,
+          tenantId,
+          shopId: store.shopId,
+        }],
+        limit: null,
+      });
+      wmsSyncedOrders = syncResult.syncedOrders;
+    }
+
+    await this.markPosStoreSynced(store);
+
+    return {
+      storeId: store.id,
+      shopId: store.shopId,
+      fetchedCount: rawOrders.length,
+      repairedLookupCount,
+      upsertedCount,
+      wmsSyncedOrders,
     };
   }
 

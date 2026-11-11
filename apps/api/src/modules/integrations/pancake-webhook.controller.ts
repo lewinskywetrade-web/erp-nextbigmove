@@ -21,8 +21,7 @@ export class PancakeWebhookController {
    * Public Pancake webhook receiver for order events.
    * Auth: x-api-key header (tenant-level key).
    */
-  @Post(':tenantId')
-  @Post(':tenantId/orders')
+  @Post([':tenantId', ':tenantId/orders'])
   @HttpCode(HttpStatus.ACCEPTED)
   async receiveOrderWebhook(
     @Param('tenantId', ParseUUIDPipe) tenantId: string,

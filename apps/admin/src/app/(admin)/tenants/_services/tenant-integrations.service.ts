@@ -59,6 +59,16 @@ export async function syncPartnerPosStoreWarehouses(tenantId: string, storeId: s
   return response.data as PartnerIntegrationActionResponse;
 }
 
+export async function syncPartnerPosStoreOrders(tenantId: string, storeId: string) {
+  const response = await apiClient.post(
+    `/wms/partners/${tenantId}/integrations/pos-stores/${storeId}/sync-orders`,
+    {},
+    { params: { tenantId } },
+  );
+
+  return response.data as PartnerIntegrationActionResponse;
+}
+
 export async function syncPartnerPosStoreAll(tenantId: string, storeId: string) {
   const response = await apiClient.post(
     `/wms/partners/${tenantId}/integrations/pos-stores/${storeId}/sync-all`,

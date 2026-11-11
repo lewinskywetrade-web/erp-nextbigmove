@@ -77,6 +77,16 @@ export class WmsIntegrationsController {
     return this.wmsIntegrationsService.syncStoreWarehouses(tenantId, storeId, this.getBaseUrl(req));
   }
 
+  @Post('pos-stores/:storeId/sync-orders')
+  @Permissions('wms.integrations.sync')
+  async syncStoreOrders(
+    @Param('tenantId') tenantId: string,
+    @Param('storeId') storeId: string,
+    @Req() req: Request,
+  ) {
+    return this.wmsIntegrationsService.syncStoreOrders(tenantId, storeId, this.getBaseUrl(req));
+  }
+
   @Post('pos-stores/:storeId/sync-all')
   @Permissions('wms.integrations.sync')
   async syncStoreAll(

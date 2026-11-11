@@ -332,3 +332,174 @@ describe('WmsFulfillmentSyncService.returnAmendmentBasketUnit', () => {
     });
   });
 });
+
+describe('WmsFulfillmentSyncService line extraction & ISSUE recovery', () => {
+  it('extracts numeric Pancake variation/product IDs and falls back to itemData when snapshot items are empty', async () => {
+    const prisma = {
+      posProduct: {
+        findMany: jest.fn<() => Promise<any[]>>().mockResolvedValue([
+          {
+            productId: '5001',
+            variationId: '9001',
+            customId: 'TONIOS-SKU-1',
+            name: 'Tonios Signature Pack',
+          },
+        ]),
+      },
+    };
+    const service = new WmsFulfillmentSyncService(prisma as any, {} as any, {} as any);
+
+    const numericLines = await (service as any).extractFulfillmentLinesFromOrderSnapshot(
+      {
+        items: [
+          {
+            product_id: 5001,
+            variation_id: 9001,
+            quantity: 2,
+          },
+        ],
+      },
+      'store-1',
+      null,
+    );
+
+    expect(numericLines).toHaveLength(1);
+    expect(numericLines[0]).toEqual(expect.objectContaining({
+      variationId: '9001',
+      productId: '5001',
+      productName: 'Tonios Signature Pack',
+      productDisplayId: 'TONIOS-SKU-1',
+      quantityRequired: 2,
+    }));
+
+    const fallbackLines = await (service as any).extractFulfillmentLinesFromOrderSnapshot(
+      { items: [{ quantity: 1 }] },
+      'store-1',
+      [
+        {
+          productId: 5001,
+          variationId: 5001,
+          variationName: 'Tonios Signature Pack',
+          quantity: 3,
+        },
+      ],
+    );
+
+    expect(fallbackLines).toHaveLength(1);
+    expect(fallbackLines[0]).toEqual(expect.objectContaining({
+      variationId: '9001',
+      productId: '5001',
+      quantityRequired: 3,
+    }));
+  });
+
+  it('recovers an unbasketed BASKET_DEMAND order out of ISSUE into RESTOCKING and triggers demand queue refresh', async () => {
+    const orderUpdate = jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({});
+    const lineUpsert = jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({});
+    const lineUpdateMany = jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({ count: 0 });
+    const adjustmentUpdateMany = jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({ count: 0 });
+    const amendmentUpdateMany = jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({ count: 0 });
+    const amendmentUpsert = jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({});
+
+    const tx = {
+      $queryRaw: jest.fn<() => Promise<any[]>>().mockResolvedValue([{ id: 'locked' }]),
+      wmsFulfillmentOrder: {
+        findUnique: jest.fn<() => Promise<any>>().mockResolvedValue({
+          id: 'fulfillment-issue-1',
+          tenantId: 'tenant-1',
+          storeId: 'store-1',
+          shopId: 'shop-1',
+          posOrderId: '2',
+          status: WmsFulfillmentOrderStatus.ISSUE,
+          assignmentMode: 'BASKET_DEMAND',
+          basketId: null,
+          pickedQuantity: 0,
+          lines: [],
+          basketPickDemands: [],
+          basketUnits: [],
+        }),
+        findUniqueOrThrow: jest.fn<() => Promise<any>>().mockResolvedValue({
+          sourceItemsHash: 'old-empty-hash',
+          sourceRevision: 1,
+        }),
+        update: orderUpdate,
+      },
+      wmsFulfillmentLine: {
+        upsert: lineUpsert,
+        updateMany: lineUpdateMany,
+        findMany: jest.fn<() => Promise<any[]>>().mockResolvedValue([]),
+      },
+      wmsFulfillmentAdjustment: {
+        updateMany: adjustmentUpdateMany,
+      },
+      wmsFulfillmentAmendment: {
+        updateMany: amendmentUpdateMany,
+        upsert: amendmentUpsert,
+      },
+    };
+
+    const prisma = {
+      posOrder: {
+        findMany: jest.fn<() => Promise<any[]>>().mockResolvedValue([
+          {
+            id: 'pos-db-2',
+            status: 1,
+            isVoid: false,
+            tenantId: 'tenant-1',
+            shopId: 'shop-1',
+            posOrderId: '2',
+            insertedAt: new Date('2026-01-30T02:00:00.000Z'),
+            customerName: null,
+            customerPhone: null,
+            orderSnapshot: {
+              items: [{ product_id: 5001, variation_id: 9001, quantity: 1 }],
+            },
+            itemData: [],
+          },
+        ]),
+      },
+      posProduct: {
+        findMany: jest.fn<() => Promise<any[]>>().mockResolvedValue([
+          {
+            productId: '5001',
+            variationId: '9001',
+            customId: 'TONIOS-SKU-1',
+            name: 'Tonios Signature Pack',
+          },
+        ]),
+      },
+      $transaction: jest.fn(async (callback: any) => callback(tx)),
+    };
+
+    const service = new WmsFulfillmentSyncService(prisma as any, {} as any, {} as any);
+    jest.spyOn(service as any, 'syncCanceledPickingOrders').mockResolvedValue({ cleanedOrders: 0 });
+    jest.spyOn(service as any, 'buildTenantGoLiveOrderFilters').mockResolvedValue([{}]);
+    jest.spyOn(service as any, 'canRecoverTransientEmptyItemsCancellationTx').mockResolvedValue(false);
+    jest.spyOn(service as any, 'reconcileLegacyFulfillmentLines').mockResolvedValue(undefined);
+    const refreshQueue = jest.spyOn(service as any, 'refreshDemandFulfillmentQueue').mockResolvedValue(undefined);
+
+    const result = await service.syncConfirmedPickingOrders({
+      tenantId: 'tenant-1',
+      storeId: 'store-1',
+      actorId: null,
+      stores: [{ id: 'store-1', tenantId: 'tenant-1', shopId: 'shop-1' }],
+      posOrderRefs: [{ shopId: 'shop-1', posOrderId: '2' }],
+    });
+
+    expect(result).toEqual({ syncedOrders: 1 });
+    expect(orderUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'fulfillment-issue-1' },
+      data: expect.objectContaining({
+        status: WmsFulfillmentOrderStatus.RESTOCKING,
+        issueReason: null,
+        totalQuantity: 1,
+        sourceTotalQuantity: 1,
+      }),
+    }));
+    expect(lineUpsert).toHaveBeenCalledTimes(1);
+    expect(refreshQueue).toHaveBeenCalledWith({
+      tenantId: 'tenant-1',
+      storeId: 'store-1',
+    });
+  });
+});

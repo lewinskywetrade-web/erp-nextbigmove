@@ -1,6 +1,18 @@
+import { createDecipheriv, createHash } from 'crypto';
 import { existsSync, readFileSync } from 'fs';
 import { resolve } from 'path';
-import { PrismaClient, RbacWorkspace, RoleScope } from '@prisma/client';
+import {
+  Prisma,
+  PrismaClient,
+  RbacWorkspace,
+  RoleScope,
+  WmsFulfillmentAssignmentMode,
+  WmsFulfillmentLineStatus,
+  WmsFulfillmentOrderStatus,
+  WmsInventoryUnitStatus,
+  WmsLocationKind,
+  WmsProductProfileStatus,
+} from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import Redis from 'ioredis';
 
@@ -4214,6 +4226,1359 @@ async function promoteDesignatedSuperAdmins() {
   }
 }
 
+function readSeedIdentifier(value: unknown): string | null {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value);
+  }
+  return null;
+}
+
+function normalizeSeedSku(value: unknown): string | null {
+  const raw = readSeedIdentifier(value);
+  if (!raw) return null;
+  const cleaned = raw.replace(/`+$/g, '').trim();
+  return cleaned.length > 0 ? cleaned : null;
+}
+
+function readSeedPositiveInt(value: unknown): number {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.max(Math.trunc(parsed), 0);
+}
+
+function decryptSeedIntegrationApiKey(encryptedData: string | null | undefined, tenantKey: string | null | undefined): string | null {
+  if (!encryptedData || !tenantKey || !/^[0-9a-fA-F]{64}$/.test(tenantKey)) {
+    return null;
+  }
+  try {
+    const parts = encryptedData.split(':');
+    if (parts.length !== 3) return null;
+    const [ivHex, authTagHex, encrypted] = parts;
+    const decipher = createDecipheriv('aes-256-gcm', Buffer.from(tenantKey, 'hex'), Buffer.from(ivHex, 'hex'));
+    decipher.setAuthTag(Buffer.from(authTagHex, 'hex'));
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    const parsed = JSON.parse(decrypted);
+    return typeof parsed?.apiKey === 'string' && parsed.apiKey.trim() ? parsed.apiKey.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function buildSeedFulfillmentDemandHash(lines: Array<{ variationId: string; quantityRequired: number }>): string {
+  const sorted = [...lines]
+    .filter((line) => line.variationId && line.quantityRequired > 0)
+    .sort((a, b) => a.variationId.localeCompare(b.variationId))
+    .map((line) => ({
+      variationId: line.variationId,
+      quantityRequired: line.quantityRequired,
+    }));
+  return createHash('sha256').update(JSON.stringify(sorted)).digest('hex');
+}
+
+function formatManilaDateFromUtc(value: string | Date): string {
+  const d = value instanceof Date ? value : new Date(value);
+  const manilaMs = d.getTime() + 8 * 60 * 60 * 1000;
+  return new Date(manilaMs).toISOString().slice(0, 10);
+}
+
+async function syncToniosPosConnectionAndOrders() {
+  try {
+    const now = new Date();
+
+    // 1. Repair active POS stores whose linked integration was left enabled=false during bulk import
+    const activeStoresWithDisabledIntegration = await prisma.posStore.findMany({
+      where: {
+        status: 'ACTIVE',
+        NOT: { enabled: false },
+      },
+      select: {
+        id: true,
+        tenantId: true,
+        shopId: true,
+        enabled: true,
+        lastSyncAt: true,
+        integrationId: true,
+        integration: {
+          select: {
+            id: true,
+            status: true,
+            enabled: true,
+            syncStatus: true,
+            lastSyncAt: true,
+          },
+        },
+      },
+    });
+
+    let repairedStoreConnections = 0;
+    for (const store of activeStoresWithDisabledIntegration) {
+      const needsStoreEnable = store.enabled === null;
+      const needsIntegrationEnable =
+        Boolean(store.integration)
+        && store.integration!.status === 'ACTIVE'
+        && store.integration!.enabled === false;
+      const needsSyncStamp =
+        Boolean(store.integration)
+        && store.integration!.status === 'ACTIVE'
+        && !store.integration!.syncStatus;
+
+      if (!needsStoreEnable && !needsIntegrationEnable && !needsSyncStamp) {
+        continue;
+      }
+
+      if (needsStoreEnable) {
+        await prisma.posStore.update({
+          where: { id: store.id },
+          data: {
+            enabled: true,
+            ...(store.lastSyncAt ? {} : { lastSyncAt: now }),
+          },
+        });
+      }
+
+      if (store.integration && (needsIntegrationEnable || needsSyncStamp)) {
+        await prisma.integration.update({
+          where: { id: store.integration.id },
+          data: {
+            ...(needsIntegrationEnable ? { enabled: true } : {}),
+            syncStatus: store.integration.syncStatus || 'SUCCESS',
+            lastSyncAt: store.integration.lastSyncAt || store.lastSyncAt || now,
+            syncError: null,
+          },
+        });
+      }
+      repairedStoreConnections += 1;
+    }
+    if (repairedStoreConnections > 0) {
+      console.log(`✓ Enabled/synced ${repairedStoreConnections} active POS store integration connection(s)`);
+    }
+
+    // 2. Locate Cristobal E-commerexe Trading OPC / Tonios store(s)
+    const targetStores = await prisma.posStore.findMany({
+      where: {
+        OR: [
+          { name: { contains: 'tonio', mode: 'insensitive' } },
+          { shopName: { contains: 'tonio', mode: 'insensitive' } },
+          { tenant: { name: { contains: 'cristobal', mode: 'insensitive' } } },
+        ],
+      },
+      include: {
+        tenant: {
+          select: {
+            id: true,
+            name: true,
+            status: true,
+            wmsFulfillmentGoLiveAt: true,
+            settings: true,
+            encryptionKey: true,
+          },
+        },
+        integration: {
+          select: {
+            id: true,
+            status: true,
+            enabled: true,
+            syncStatus: true,
+            syncError: true,
+            lastSyncAt: true,
+            credentials: true,
+          },
+        },
+        _count: {
+          select: {
+            products: true,
+            tags: true,
+            warehouses: true,
+          },
+        },
+      },
+    });
+
+    if (targetStores.length === 0) {
+      console.log('[TONIOS_DIAG] No matching Tonios / Cristobal POS store found.');
+      return;
+    }
+
+    for (const store of targetStores) {
+      const settingsObj = (store.tenant.settings && typeof store.tenant.settings === 'object' && !Array.isArray(store.tenant.settings))
+        ? (store.tenant.settings as Record<string, any>)
+        : {};
+      const webhookCfg = (settingsObj.pancakePosWebhook && typeof settingsObj.pancakePosWebhook === 'object')
+        ? (settingsObj.pancakePosWebhook as Record<string, any>)
+        : {};
+      const ownership = store.shopId
+        ? await prisma.posShopOwnership.findUnique({ where: { shopId: store.shopId } })
+        : null;
+      const profileCount = await prisma.wmsProductProfile.count({
+        where: { tenantId: store.tenantId, storeId: store.id },
+      });
+      const posOrderStats = await prisma.posOrder.groupBy({
+        by: ['status', 'isVoid'],
+        where: { tenantId: store.tenantId, shopId: store.shopId },
+        _count: { _all: true },
+      });
+      const fulfillmentStatsBefore = await prisma.wmsFulfillmentOrder.groupBy({
+        by: ['status', 'issueReason'],
+        where: { tenantId: store.tenantId, storeId: store.id },
+        _count: { _all: true },
+      });
+      const inventoryStats = await prisma.wmsInventoryUnit.groupBy({
+        by: ['status', 'variationId', 'posWarehouseRef'],
+        where: { tenantId: store.tenantId, storeId: store.id },
+        _count: { _all: true },
+      });
+
+      console.log('[TONIOS_DIAG_BEFORE]', JSON.stringify({
+        tenant: {
+          id: store.tenant.id,
+          name: store.tenant.name,
+          status: store.tenant.status,
+          wmsFulfillmentGoLiveAt: store.tenant.wmsFulfillmentGoLiveAt,
+          webhookEnabled: Boolean(webhookCfg.enabled),
+          webhookHasApiKey: Boolean(webhookCfg.apiKeyHash),
+        },
+        store: {
+          id: store.id,
+          name: store.name,
+          shopName: store.shopName,
+          shopId: store.shopId,
+          status: store.status,
+          enabled: store.enabled,
+          hasStoreApiKey: Boolean(store.apiKey && store.apiKey.trim()),
+          integrationStatus: store.integration?.status ?? null,
+          integrationEnabled: store.integration?.enabled ?? null,
+          integrationSyncStatus: store.integration?.syncStatus ?? null,
+          lastSyncAt: store.lastSyncAt,
+          counts: {
+            products: store._count.products,
+            profiles: profileCount,
+            tags: store._count.tags,
+            warehouses: store._count.warehouses,
+          },
+          ownership: ownership
+            ? { tenantId: ownership.tenantId, storeId: ownership.storeId, ownedBySelf: ownership.storeId === store.id }
+            : null,
+        },
+        posOrderStats,
+        fulfillmentStatsBefore,
+        inventoryStats,
+      }));
+
+      if (store.status !== 'ACTIVE' || store.enabled === false || !store.shopId) {
+        continue;
+      }
+
+      if (!ownership) {
+        await prisma.posShopOwnership.create({
+          data: {
+            shopId: store.shopId,
+            tenantId: store.tenantId,
+            storeId: store.id,
+            activatedAt: now,
+            reason: 'Auto-claimed during Tonios WMS POS repair',
+          },
+        });
+      }
+
+      const apiKey =
+        (store.apiKey && store.apiKey.trim())
+        || decryptSeedIntegrationApiKey(store.integration?.credentials, store.tenant.encryptionKey);
+      if (!apiKey) {
+        console.warn(`[TONIOS_DIAG] Store ${store.id} has no resolvable API key.`);
+        continue;
+      }
+
+      if (!store.apiKey || !store.apiKey.trim()) {
+        await prisma.posStore.update({
+          where: { id: store.id },
+          data: { apiKey },
+        });
+      }
+
+      // 3. Sync live Pancake catalog (products + WMS profiles)
+      let syncedCatalogCount = 0;
+      try {
+        let page = 1;
+        let totalPages = 1;
+        while (page <= totalPages && page <= 25) {
+          const prodParams = new URLSearchParams({
+            api_key: apiKey,
+            page_number: String(page),
+          });
+          const resp = await fetch(
+            `https://pos.pages.fm/api/v1/shops/${encodeURIComponent(store.shopId)}/products?${prodParams.toString()}`,
+            { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(20_000) },
+          );
+          if (!resp.ok) break;
+          const body: any = await resp.json().catch(() => null);
+          const rawRows: any[] = Array.isArray(body?.data)
+            ? body.data
+            : Array.isArray(body?.products)
+              ? body.products
+              : Array.isArray(body?.data?.products)
+                ? body.data.products
+                : [];
+          for (const rawItem of rawRows) {
+            const itemsToExpand = Array.isArray(rawItem?.variations) && rawItem.variations.length > 0
+              ? rawItem.variations.map((v: any) => ({ ...v, product: v.product ?? rawItem, product_id: v.product_id ?? rawItem.id }))
+              : [rawItem];
+            for (const item of itemsToExpand) {
+              const productId =
+                readSeedIdentifier(item?.product_id)
+                ?? readSeedIdentifier(item?.productId)
+                ?? readSeedIdentifier(item?.product?.id)
+                ?? readSeedIdentifier(item?.variation_info?.product_id);
+              if (!productId) continue;
+              const explicitVarId =
+                readSeedIdentifier(item?.variation_id)
+                ?? readSeedIdentifier(item?.variationId)
+                ?? readSeedIdentifier(item?.variation?.id);
+              const candidateId = readSeedIdentifier(item?.id);
+              const variationId = explicitVarId ?? (candidateId && candidateId !== productId ? candidateId : null);
+              const customId = normalizeSeedSku(item?.custom_id ?? item?.display_id ?? item?.code ?? item?.barcode);
+              const name =
+                (typeof item?.name === 'string' && item.name.trim())
+                || (typeof item?.variation_info?.name === 'string' && item.variation_info.name.trim())
+                || (typeof item?.product?.name === 'string' && item.product.name.trim())
+                || 'Unnamed product';
+              const whRows = Array.isArray(item?.variations_warehouses) ? item.variations_warehouses : [];
+              const warehouseId = readSeedIdentifier(whRows[0]?.warehouse_id ?? whRows[0]?.id);
+
+              let savedProduct = variationId
+                ? await prisma.posProduct.findFirst({ where: { storeId: store.id, variationId } })
+                : await prisma.posProduct.findFirst({ where: { storeId: store.id, productId, variationId: null } });
+
+              if (savedProduct) {
+                savedProduct = await prisma.posProduct.update({
+                  where: { id: savedProduct.id },
+                  data: {
+                    productId,
+                    ...(variationId ? { variationId } : {}),
+                    ...(warehouseId ? { warehouseId } : {}),
+                    ...(customId ? { customId } : {}),
+                    name,
+                  },
+                });
+              } else {
+                savedProduct = await prisma.posProduct.create({
+                  data: {
+                    storeId: store.id,
+                    productId,
+                    variationId,
+                    warehouseId,
+                    customId,
+                    name,
+                  },
+                });
+              }
+
+              if (variationId && variationId !== productId) {
+                await prisma.wmsProductProfile.upsert({
+                  where: {
+                    storeId_variationId: {
+                      storeId: store.id,
+                      variationId,
+                    },
+                  },
+                  update: {
+                    posProductId: savedProduct.id,
+                    productId,
+                    ...(warehouseId ? { posWarehouseRef: warehouseId } : {}),
+                  },
+                  create: {
+                    tenantId: store.tenantId,
+                    storeId: store.id,
+                    posProductId: savedProduct.id,
+                    productId,
+                    variationId,
+                    posWarehouseRef: warehouseId,
+                    status: WmsProductProfileStatus.DEFAULT,
+                    isSerialized: true,
+                  },
+                });
+              }
+              syncedCatalogCount += 1;
+            }
+          }
+          const pageNum = Number.parseInt(String(body?.page_number ?? page), 10) || page;
+          totalPages = Math.max(pageNum, Number.parseInt(String(body?.total_pages ?? pageNum), 10) || pageNum);
+          if (pageNum >= totalPages || rawRows.length === 0) break;
+          page = pageNum + 1;
+        }
+      } catch (err: any) {
+        console.warn(`[TONIOS_DIAG] Catalog sync warning for store=${store.id}: ${err?.message || 'Unknown error'}`);
+      }
+
+      // Ensure every existing stockable posProduct in this store has a WmsProductProfile
+      const storeProducts = await prisma.posProduct.findMany({
+        where: { storeId: store.id },
+        select: { id: true, productId: true, variationId: true, warehouseId: true },
+      });
+      for (const p of storeProducts) {
+        if (p.variationId && p.variationId !== p.productId) {
+          await prisma.wmsProductProfile.upsert({
+            where: {
+              storeId_variationId: {
+                storeId: store.id,
+                variationId: p.variationId,
+              },
+            },
+            update: {
+              posProductId: p.id,
+              productId: p.productId,
+            },
+            create: {
+              tenantId: store.tenantId,
+              storeId: store.id,
+              posProductId: p.id,
+              productId: p.productId,
+              variationId: p.variationId,
+              posWarehouseRef: p.warehouseId,
+              status: WmsProductProfileStatus.DEFAULT,
+              isSerialized: true,
+            },
+          });
+        }
+      }
+
+      // 4. Fetch recent orders + live single-order state for every open/confirmed order of this store
+      const liveOrdersByPosOrderId = new Map<string, any>();
+      try {
+        const endUnix = Math.floor(Date.now() / 1000) + 60;
+        const startUnix = endUnix - 21 * 24 * 60 * 60;
+        let page = 1;
+        let totalPages = 1;
+        while (page <= totalPages && page <= 25) {
+          const orderParams = new URLSearchParams({
+            api_key: apiKey,
+            updateStatus: 'updated_at',
+            startDateTime: String(startUnix),
+            endDateTime: String(endUnix),
+            page_number: String(page),
+          });
+          const resp = await fetch(
+            `https://pos.pages.fm/api/v1/shops/${encodeURIComponent(store.shopId)}/orders?${orderParams.toString()}`,
+            { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(20_000) },
+          );
+          if (!resp.ok) break;
+          const body: any = await resp.json().catch(() => null);
+          const rows: any[] = Array.isArray(body?.orders)
+            ? body.orders
+            : Array.isArray(body?.data)
+              ? body.data
+              : [];
+          for (const row of rows) {
+            const oid = readSeedIdentifier(row?.id);
+            if (oid) liveOrdersByPosOrderId.set(oid, row);
+          }
+          const pageNum = Number.parseInt(String(body?.page_number ?? page), 10) || page;
+          totalPages = Math.max(pageNum, Number.parseInt(String(body?.total_pages ?? pageNum), 10) || pageNum);
+          if (pageNum >= totalPages || rows.length === 0) break;
+          page = pageNum + 1;
+        }
+      } catch (err: any) {
+        console.warn(`[TONIOS_DIAG] Recent orders window fetch warning for store=${store.id}: ${err?.message || 'Unknown error'}`);
+      }
+
+      // Explicitly inspect open fulfillment orders and confirmed DB orders (including Order #2)
+      const trackedDbOrders = await prisma.posOrder.findMany({
+        where: {
+          tenantId: store.tenantId,
+          shopId: store.shopId,
+          OR: [
+            { status: 1, isVoid: false },
+            {
+              wmsFulfillmentOrders: {
+                some: {
+                  status: {
+                    in: [
+                      WmsFulfillmentOrderStatus.ISSUE,
+                      WmsFulfillmentOrderStatus.RESTOCKING,
+                      WmsFulfillmentOrderStatus.PARTIAL,
+                      WmsFulfillmentOrderStatus.READY,
+                    ],
+                  },
+                },
+              },
+            },
+          ],
+        },
+        select: {
+          id: true,
+          posOrderId: true,
+          dateLocal: true,
+          status: true,
+          isVoid: true,
+          totalQuantity: true,
+          orderSnapshot: true,
+          itemData: true,
+          wmsFulfillmentOrders: {
+            select: {
+              id: true,
+              status: true,
+              issueReason: true,
+              pickedQuantity: true,
+              basketId: true,
+            },
+          },
+        },
+        orderBy: [{ dateLocal: 'asc' }, { posOrderId: 'asc' }],
+        take: 120,
+      });
+
+      const targetedLookupDiagnostics: Array<Record<string, unknown>> = [];
+      for (const dbOrder of trackedDbOrders) {
+        const hasFulfillmentIssue = dbOrder.wmsFulfillmentOrders.some(
+          (fo) => fo.status === WmsFulfillmentOrderStatus.ISSUE,
+        );
+        if (liveOrdersByPosOrderId.has(dbOrder.posOrderId) && !hasFulfillmentIssue) {
+          continue;
+        }
+
+        try {
+          const singleParams = new URLSearchParams({ api_key: apiKey });
+          const singleResp = await fetch(
+            `https://pos.pages.fm/api/v1/shops/${encodeURIComponent(store.shopId)}/orders/${encodeURIComponent(dbOrder.posOrderId)}?${singleParams.toString()}`,
+            { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) },
+          );
+          const singleBody: any = await singleResp.json().catch(() => null);
+          const liveData =
+            singleResp.ok && singleBody?.success === true && singleBody.data && typeof singleBody.data === 'object' && !Array.isArray(singleBody.data)
+              ? singleBody.data
+              : null;
+
+          if (liveData) {
+            liveOrdersByPosOrderId.set(dbOrder.posOrderId, liveData);
+          } else if (singleResp.status === 404 && !dbOrder.isVoid) {
+            await prisma.posOrder.update({
+              where: { id: dbOrder.id },
+              data: { isVoid: true },
+            });
+          }
+
+          if (hasFulfillmentIssue || singleResp.status !== 200 || !liveData) {
+            const liveItems = Array.isArray(liveData?.items) ? liveData.items : [];
+            targetedLookupDiagnostics.push({
+              posOrderId: dbOrder.posOrderId,
+              dateLocal: dbOrder.dateLocal,
+              dbStatus: dbOrder.status,
+              dbIsVoid: dbOrder.isVoid,
+              httpStatus: singleResp.status,
+              apiSuccess: Boolean(singleBody?.success),
+              liveStatus: liveData?.status ?? null,
+              liveItemCount: liveItems.length,
+              liveItemRefs: liveItems.slice(0, 5).map((it: any) => ({
+                qty: it?.quantity ?? null,
+                varIdType: typeof it?.variation_id,
+                hasVarId: Boolean(readSeedIdentifier(it?.variation_id ?? it?.variationId ?? it?.variation_info?.id)),
+                hasProdId: Boolean(readSeedIdentifier(it?.product_id ?? it?.productId)),
+                hasSku: Boolean(normalizeSeedSku(it?.product_display_id ?? it?.variation_info?.display_id ?? it?.variation_info?.barcode)),
+              })),
+            });
+          }
+        } catch (err: any) {
+          targetedLookupDiagnostics.push({
+            posOrderId: dbOrder.posOrderId,
+            dateLocal: dbOrder.dateLocal,
+            error: err?.message || 'fetch_failed',
+          });
+        }
+      }
+
+      let updatedLivePosOrders = 0;
+      let createdLivePosOrders = 0;
+      for (const [posOrderId, rawOrder] of Array.from(liveOrdersByPosOrderId.entries())) {
+        const rawShopId = readSeedIdentifier(rawOrder?.shop_id) ?? store.shopId;
+        if (rawShopId !== store.shopId) continue;
+        const sourceNameLower = String(rawOrder?.order_sources_name ?? '').trim().toLowerCase();
+        if (sourceNameLower === 'tiktok' || sourceNameLower === 'shopee') continue;
+        if ((rawOrder?.status === 0 || rawOrder?.status === '0') && rawOrder?.shopify_abandon_checkout_id) {
+          continue;
+        }
+
+        const parsedStatus = Number(rawOrder?.status);
+        const normalizedStatus = Number.isFinite(parsedStatus) ? Math.trunc(parsedStatus) : null;
+        const rawItems = Array.isArray(rawOrder?.items) ? rawOrder.items : [];
+        const hasAnyProductIdentifier = rawItems.some((it: any) => Boolean(
+          readSeedIdentifier(it?.variation_id)
+          ?? readSeedIdentifier(it?.variationId)
+          ?? readSeedIdentifier(it?.variation_info?.id)
+          ?? readSeedIdentifier(it?.product_id)
+          ?? readSeedIdentifier(it?.productId)
+          ?? normalizeSeedSku(it?.product_display_id ?? it?.variation_info?.display_id ?? it?.variation_info?.barcode),
+        ));
+        const isNoProductNonConfirmed =
+          Array.isArray(rawOrder?.items)
+          && (rawItems.length === 0 || !hasAnyProductIdentifier)
+          && normalizedStatus !== 1
+          && normalizedStatus !== 0;
+        const nextIsVoid = normalizedStatus === 7 || isNoProductNonConfirmed;
+        const nextItemData = rawItems.map((it: any) => {
+          const variation = it?.variation_info && typeof it.variation_info === 'object' ? it.variation_info : {};
+          return {
+            quantity: readSeedPositiveInt(it?.quantity) || 1,
+            productId: readSeedIdentifier(it?.product_id ?? it?.productId),
+            variationId: readSeedIdentifier(it?.variation_id ?? it?.variationId ?? variation?.id),
+            variationName: typeof variation?.name === 'string' ? variation.name : null,
+            productDisplayId: normalizeSeedSku(
+              variation?.product_display_id
+              ?? it?.product_display_id
+              ?? it?.productDisplayId
+              ?? variation?.display_id
+              ?? variation?.barcode,
+            ),
+          };
+        });
+        const calcQty = nextItemData.reduce((sum: number, it: any) => sum + (it.quantity || 0), 0);
+
+        const existingPosOrder = await prisma.posOrder.findUnique({
+          where: {
+            tenantId_shopId_posOrderId: {
+              tenantId: store.tenantId,
+              shopId: store.shopId,
+              posOrderId,
+            },
+          },
+          select: {
+            id: true,
+            status: true,
+            isVoid: true,
+            totalQuantity: true,
+            orderSnapshot: true,
+          },
+        });
+
+        if (existingPosOrder) {
+          const prevSnap =
+            existingPosOrder.orderSnapshot
+            && typeof existingPosOrder.orderSnapshot === 'object'
+            && !Array.isArray(existingPosOrder.orderSnapshot)
+              ? (existingPosOrder.orderSnapshot as Record<string, unknown>)
+              : {};
+          const mergedSnapshot: Record<string, unknown> = {
+            ...prevSnap,
+            id: rawOrder.id ?? prevSnap.id,
+            shop_id: rawOrder.shop_id ?? store.shopId,
+            status: normalizedStatus ?? prevSnap.status,
+            status_name: rawOrder.status_name ?? prevSnap.status_name ?? null,
+            inserted_at: rawOrder.inserted_at ?? prevSnap.inserted_at ?? null,
+            updated_at: rawOrder.updated_at ?? prevSnap.updated_at ?? null,
+            warehouse_id: rawOrder.warehouse_id ?? prevSnap.warehouse_id ?? null,
+            total_quantity: rawOrder.total_quantity ?? calcQty,
+            items: rawItems,
+          };
+
+          await prisma.posOrder.update({
+            where: { id: existingPosOrder.id },
+            data: {
+              ...(normalizedStatus !== null ? { status: normalizedStatus } : {}),
+              ...(typeof rawOrder?.status_name === 'string' ? { statusName: rawOrder.status_name } : {}),
+              isVoid: nextIsVoid,
+              ...(calcQty > 0 ? { totalQuantity: calcQty } : {}),
+              ...(rawItems.length > 0 ? { itemData: nextItemData as Prisma.InputJsonValue } : {}),
+              orderSnapshot: mergedSnapshot as Prisma.InputJsonValue,
+            },
+          });
+          updatedLivePosOrders += 1;
+        } else if (normalizedStatus === 1 && !nextIsVoid && rawOrder?.inserted_at) {
+          const insertedAt = new Date(rawOrder.inserted_at);
+          if (!Number.isNaN(insertedAt.getTime())) {
+            const dateLocal = formatManilaDateFromUtc(insertedAt);
+            const codNumeric = Number(rawOrder?.cod ?? 0);
+            const safeCod = Number.isFinite(codNumeric) ? codNumeric : 0;
+            await prisma.posOrder.create({
+              data: {
+                tenantId: store.tenantId,
+                teamId: store.teamId ?? null,
+                shopId: store.shopId,
+                posOrderId,
+                insertedAt,
+                dateLocal,
+                status: normalizedStatus,
+                statusName: typeof rawOrder?.status_name === 'string' ? rawOrder.status_name : null,
+                cod: new Prisma.Decimal(safeCod),
+                salesCod: new Prisma.Decimal(safeCod),
+                mktgCod: new Prisma.Decimal(0),
+                isVoid: false,
+                cogs: new Prisma.Decimal(0),
+                totalQuantity: Math.max(calcQty, 1),
+                itemData: nextItemData as Prisma.InputJsonValue,
+                orderSnapshot: {
+                  id: rawOrder.id,
+                  shop_id: store.shopId,
+                  status: normalizedStatus,
+                  status_name: rawOrder.status_name ?? null,
+                  inserted_at: rawOrder.inserted_at,
+                  updated_at: rawOrder.updated_at ?? null,
+                  warehouse_id: rawOrder.warehouse_id ?? null,
+                  total_quantity: rawOrder.total_quantity ?? calcQty,
+                  items: rawItems,
+                } as Prisma.InputJsonValue,
+              },
+            });
+            createdLivePosOrders += 1;
+          }
+        }
+      }
+
+      await prisma.posStore.update({
+        where: { id: store.id },
+        data: {
+          enabled: true,
+          lastSyncAt: now,
+        },
+      });
+      if (store.integration) {
+        await prisma.integration.update({
+          where: { id: store.integration.id },
+          data: {
+            enabled: true,
+            status: 'ACTIVE',
+            syncStatus: 'SUCCESS',
+            syncError: null,
+            lastSyncAt: now,
+          },
+        });
+      }
+
+      console.log('[TONIOS_SYNC_SUMMARY]', JSON.stringify({
+        storeId: store.id,
+        shopId: store.shopId,
+        syncedCatalogCount,
+        liveOrdersFetched: liveOrdersByPosOrderId.size,
+        updatedLivePosOrders,
+        createdLivePosOrders,
+        targetedLookupDiagnostics,
+      }));
+    }
+  } catch (err: any) {
+    console.error('Warning during Tonios POS connection & order sync:', err?.message || err);
+  }
+}
+
+async function reconcileToniosWmsFulfillmentQueue() {
+  try {
+    const now = new Date();
+    const targetStores = await prisma.posStore.findMany({
+      where: {
+        status: 'ACTIVE',
+        NOT: { enabled: false },
+        OR: [
+          { name: { contains: 'tonio', mode: 'insensitive' } },
+          { shopName: { contains: 'tonio', mode: 'insensitive' } },
+          { tenant: { name: { contains: 'cristobal', mode: 'insensitive' } } },
+        ],
+      },
+      include: {
+        tenant: {
+          select: {
+            id: true,
+            name: true,
+            wmsFulfillmentGoLiveAt: true,
+          },
+        },
+      },
+    });
+
+    for (const store of targetStores) {
+      const catalogProducts = await prisma.posProduct.findMany({
+        where: { storeId: store.id },
+        select: {
+          productId: true,
+          variationId: true,
+          customId: true,
+          name: true,
+        },
+      });
+
+      type CatalogRow = (typeof catalogProducts)[number];
+      const isStockable = (row: CatalogRow) => Boolean(row.variationId && row.variationId !== row.productId);
+      const byVariationId = new Map<string, CatalogRow>();
+      const byProductId = new Map<string, CatalogRow[]>();
+      const byCustomKey = new Map<string, CatalogRow[]>();
+
+      for (const row of catalogProducts) {
+        if (row.variationId) {
+          const cur = byVariationId.get(row.variationId);
+          if (!cur || (!isStockable(cur) && isStockable(row))) {
+            byVariationId.set(row.variationId, row);
+          }
+        }
+        if (row.productId) {
+          const list = byProductId.get(row.productId) ?? [];
+          list.push(row);
+          byProductId.set(row.productId, list);
+        }
+        const normSku = normalizeSeedSku(row.customId)?.toLowerCase();
+        if (normSku) {
+          const list = byCustomKey.get(normSku) ?? [];
+          list.push(row);
+          byCustomKey.set(normSku, list);
+        }
+      }
+
+      const pickUnambiguous = (rows: CatalogRow[] | undefined): CatalogRow | null => {
+        if (!rows || rows.length === 0) return null;
+        const stockable = rows.filter((r) => isStockable(r));
+        const pool = stockable.length > 0 ? stockable : rows.filter((r) => Boolean(r.variationId));
+        if (pool.length === 0) return rows.length === 1 ? rows[0] : null;
+        const vars = new Set(pool.map((r) => r.variationId!));
+        return vars.size === 1 ? pool[0] : null;
+      };
+
+      const extractLinesFromItems = (items: unknown[]) => {
+        const grouped = new Map<string, {
+          variationId: string;
+          productId: string | null;
+          productName: string;
+          productDisplayId: string | null;
+          quantityRequired: number;
+          lineSnapshot: Prisma.InputJsonValue;
+        }>();
+
+        for (const raw of items) {
+          if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+          const item = raw as Record<string, any>;
+          const variationInfo = item.variation_info && typeof item.variation_info === 'object' && !Array.isArray(item.variation_info)
+            ? (item.variation_info as Record<string, any>)
+            : null;
+          const sourceProductId =
+            readSeedIdentifier(item.product_id)
+            ?? readSeedIdentifier(item.productId)
+            ?? readSeedIdentifier(variationInfo?.product_id)
+            ?? readSeedIdentifier(variationInfo?.productId);
+          const explicitVarId =
+            readSeedIdentifier(item.variation_id)
+            ?? readSeedIdentifier(item.variationId)
+            ?? readSeedIdentifier(variationInfo?.variation_id)
+            ?? readSeedIdentifier(variationInfo?.variationId);
+          const variationInfoId = readSeedIdentifier(variationInfo?.id);
+          const sourceVariationId =
+            explicitVarId
+            ?? (variationInfoId && (!sourceProductId || variationInfoId !== sourceProductId) ? variationInfoId : null);
+          const skus = [
+            normalizeSeedSku(item.product_display_id),
+            normalizeSeedSku(item.productDisplayId),
+            normalizeSeedSku(item.custom_id),
+            normalizeSeedSku(item.customId),
+            normalizeSeedSku(item.sku),
+            normalizeSeedSku(item.barcode),
+            normalizeSeedSku(variationInfo?.product_display_id),
+            normalizeSeedSku(variationInfo?.display_id),
+            normalizeSeedSku(variationInfo?.custom_id),
+            normalizeSeedSku(variationInfo?.barcode),
+          ].filter((v): v is string => Boolean(v));
+
+          const hasDistinctVar = Boolean(sourceVariationId && (!sourceProductId || sourceVariationId !== sourceProductId));
+          let resolved: CatalogRow | null = null;
+          if (hasDistinctVar) {
+            resolved = byVariationId.get(sourceVariationId!) ?? null;
+          } else {
+            const direct = sourceVariationId ? byVariationId.get(sourceVariationId) ?? null : null;
+            resolved =
+              (direct && isStockable(direct) ? direct : null)
+              ?? skus.map((s) => pickUnambiguous(byCustomKey.get(s.toLowerCase()))).find((r): r is CatalogRow => Boolean(r))
+              ?? (sourceProductId ? pickUnambiguous(byProductId.get(sourceProductId)) : null)
+              ?? direct
+              ?? null;
+          }
+
+          const variationId = resolved?.variationId ?? sourceVariationId ?? null;
+          if (!variationId) continue;
+
+          const qty = readSeedPositiveInt(item.quantity);
+          const returned =
+            readSeedPositiveInt(item.returned_count)
+            + readSeedPositiveInt(item.return_quantity)
+            + readSeedPositiveInt(item.returning_quantity);
+          const required = Math.max(qty - returned, 0);
+          if (required <= 0) continue;
+
+          const productId = resolved?.productId ?? sourceProductId;
+          const productName =
+            (typeof variationInfo?.name === 'string' && variationInfo.name.trim())
+            || (typeof item.variationName === 'string' && item.variationName.trim())
+            || resolved?.name
+            || (typeof item.note_product === 'string' && item.note_product.trim())
+            || `Variation ${variationId}`;
+          const productDisplayId =
+            resolved?.customId
+            ?? normalizeSeedSku(item.productDisplayId ?? item.product_display_id ?? variationInfo?.display_id ?? variationInfo?.product_display_id ?? variationInfo?.barcode);
+
+          const existing = grouped.get(variationId);
+          if (existing) {
+            existing.quantityRequired += required;
+            continue;
+          }
+          grouped.set(variationId, {
+            variationId,
+            productId,
+            productName,
+            productDisplayId,
+            quantityRequired: required,
+            lineSnapshot: {
+              variationId,
+              productId,
+              productName,
+              productDisplayId,
+              sourceVariationId,
+              sourceProductId,
+              sourceItem: item,
+            } as Prisma.InputJsonValue,
+          });
+        }
+        return Array.from(grouped.values());
+      };
+
+      // 1. Cancel unpicked fulfillment orders whose POS order is canceled (6) or void
+      const unpickedCanceledOrders = await prisma.wmsFulfillmentOrder.findMany({
+        where: {
+          tenantId: store.tenantId,
+          storeId: store.id,
+          basketId: null,
+          pickedQuantity: 0,
+          status: {
+            in: [
+              WmsFulfillmentOrderStatus.ISSUE,
+              WmsFulfillmentOrderStatus.RESTOCKING,
+              WmsFulfillmentOrderStatus.PARTIAL,
+              WmsFulfillmentOrderStatus.READY,
+            ],
+          },
+          posOrder: {
+            is: {
+              OR: [{ status: 6 }, { isVoid: true }],
+            },
+          },
+        },
+        select: { id: true },
+      });
+
+      for (const canceledOrder of unpickedCanceledOrders) {
+        await prisma.wmsFulfillmentLine.updateMany({
+          where: { fulfillmentOrderId: canceledOrder.id },
+          data: {
+            quantityAllocated: 0,
+            quantityPicked: 0,
+            status: WmsFulfillmentLineStatus.CANCELED,
+            issueReason: 'Order was canceled in POS.',
+          },
+        });
+        await prisma.wmsFulfillmentOrder.update({
+          where: { id: canceledOrder.id },
+          data: {
+            status: WmsFulfillmentOrderStatus.CANCELED,
+            issueReason: 'Order was canceled in POS.',
+            allocatedQuantity: 0,
+            pickedQuantity: 0,
+            completedAt: now,
+            lastSyncedAt: now,
+          },
+        });
+      }
+
+      // 2. Sync all confirmed (status=1, isVoid=false) POS orders for this store
+      const confirmedPosOrders = await prisma.posOrder.findMany({
+        where: {
+          tenantId: store.tenantId,
+          shopId: store.shopId,
+          status: 1,
+          isVoid: false,
+          ...(store.tenant.wmsFulfillmentGoLiveAt
+            ? { insertedAt: { gte: store.tenant.wmsFulfillmentGoLiveAt } }
+            : {}),
+        },
+        orderBy: [{ dateLocal: 'asc' }, { insertedAt: 'asc' }],
+      });
+
+      let createdFulfillmentCount = 0;
+      let recoveredIssueCount = 0;
+
+      for (const posOrder of confirmedPosOrders) {
+        const snap = posOrder.orderSnapshot && typeof posOrder.orderSnapshot === 'object' && !Array.isArray(posOrder.orderSnapshot)
+          ? (posOrder.orderSnapshot as Record<string, any>)
+          : null;
+        const primaryLines = extractLinesFromItems(Array.isArray(snap?.items) ? snap!.items : []);
+        const lines = primaryLines.length > 0
+          ? primaryLines
+          : extractLinesFromItems(Array.isArray(posOrder.itemData) ? (posOrder.itemData as unknown[]) : []);
+        const totalQuantity = lines.reduce((sum, l) => sum + l.quantityRequired, 0);
+        const sourceItemsHash = buildSeedFulfillmentDemandHash(lines);
+        const posWarehouseRef = readSeedIdentifier(snap?.warehouse_id ?? snap?.warehouseId);
+
+        const existing = await prisma.wmsFulfillmentOrder.findUnique({
+          where: { posOrderDbId: posOrder.id },
+          include: { lines: true },
+        });
+
+        if (!existing) {
+          await prisma.wmsFulfillmentOrder.create({
+            data: {
+              tenantId: posOrder.tenantId,
+              storeId: store.id,
+              posOrderDbId: posOrder.id,
+              shopId: posOrder.shopId,
+              posOrderId: posOrder.posOrderId,
+              posWarehouseRef,
+              customerName: posOrder.customerName,
+              customerPhone: posOrder.customerPhone,
+              status: lines.length === 0 ? WmsFulfillmentOrderStatus.ISSUE : WmsFulfillmentOrderStatus.RESTOCKING,
+              assignmentMode: WmsFulfillmentAssignmentMode.BASKET_DEMAND,
+              issueReason: lines.length === 0 ? 'Order has no pickable variation items' : null,
+              sourceTotalQuantity: totalQuantity,
+              totalQuantity,
+              sourceItemsHash,
+              sourceRevision: 1,
+              lastSyncedAt: now,
+              lines: {
+                create: lines.map((line) => ({
+                  tenantId: posOrder.tenantId,
+                  productId: line.productId,
+                  variationId: line.variationId,
+                  productName: line.productName,
+                  productDisplayId: line.productDisplayId,
+                  sourceQuantityRequired: line.quantityRequired,
+                  quantityRequired: line.quantityRequired,
+                  lineSnapshot: line.lineSnapshot,
+                  status: WmsFulfillmentLineStatus.RESTOCKING,
+                })),
+              },
+            },
+          });
+          createdFulfillmentCount += 1;
+          continue;
+        }
+
+        if (
+          existing.basketId
+          || (
+            existing.status !== WmsFulfillmentOrderStatus.ISSUE
+            && existing.status !== WmsFulfillmentOrderStatus.RESTOCKING
+            && existing.status !== WmsFulfillmentOrderStatus.PARTIAL
+            && existing.status !== WmsFulfillmentOrderStatus.READY
+          )
+        ) {
+          continue;
+        }
+
+        if (lines.length > 0 && (existing.status === WmsFulfillmentOrderStatus.ISSUE || existing.sourceItemsHash !== sourceItemsHash)) {
+          for (const line of lines) {
+            await prisma.wmsFulfillmentLine.upsert({
+              where: {
+                fulfillmentOrderId_variationId: {
+                  fulfillmentOrderId: existing.id,
+                  variationId: line.variationId,
+                },
+              },
+              create: {
+                fulfillmentOrderId: existing.id,
+                tenantId: posOrder.tenantId,
+                productId: line.productId,
+                variationId: line.variationId,
+                productName: line.productName,
+                productDisplayId: line.productDisplayId,
+                sourceQuantityRequired: line.quantityRequired,
+                quantityRequired: line.quantityRequired,
+                lineSnapshot: line.lineSnapshot,
+                status: WmsFulfillmentLineStatus.RESTOCKING,
+              },
+              update: {
+                productId: line.productId,
+                productName: line.productName,
+                productDisplayId: line.productDisplayId,
+                sourceQuantityRequired: line.quantityRequired,
+                quantityRequired: line.quantityRequired,
+                lineSnapshot: line.lineSnapshot,
+                status: WmsFulfillmentLineStatus.RESTOCKING,
+                issueReason: null,
+              },
+            });
+          }
+
+          await prisma.wmsFulfillmentLine.updateMany({
+            where: {
+              fulfillmentOrderId: existing.id,
+              variationId: { notIn: lines.map((l) => l.variationId) },
+            },
+            data: {
+              status: WmsFulfillmentLineStatus.CANCELED,
+              sourceQuantityRequired: 0,
+              quantityRequired: 0,
+              quantityAllocated: 0,
+              issueReason: null,
+            },
+          });
+
+          await prisma.wmsFulfillmentOrder.update({
+            where: { id: existing.id },
+            data: {
+              posWarehouseRef,
+              status: WmsFulfillmentOrderStatus.RESTOCKING,
+              issueReason: null,
+              sourceTotalQuantity: totalQuantity,
+              totalQuantity,
+              sourceItemsHash,
+              lastSyncedAt: now,
+            },
+          });
+
+          if (existing.status === WmsFulfillmentOrderStatus.ISSUE) {
+            recoveredIssueCount += 1;
+          }
+        }
+      }
+
+      // 3. Recompute BASKET_DEMAND readiness against eligible PUTAWAY BIN inventory units
+      const putawayBinUnits = await prisma.wmsInventoryUnit.findMany({
+        where: {
+          tenantId: store.tenantId,
+          storeId: store.id,
+          status: WmsInventoryUnitStatus.PUTAWAY,
+          currentLocationId: { not: null },
+          currentLocation: { is: { kind: WmsLocationKind.BIN, isActive: true } },
+          OR: [{ expirationDate: null }, { expirationDate: { gt: now } }],
+          pickReservations: { none: { status: { in: ['RESERVED', 'PICKED'] } } },
+          basketUnits: { none: { status: { in: ['PICKED', 'PACKED'] } } },
+        },
+        select: {
+          warehouseId: true,
+          variationId: true,
+          posWarehouseRef: true,
+        },
+      });
+
+      const activeHolds = await prisma.wmsBasketPickDemandBin.groupBy({
+        by: ['warehouseId', 'variationId'],
+        where: {
+          tenantId: store.tenantId,
+          basket: {
+            status: { in: ['ASSIGNED', 'IN_PICKING', 'FULL_HELD'] },
+          },
+        },
+        _sum: { quantityTarget: true, quantityPicked: true },
+      });
+      const heldByWhVar = new Map<string, number>();
+      for (const hold of activeHolds) {
+        const held = Math.max((hold._sum.quantityTarget ?? 0) - (hold._sum.quantityPicked ?? 0), 0);
+        if (held > 0) {
+          heldByWhVar.set(`${hold.warehouseId}::${hold.variationId}`, held);
+        }
+      }
+
+      const candidateQueueOrders = await prisma.wmsFulfillmentOrder.findMany({
+        where: {
+          tenantId: store.tenantId,
+          storeId: store.id,
+          assignmentMode: WmsFulfillmentAssignmentMode.BASKET_DEMAND,
+          basketId: null,
+          status: {
+            in: [
+              WmsFulfillmentOrderStatus.READY,
+              WmsFulfillmentOrderStatus.RESTOCKING,
+              WmsFulfillmentOrderStatus.PARTIAL,
+            ],
+          },
+          posOrder: {
+            is: { status: 1, isVoid: false },
+          },
+        },
+        include: {
+          posOrder: { select: { dateLocal: true } },
+          lines: true,
+        },
+        orderBy: [{ posOrder: { dateLocal: 'asc' } }, { id: 'asc' }],
+      });
+
+      const virtualUsedByWhVar = new Map<string, number>();
+      const availableFor = (warehouseId: string, variationId: string, orderPosWhRef: string | null) => {
+        const rawCount = putawayBinUnits.filter((u) => (
+          u.warehouseId === warehouseId
+          && u.variationId === variationId
+          && (!orderPosWhRef || !u.posWarehouseRef || u.posWarehouseRef === orderPosWhRef)
+        )).length;
+        const held = heldByWhVar.get(`${warehouseId}::${variationId}`) ?? 0;
+        const used = virtualUsedByWhVar.get(`${warehouseId}::${variationId}`) ?? 0;
+        return Math.max(rawCount - held - used, 0);
+      };
+
+      const warehouseIds = Array.from(new Set(putawayBinUnits.map((u) => u.warehouseId)));
+      const incompleteOrders: typeof candidateQueueOrders = [];
+
+      // Pass 1: Complete orders first
+      for (const order of candidateQueueOrders) {
+        const activeLines = order.lines.filter((l) => l.status !== WmsFulfillmentLineStatus.CANCELED && l.quantityRequired > 0);
+        if (activeLines.length === 0) continue;
+
+        let fullWarehouseId: string | null = null;
+        for (const whId of warehouseIds) {
+          const canFulfillAll = activeLines.every(
+            (l) => availableFor(whId, l.variationId, order.posWarehouseRef) >= l.quantityRequired,
+          );
+          if (canFulfillAll) {
+            fullWarehouseId = whId;
+            break;
+          }
+        }
+
+        if (!fullWarehouseId) {
+          incompleteOrders.push(order);
+          continue;
+        }
+
+        let orderTotal = 0;
+        for (const line of activeLines) {
+          const key = `${fullWarehouseId}::${line.variationId}`;
+          virtualUsedByWhVar.set(key, (virtualUsedByWhVar.get(key) ?? 0) + line.quantityRequired);
+          orderTotal += line.quantityRequired;
+          await prisma.wmsFulfillmentLine.update({
+            where: { id: line.id },
+            data: {
+              quantityAllocated: line.quantityRequired,
+              quantityPicked: 0,
+              status: WmsFulfillmentLineStatus.READY,
+              issueReason: null,
+            },
+          });
+        }
+
+        await prisma.wmsFulfillmentOrder.update({
+          where: { id: order.id },
+          data: {
+            warehouseId: null,
+            totalQuantity: orderTotal,
+            allocatedQuantity: orderTotal,
+            pickedQuantity: 0,
+            status: WmsFulfillmentOrderStatus.READY,
+            issueReason: null,
+            lastSyncedAt: now,
+          },
+        });
+      }
+
+      // Pass 2: Partial / Restocking orders
+      for (const order of incompleteOrders) {
+        const activeLines = order.lines.filter((l) => l.status !== WmsFulfillmentLineStatus.CANCELED && l.quantityRequired > 0);
+        if (activeLines.length === 0) continue;
+
+        let bestWarehouseId: string | null = warehouseIds[0] ?? null;
+        let bestAllocTotal = -1;
+        for (const whId of warehouseIds) {
+          const allocSum = activeLines.reduce(
+            (sum, l) => sum + Math.min(availableFor(whId, l.variationId, order.posWarehouseRef), l.quantityRequired),
+            0,
+          );
+          if (allocSum > bestAllocTotal) {
+            bestAllocTotal = allocSum;
+            bestWarehouseId = whId;
+          }
+        }
+
+        let orderTotal = 0;
+        let orderAlloc = 0;
+        for (const line of activeLines) {
+          const avail = bestWarehouseId ? availableFor(bestWarehouseId, line.variationId, order.posWarehouseRef) : 0;
+          const alloc = Math.min(avail, line.quantityRequired);
+          if (bestWarehouseId && alloc > 0) {
+            const key = `${bestWarehouseId}::${line.variationId}`;
+            virtualUsedByWhVar.set(key, (virtualUsedByWhVar.get(key) ?? 0) + alloc);
+          }
+          orderTotal += line.quantityRequired;
+          orderAlloc += alloc;
+          const missing = Math.max(line.quantityRequired - avail, 0);
+          const lineStatus = alloc >= line.quantityRequired
+            ? WmsFulfillmentLineStatus.READY
+            : alloc > 0
+              ? WmsFulfillmentLineStatus.PARTIAL
+              : WmsFulfillmentLineStatus.RESTOCKING;
+          await prisma.wmsFulfillmentLine.update({
+            where: { id: line.id },
+            data: {
+              quantityAllocated: alloc,
+              quantityPicked: 0,
+              status: lineStatus,
+              issueReason: lineStatus === WmsFulfillmentLineStatus.READY
+                ? 'Stock is available for this item, but the complete order cannot be fulfilled yet.'
+                : avail <= 0
+                  ? `Needs ${line.quantityRequired} unit${line.quantityRequired === 1 ? '' : 's'} in putaway bin inventory.`
+                  : `${avail} of ${line.quantityRequired} required unit${line.quantityRequired === 1 ? '' : 's'} available in the selected warehouse; needs ${missing} more.`,
+            },
+          });
+        }
+
+        await prisma.wmsFulfillmentOrder.update({
+          where: { id: order.id },
+          data: {
+            warehouseId: null,
+            totalQuantity: orderTotal,
+            allocatedQuantity: orderAlloc,
+            pickedQuantity: 0,
+            status: orderAlloc > 0 ? WmsFulfillmentOrderStatus.PARTIAL : WmsFulfillmentOrderStatus.RESTOCKING,
+            issueReason: null,
+            lastSyncedAt: now,
+          },
+        });
+      }
+
+      const fulfillmentStatsAfter = await prisma.wmsFulfillmentOrder.groupBy({
+        by: ['status', 'issueReason'],
+        where: {
+          tenantId: store.tenantId,
+          storeId: store.id,
+          posOrder: { is: { status: 1, isVoid: false } },
+        },
+        _count: { _all: true },
+      });
+      const sampleQueueAfter = await prisma.wmsFulfillmentOrder.findMany({
+        where: {
+          tenantId: store.tenantId,
+          storeId: store.id,
+          posOrder: { is: { status: 1, isVoid: false } },
+        },
+        select: {
+          posOrderId: true,
+          status: true,
+          issueReason: true,
+          totalQuantity: true,
+          allocatedQuantity: true,
+          pickedQuantity: true,
+          posWarehouseRef: true,
+          posOrder: { select: { dateLocal: true } },
+          lines: {
+            where: { status: { not: WmsFulfillmentLineStatus.CANCELED } },
+            select: {
+              variationId: true,
+              quantityRequired: true,
+              quantityAllocated: true,
+              status: true,
+              issueReason: true,
+            },
+          },
+        },
+        orderBy: [{ status: 'asc' }, { posOrder: { dateLocal: 'asc' } }, { id: 'asc' }],
+        take: 15,
+      });
+
+      console.log('[TONIOS_DIAG_AFTER]', JSON.stringify({
+        storeId: store.id,
+        shopId: store.shopId,
+        canceledStaleFulfillmentCount: unpickedCanceledOrders.length,
+        createdFulfillmentCount,
+        recoveredIssueCount,
+        putawayBinUnitCount: putawayBinUnits.length,
+        fulfillmentStatsAfter,
+        sampleQueueAfter,
+      }));
+    }
+  } catch (err: any) {
+    console.error('Warning during Tonios WMS fulfillment queue reconciliation:', err?.message || err);
+  }
+}
+
 async function main() {
   console.log('Starting database seed...');
   await ensureSuperAdmin();
@@ -4222,8 +5587,10 @@ async function main() {
   await seedPermissions();
   await seedRoles();
   await ensureDefaultTeamsAndBackfill();
+  await syncToniosPosConnectionAndOrders();
   await backfillAdSpendStoreAndTeamAttribution();
   await backfill2026OrderCogsAndReports();
+  await reconcileToniosWmsFulfillmentQueue();
   await diagnoseErpFreshness();
   console.log('Seed completed successfully!');
 }
