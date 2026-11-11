@@ -30,6 +30,7 @@ jobs:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
           PROD_ENV_FILE: ${{ secrets.PROD_ENV_FILE }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           DEPLOY_SHA: ${{ github.sha }}
         run: |
           set -e
@@ -70,7 +71,12 @@ jobs:
           REMOTE
 
           # Write env file from secret
-          echo "$PROD_ENV_FILE" | ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$SSH_USER@$SSH_HOST" "cat > /opt/erp/.env.prod"
+          {
+            printf '%s\n' "$PROD_ENV_FILE"
+            if [ -n "${RESEND_API_KEY:-}" ]; then
+              printf 'RESEND_API_KEY=%s\n' "$RESEND_API_KEY"
+            fi
+          } | ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$SSH_USER@$SSH_HOST" "cat > /opt/erp/.env.prod"
 
           # Copy env to api directory
           ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=20 "$SSH_USER@$SSH_HOST" "cp /opt/erp/.env.prod /opt/erp/apps/api/.env.prod"

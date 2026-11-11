@@ -105,6 +105,8 @@ services:
       SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD}
       SEED_ADMIN_FIRST_NAME: ${SEED_ADMIN_FIRST_NAME}
       SEED_ADMIN_LAST_NAME: ${SEED_ADMIN_LAST_NAME}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      DAILY_REPORT_EMAIL_FROM: ${DAILY_REPORT_EMAIL_FROM:-WeTrade WMS <wms-inventory-update@wetrade.com.ph>}
     ports:
       - "3001:3001"
     volumes:
