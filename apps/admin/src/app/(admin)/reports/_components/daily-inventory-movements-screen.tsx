@@ -664,16 +664,67 @@ export function DailyInventoryMovementsScreen() {
                 {isSendingEmail ? 'Sending…' : 'Email Client Now'}
               </button>
 
-              {previewHtml ? (
-                <button
-                  type="button"
-                  onClick={() => setPreviewHtml(previewHtml)}
-                  className="btn btn-md btn-secondary btn-icon"
-                >
-                  <Eye className="h-4 w-4" />
-                  Preview
-                </button>
-              ) : null}
+              <button
+                type="button"
+                disabled={!data || !selectedEmailTenantId}
+                onClick={() => {
+                  if (!data) return;
+                  const clientName =
+                    partners.find((p) => p.id === selectedEmailTenantId)?.name || 'Client';
+                  const dateLabel =
+                    startDate === endDate ? startDate : `${startDate} to ${endDate}`;
+                  const clientRows = data.rows.filter(
+                    (r) => !selectedEmailTenantId || r.tenantId === selectedEmailTenantId,
+                  );
+                  const movedRows = clientRows.filter(
+                    (r) => r.totalInQty > 0 || r.totalOutQty > 0,
+                  );
+                  const displayRows = (movedRows.length > 0 ? movedRows : clientRows).slice(0, 30);
+                  const rowHtml = displayRows
+                    .map(
+                      (row) => `
+                        <tr>
+                          <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:13px;color:#0f172a;font-weight:600;">
+                            ${row.variantName}
+                            <div style="font-size:11px;color:#64748b;font-weight:400;">${row.storeName} • ${row.variantCode || row.variationId || '—'}</div>
+                          </td>
+                          <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:13px;text-align:right;color:#059669;font-weight:600;">+${row.totalInQty.toLocaleString()}</td>
+                          <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:13px;text-align:right;color:#e11d48;font-weight:600;">-${row.totalOutQty.toLocaleString()}</td>
+                          <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:13px;text-align:right;color:#334155;font-weight:600;">${row.netChangeQty >= 0 ? `+${row.netChangeQty.toLocaleString()}` : row.netChangeQty.toLocaleString()}</td>
+                          <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:13px;text-align:right;color:#0f172a;font-weight:700;">${row.onHandQty.toLocaleString()} <span style="font-size:11px;color:#64748b;font-weight:400;">(Bin: ${row.inBinQty.toLocaleString()})</span></td>
+                        </tr>`,
+                    )
+                    .join('');
+                  setPreviewHtml({
+                    subject: `[Daily Inventory Ins & Outs] ${clientName} — ${dateLabel}`,
+                    html: `<div style="max-width:720px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+                      <div style="padding:20px 24px;background:#17324b;color:#ffffff;">
+                        <div style="font-size:11px;letter-spacing:0.16em;text-transform:uppercase;color:#93c5fd;font-weight:600;">Daily Automated Inventory Report</div>
+                        <h2 style="margin:6px 0 4px;font-size:20px;font-weight:700;">${clientName} — Inventory Ins &amp; Outs</h2>
+                        <div style="font-size:12px;color:#cbd5e1;">Report Date: ${dateLabel} (Asia/Manila) • Scheduled Daily at ${sendTimeManila} PH</div>
+                      </div>
+                      <div style="padding:20px 24px;">
+                        <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">
+                          <thead>
+                            <tr style="background:#f1f5f9;">
+                              <th style="padding:10px 12px;text-align:left;font-size:11px;text-transform:uppercase;color:#475569;">Product / Store</th>
+                              <th style="padding:10px 12px;text-align:right;font-size:11px;text-transform:uppercase;color:#475569;">In (+)</th>
+                              <th style="padding:10px 12px;text-align:right;font-size:11px;text-transform:uppercase;color:#475569;">Out (-)</th>
+                              <th style="padding:10px 12px;text-align:right;font-size:11px;text-transform:uppercase;color:#475569;">Net</th>
+                              <th style="padding:10px 12px;text-align:right;font-size:11px;text-transform:uppercase;color:#475569;">On-Hand</th>
+                            </tr>
+                          </thead>
+                          <tbody>${rowHtml || '<tr><td colspan="5" style="padding:20px;text-align:center;color:#64748b;">No products found for this client.</td></tr>'}</tbody>
+                        </table>
+                      </div>
+                    </div>`,
+                  });
+                }}
+                className="btn btn-md btn-secondary btn-icon"
+              >
+                <Eye className="h-4 w-4" />
+                Preview Email
+              </button>
             </div>
           </div>
         </div>

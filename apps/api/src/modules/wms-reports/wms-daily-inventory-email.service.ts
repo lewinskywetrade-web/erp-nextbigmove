@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { TenantStatus } from '@prisma/client';
 import * as dayjs from 'dayjs';
@@ -38,7 +38,7 @@ type DeliveryOutcome = {
 };
 
 @Injectable()
-export class WmsDailyInventoryEmailService {
+export class WmsDailyInventoryEmailService implements OnModuleInit {
   private readonly logger = new Logger(WmsDailyInventoryEmailService.name);
   private isCronRunning = false;
 
@@ -47,8 +47,15 @@ export class WmsDailyInventoryEmailService {
     private readonly wmsReportsService: WmsReportsService,
   ) {}
 
-  @Cron('5 * * * *')
-  async runHourlyDailyReportScheduleCheck() {
+  onModuleInit() {
+    if (process.env.NODE_ENV === 'test') {
+      return;
+    }
+    void this.processScheduledDailyEmails();
+  }
+
+  @Cron('*/5 * * * *')
+  async runEveryFiveMinutesDailyReportCheck() {
     await this.processScheduledDailyEmails();
   }
 
