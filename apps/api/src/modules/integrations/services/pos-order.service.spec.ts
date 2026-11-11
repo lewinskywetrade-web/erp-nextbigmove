@@ -803,4 +803,38 @@ describe('POS source freshness and recovery', () => {
     jest.spyOn(service as any, 'syncUndeliverableAttempts').mockRejectedValueOnce(error);
     await expect(service.upsertPosOrdersWithOutcomes('tenant-1', 'store-1', [{ ...rawOrder, items, updated_at: newer }], null, { requireProjectionSuccess: true })).rejects.toBe(error);
   });
+
+  it('hydrates an incomplete empty-items row under allowIncompleteOrderHydration while preserving watermark and respecting tombstones', async () => {
+    const emptySaved = {
+      ...saved(newer),
+      status: 1,
+      orderSnapshot: { _pancakeUpdatedAt: newer, items: [] },
+      totalQuantity: 0,
+    };
+    const { service, prisma, fulfillment, readSourceLedger } = createUpsertHarness(emptySaved);
+    const hydrated = await service.upsertPosOrdersWithOutcomes(
+      'tenant-1',
+      'store-1',
+      [{ ...rawOrder, status: 1, items, updated_at: older }],
+      null,
+      { allowIncompleteOrderHydration: true },
+    );
+    expect(hydrated.upserted).toBe(1);
+    expect(prisma.posOrder.upsert).toHaveBeenCalledTimes(1);
+    expect(fulfillment.syncConfirmedPickingOrders).toHaveBeenCalledTimes(1);
+    expect(readSourceLedger().sourceVersion).toBe('2026-10-22T06:57:03.850999000Z');
+
+    // Deleted tombstones must still never be resurrected even with allowIncompleteOrderHydration
+    const tombstoned = createUpsertHarness(emptySaved);
+    tombstoned.setSourceLedger({ sourceVersion: newer, deleted: true });
+    const blocked = await tombstoned.service.upsertPosOrdersWithOutcomes(
+      'tenant-1',
+      'store-1',
+      [{ ...rawOrder, status: 1, items, updated_at: newer }],
+      null,
+      { allowIncompleteOrderHydration: true },
+    );
+    expect(blocked.upserted).toBe(0);
+    expect(blocked.outcomes[0]).toMatchObject({ upsertStatus: 'SKIPPED', reason: 'SOURCE_DELETED' });
+  });
 });

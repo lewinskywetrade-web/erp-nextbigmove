@@ -428,6 +428,9 @@ export class WmsFulfillmentSyncService {
         store.id,
         posOrder.itemData,
       );
+      const emptyOrderIssueReason = lines.length === 0
+        ? this.resolveEmptyFulfillmentIssueReason(posOrder.orderSnapshot, posOrder.itemData)
+        : null;
       const sourceItemsHash = buildFulfillmentDemandHash(lines);
       const posWarehouseRef = this.extractPosWarehouseRef(posOrder.orderSnapshot);
       const assignmentMode = this.resolveNewFulfillmentAssignmentMode();
@@ -493,7 +496,7 @@ export class WmsFulfillmentSyncService {
                 ? WmsFulfillmentOrderStatus.ISSUE
                 : WmsFulfillmentOrderStatus.RESTOCKING,
               assignmentMode,
-              issueReason: lines.length === 0 ? 'Order has no pickable variation items' : null,
+              issueReason: emptyOrderIssueReason,
               sourceTotalQuantity: totalQuantity,
               totalQuantity,
               sourceItemsHash,
@@ -596,7 +599,11 @@ export class WmsFulfillmentSyncService {
                     basketId: null,
                     completedAt: null,
                   }
-                : {}),
+                : existing.status === WmsFulfillmentOrderStatus.ISSUE
+                  && lines.length === 0
+                  && emptyOrderIssueReason
+                  ? { issueReason: emptyOrderIssueReason }
+                  : {}),
               lastSyncedAt: new Date(),
             },
           });
@@ -634,7 +641,7 @@ export class WmsFulfillmentSyncService {
             changeState: amendment.changeState,
             changeDetectedAt: new Date(),
             changeSummary: amendment.summary as Prisma.InputJsonValue,
-            issueReason: lines.length === 0 ? 'Order has no pickable variation items' : null,
+            issueReason: emptyOrderIssueReason,
             ...(shouldRecoverTransientCancellation
               ? {
                   status: WmsFulfillmentOrderStatus.RESTOCKING,
@@ -4571,7 +4578,46 @@ export class WmsFulfillmentSyncService {
     return WmsFulfillmentOrderStatus.RESTOCKING;
   }
 
-  private async extractFulfillmentLinesFromOrderSnapshot(
+  public resolveEmptyFulfillmentIssueReason(
+    orderSnapshot: Prisma.JsonValue | null,
+    fallbackItemData?: Prisma.JsonValue | null,
+  ): string {
+    const snapshot = this.asJsonRecord(orderSnapshot);
+    const hasSnapshotItemsArray = Array.isArray(snapshot?.items);
+    const snapshotItems = hasSnapshotItemsArray ? (snapshot!.items as unknown[]) : [];
+    const fallbackItems = Array.isArray(fallbackItemData) ? fallbackItemData : [];
+
+    if (!hasSnapshotItemsArray && fallbackItems.length === 0) {
+      return 'Order line items have not arrived from Pancake POS yet — syncing from POS';
+    }
+
+    if (snapshotItems.length === 0 && fallbackItems.length === 0) {
+      return 'Order has no line items in Pancake POS — add a product variation in POS to pick';
+    }
+
+    const effectiveItems = snapshotItems.length > 0 ? snapshotItems : fallbackItems;
+    const objectItems = effectiveItems
+      .map((raw) => this.asJsonRecord(raw))
+      .filter((item): item is Record<string, unknown> => Boolean(item));
+
+    if (
+      objectItems.length > 0
+      && objectItems.every((item) => {
+        const qty = this.readPositiveInt(item.quantity);
+        const returned =
+          this.readPositiveInt(item.returned_count)
+          + this.readPositiveInt(item.return_quantity)
+          + this.readPositiveInt(item.returning_quantity);
+        return qty > 0 && returned >= qty;
+      })
+    ) {
+      return 'All order line items are marked returned in Pancake POS';
+    }
+
+    return 'Order item in Pancake POS is not linked to a catalog variation — link a product variation in POS to pick';
+  }
+
+  public async extractFulfillmentLinesFromOrderSnapshot(
     orderSnapshot: Prisma.JsonValue | null,
     storeId: string,
     fallbackItemData?: Prisma.JsonValue | null,
@@ -4594,6 +4640,7 @@ export class WmsFulfillmentSyncService {
   private async extractFulfillmentLinesFromItems(
     items: unknown[],
     storeId: string,
+    depth = 0,
   ): Promise<FulfillmentLineDraft[]> {
     if (items.length === 0) {
       return [];
@@ -4601,12 +4648,19 @@ export class WmsFulfillmentSyncService {
 
     const groupedLines = new Map<string, FulfillmentLineDraft>();
     const identifiers = new Set<string>();
+    const exactNames = new Set<string>();
 
     const normalizeSkuCandidate = (value: unknown): string | null => {
       const raw = this.readIdentifier(value);
       if (!raw) return null;
       const cleaned = raw.replace(/`+$/g, '').trim();
       return cleaned.length > 0 ? cleaned : null;
+    };
+
+    const normalizeNameCandidate = (value: unknown): string | null => {
+      if (typeof value !== 'string') return null;
+      const trimmed = value.trim();
+      return trimmed.length >= 2 ? trimmed : null;
     };
 
     for (const rawItem of items) {
@@ -4641,19 +4695,39 @@ export class WmsFulfillmentSyncService {
           identifiers.add(value);
         }
       });
+
+      [
+        normalizeNameCandidate(variationInfo?.name),
+        normalizeNameCandidate(item.variationName),
+        normalizeNameCandidate(item.product_name),
+        normalizeNameCandidate(item.name),
+      ].forEach((nameValue) => {
+        if (nameValue && exactNames.size < 20) {
+          exactNames.add(nameValue);
+        }
+      });
     }
 
     const candidateIds = Array.from(identifiers);
-    const catalogProducts = candidateIds.length > 0
+    const candidateNames = Array.from(exactNames);
+    const catalogOrClauses: Prisma.PosProductWhereInput[] = [
+      ...(candidateIds.length > 0
+        ? [
+            { variationId: { in: candidateIds } },
+            { productId: { in: candidateIds } },
+            { customId: { in: candidateIds } },
+          ]
+        : []),
+      ...candidateNames.map((name) => ({
+        name: { equals: name, mode: 'insensitive' as const },
+      })),
+    ];
+    const catalogProducts = catalogOrClauses.length > 0
       && typeof (this.prisma as any).posProduct?.findMany === 'function'
       ? await this.prisma.posProduct.findMany({
           where: {
             storeId,
-            OR: [
-              { variationId: { in: candidateIds } },
-              { productId: { in: candidateIds } },
-              { customId: { in: candidateIds } },
-            ],
+            OR: catalogOrClauses,
           },
           select: {
             productId: true,
@@ -4671,6 +4745,7 @@ export class WmsFulfillmentSyncService {
     const productByVariationId = new Map<string, CatalogProductRow>();
     const productsByProductId = new Map<string, CatalogProductRow[]>();
     const productsByCustomKey = new Map<string, CatalogProductRow[]>();
+    const productsByNameKey = new Map<string, CatalogProductRow[]>();
 
     for (const product of catalogProducts) {
       if (product.variationId) {
@@ -4692,6 +4767,13 @@ export class WmsFulfillmentSyncService {
         list.push(product);
         productsByCustomKey.set(normCustom, list);
       }
+
+      const normName = normalizeNameCandidate(product.name)?.toLowerCase();
+      if (normName) {
+        const list = productsByNameKey.get(normName) ?? [];
+        list.push(product);
+        productsByNameKey.set(normName, list);
+      }
     }
 
     const pickUnambiguousCatalogProduct = (rows: CatalogProductRow[] | undefined): CatalogProductRow | null => {
@@ -4708,6 +4790,16 @@ export class WmsFulfillmentSyncService {
     for (const rawItem of items) {
       const item = this.asJsonRecord(rawItem);
       if (!item) {
+        continue;
+      }
+
+      const quantity = this.readPositiveInt(item.quantity);
+      const returnedQuantity =
+        this.readPositiveInt(item.returned_count)
+        + this.readPositiveInt(item.return_quantity)
+        + this.readPositiveInt(item.returning_quantity);
+      const requiredQuantity = Math.max(quantity - returnedQuantity, 0);
+      if (requiredQuantity <= 0) {
         continue;
       }
 
@@ -4740,6 +4832,12 @@ export class WmsFulfillmentSyncService {
         normalizeSkuCandidate(variationInfo?.custom_id),
         normalizeSkuCandidate(variationInfo?.barcode),
       ].filter((value): value is string => Boolean(value));
+      const sourceNames = [
+        normalizeNameCandidate(variationInfo?.name),
+        normalizeNameCandidate(item.variationName),
+        normalizeNameCandidate(item.product_name),
+        normalizeNameCandidate(item.name),
+      ].filter((value): value is string => Boolean(value));
 
       const hasDistinctSourceVariation = Boolean(
         sourceVariationId && (!sourceProductId || sourceVariationId !== sourceProductId),
@@ -4756,6 +4854,9 @@ export class WmsFulfillmentSyncService {
             .map((sku) => pickUnambiguousCatalogProduct(productsByCustomKey.get(sku.toLowerCase())))
             .find((row): row is CatalogProductRow => Boolean(row))
           ?? (sourceProductId ? pickUnambiguousCatalogProduct(productsByProductId.get(sourceProductId)) : null)
+          ?? sourceNames
+            .map((name) => pickUnambiguousCatalogProduct(productsByNameKey.get(name.toLowerCase())))
+            .find((row): row is CatalogProductRow => Boolean(row))
           ?? directVariationMatch
           ?? null;
       }
@@ -4763,17 +4864,30 @@ export class WmsFulfillmentSyncService {
       const variationId = hasDistinctSourceVariation
         ? (resolvedProduct?.variationId ?? sourceVariationId)
         : (resolvedProduct?.variationId ?? sourceVariationId ?? null);
-      if (!variationId) {
-        continue;
-      }
 
-      const quantity = this.readPositiveInt(item.quantity);
-      const returnedQuantity =
-        this.readPositiveInt(item.returned_count)
-        + this.readPositiveInt(item.return_quantity)
-        + this.readPositiveInt(item.returning_quantity);
-      const requiredQuantity = Math.max(quantity - returnedQuantity, 0);
-      if (requiredQuantity <= 0) {
+      if (!variationId) {
+        if (depth === 0) {
+          const childItems = Array.isArray(item.components)
+            ? item.components
+            : Array.isArray(item.combo_items)
+              ? item.combo_items
+              : null;
+          if (childItems && childItems.length > 0) {
+            const childLines = await this.extractFulfillmentLinesFromItems(childItems, storeId, depth + 1);
+            for (const childLine of childLines) {
+              const scaledRequired = childLine.quantityRequired * requiredQuantity;
+              const existingChild = groupedLines.get(childLine.variationId);
+              if (existingChild) {
+                existingChild.quantityRequired += scaledRequired;
+              } else {
+                groupedLines.set(childLine.variationId, {
+                  ...childLine,
+                  quantityRequired: scaledRequired,
+                });
+              }
+            }
+          }
+        }
         continue;
       }
 

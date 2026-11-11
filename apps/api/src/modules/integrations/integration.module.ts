@@ -27,6 +27,7 @@ import { shouldRunPancakeWorkers } from '../../common/runtime/process-role';
 import { CreativeAgentModule } from '../creative-agent/creative-agent.module';
 import { PosOrderSyncRecoveryService } from './services/pos-order-sync-recovery.service';
 import { PosOrderSyncRecoveryProcessor } from './processors/pos-order-sync-recovery.processor';
+import { WmsIssueOrderReconcilerService } from './services/wms-issue-order-reconciler.service';
 
 @Module({
   imports: [
@@ -52,6 +53,7 @@ import { PosOrderSyncRecoveryProcessor } from './processors/pos-order-sync-recov
     ProductCogsRecalculationService,
     PosShopOwnershipService,
     PosOrderSyncRecoveryService,
+    WmsIssueOrderReconcilerService,
     ...(shouldRunPancakeWorkers() ? [PancakeWebhookQueueProcessor, PosOrderSyncRecoveryProcessor] : []),
     ProviderRegistry,
     ProviderFactory,

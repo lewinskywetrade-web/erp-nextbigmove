@@ -4793,13 +4793,19 @@ async function syncToniosPosConnectionAndOrders() {
               httpStatus: singleResp.status,
               apiSuccess: Boolean(singleBody?.success),
               liveStatus: liveData?.status ?? null,
+              liveUpdatedAt: liveData?.updated_at ?? null,
+              liveTotalQuantity: liveData?.total_quantity ?? null,
+              liveWarehouseId: readSeedIdentifier(liveData?.warehouse_id ?? liveData?.warehouseId),
               liveItemCount: liveItems.length,
               liveItemRefs: liveItems.slice(0, 5).map((it: any) => ({
                 qty: it?.quantity ?? null,
-                varIdType: typeof it?.variation_id,
-                hasVarId: Boolean(readSeedIdentifier(it?.variation_id ?? it?.variationId ?? it?.variation_info?.id)),
-                hasProdId: Boolean(readSeedIdentifier(it?.product_id ?? it?.productId)),
-                hasSku: Boolean(normalizeSeedSku(it?.product_display_id ?? it?.variation_info?.display_id ?? it?.variation_info?.barcode)),
+                returned: (it?.returned_count ?? 0) || (it?.return_quantity ?? 0) || (it?.returning_quantity ?? 0),
+                varId: readSeedIdentifier(it?.variation_id ?? it?.variationId ?? it?.variation_info?.id),
+                prodId: readSeedIdentifier(it?.product_id ?? it?.productId),
+                sku: normalizeSeedSku(it?.product_display_id ?? it?.variation_info?.display_id ?? it?.variation_info?.barcode),
+                hasVariationName: Boolean(typeof it?.variation_info?.name === 'string' && it.variation_info.name.trim()),
+                hasItemName: Boolean(typeof it?.name === 'string' && it.name.trim()),
+                hasComponents: Array.isArray(it?.components) || Array.isArray(it?.combo_items),
               })),
             });
           }
@@ -5023,6 +5029,7 @@ async function reconcileToniosWmsFulfillmentQueue() {
       const byVariationId = new Map<string, CatalogRow>();
       const byProductId = new Map<string, CatalogRow[]>();
       const byCustomKey = new Map<string, CatalogRow[]>();
+      const byNameKey = new Map<string, CatalogRow[]>();
 
       for (const row of catalogProducts) {
         if (row.variationId) {
@@ -5042,6 +5049,14 @@ async function reconcileToniosWmsFulfillmentQueue() {
           list.push(row);
           byCustomKey.set(normSku, list);
         }
+        const normName = typeof row.name === 'string' && row.name.trim().length >= 2
+          ? row.name.trim().toLowerCase()
+          : null;
+        if (normName) {
+          const list = byNameKey.get(normName) ?? [];
+          list.push(row);
+          byNameKey.set(normName, list);
+        }
       }
 
       const pickUnambiguous = (rows: CatalogRow[] | undefined): CatalogRow | null => {
@@ -5053,7 +5068,30 @@ async function reconcileToniosWmsFulfillmentQueue() {
         return vars.size === 1 ? pool[0] : null;
       };
 
-      const extractLinesFromItems = (items: unknown[]) => {
+      const resolveSeedEmptyIssueReason = (
+        snap: Record<string, any> | null,
+        fallbackItemData: Prisma.JsonValue | null,
+      ): string => {
+        const hasSnapItems = Array.isArray(snap?.items);
+        const snapItems = hasSnapItems ? (snap!.items as unknown[]) : [];
+        const fbItems = Array.isArray(fallbackItemData) ? fallbackItemData : [];
+        if (!hasSnapItems && fbItems.length === 0) {
+          return 'Order line items have not arrived from Pancake POS yet — syncing from POS';
+        }
+        if (snapItems.length === 0 && fbItems.length === 0) {
+          return 'Order has no line items in Pancake POS — add a product variation in POS to pick';
+        }
+        return 'Order item in Pancake POS is not linked to a catalog variation — link a product variation in POS to pick';
+      };
+
+      const extractLinesFromItems = (items: unknown[], depth = 0): Array<{
+        variationId: string;
+        productId: string | null;
+        productName: string;
+        productDisplayId: string | null;
+        quantityRequired: number;
+        lineSnapshot: Prisma.InputJsonValue;
+      }> => {
         const grouped = new Map<string, {
           variationId: string;
           productId: string | null;
@@ -5066,6 +5104,14 @@ async function reconcileToniosWmsFulfillmentQueue() {
         for (const raw of items) {
           if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
           const item = raw as Record<string, any>;
+          const qty = readSeedPositiveInt(item.quantity);
+          const returned =
+            readSeedPositiveInt(item.returned_count)
+            + readSeedPositiveInt(item.return_quantity)
+            + readSeedPositiveInt(item.returning_quantity);
+          const required = Math.max(qty - returned, 0);
+          if (required <= 0) continue;
+
           const variationInfo = item.variation_info && typeof item.variation_info === 'object' && !Array.isArray(item.variation_info)
             ? (item.variation_info as Record<string, any>)
             : null;
@@ -5095,6 +5141,12 @@ async function reconcileToniosWmsFulfillmentQueue() {
             normalizeSeedSku(variationInfo?.custom_id),
             normalizeSeedSku(variationInfo?.barcode),
           ].filter((v): v is string => Boolean(v));
+          const names = [
+            typeof variationInfo?.name === 'string' && variationInfo.name.trim().length >= 2 ? variationInfo.name.trim() : null,
+            typeof item.variationName === 'string' && item.variationName.trim().length >= 2 ? item.variationName.trim() : null,
+            typeof item.product_name === 'string' && item.product_name.trim().length >= 2 ? item.product_name.trim() : null,
+            typeof item.name === 'string' && item.name.trim().length >= 2 ? item.name.trim() : null,
+          ].filter((v): v is string => Boolean(v));
 
           const hasDistinctVar = Boolean(sourceVariationId && (!sourceProductId || sourceVariationId !== sourceProductId));
           let resolved: CatalogRow | null = null;
@@ -5106,20 +5158,33 @@ async function reconcileToniosWmsFulfillmentQueue() {
               (direct && isStockable(direct) ? direct : null)
               ?? skus.map((s) => pickUnambiguous(byCustomKey.get(s.toLowerCase()))).find((r): r is CatalogRow => Boolean(r))
               ?? (sourceProductId ? pickUnambiguous(byProductId.get(sourceProductId)) : null)
+              ?? names.map((n) => pickUnambiguous(byNameKey.get(n.toLowerCase()))).find((r): r is CatalogRow => Boolean(r))
               ?? direct
               ?? null;
           }
 
           const variationId = resolved?.variationId ?? sourceVariationId ?? null;
-          if (!variationId) continue;
-
-          const qty = readSeedPositiveInt(item.quantity);
-          const returned =
-            readSeedPositiveInt(item.returned_count)
-            + readSeedPositiveInt(item.return_quantity)
-            + readSeedPositiveInt(item.returning_quantity);
-          const required = Math.max(qty - returned, 0);
-          if (required <= 0) continue;
+          if (!variationId) {
+            if (depth === 0) {
+              const childItems = Array.isArray(item.components)
+                ? item.components
+                : Array.isArray(item.combo_items)
+                  ? item.combo_items
+                  : null;
+              if (childItems && childItems.length > 0) {
+                for (const childLine of extractLinesFromItems(childItems, depth + 1)) {
+                  const scaled = childLine.quantityRequired * required;
+                  const existingChild = grouped.get(childLine.variationId);
+                  if (existingChild) {
+                    existingChild.quantityRequired += scaled;
+                  } else {
+                    grouped.set(childLine.variationId, { ...childLine, quantityRequired: scaled });
+                  }
+                }
+              }
+            }
+            continue;
+          }
 
           const productId = resolved?.productId ?? sourceProductId;
           const productName =
@@ -5272,6 +5337,9 @@ async function reconcileToniosWmsFulfillmentQueue() {
         const lines = primaryLines.length > 0
           ? primaryLines
           : extractLinesFromItems(Array.isArray(posOrder.itemData) ? (posOrder.itemData as unknown[]) : []);
+        const emptyIssueReason = lines.length === 0
+          ? resolveSeedEmptyIssueReason(snap, posOrder.itemData)
+          : null;
         const totalQuantity = lines.reduce((sum, l) => sum + l.quantityRequired, 0);
         const sourceItemsHash = buildSeedFulfillmentDemandHash(lines);
         const posWarehouseRef = readSeedIdentifier(snap?.warehouse_id ?? snap?.warehouseId);
@@ -5294,7 +5362,7 @@ async function reconcileToniosWmsFulfillmentQueue() {
               customerPhone: posOrder.customerPhone,
               status: lines.length === 0 ? WmsFulfillmentOrderStatus.ISSUE : WmsFulfillmentOrderStatus.RESTOCKING,
               assignmentMode: WmsFulfillmentAssignmentMode.BASKET_DEMAND,
-              issueReason: lines.length === 0 ? 'Order has no pickable variation items' : null,
+              issueReason: emptyIssueReason,
               sourceTotalQuantity: totalQuantity,
               totalQuantity,
               sourceItemsHash,
@@ -5395,6 +5463,19 @@ async function reconcileToniosWmsFulfillmentQueue() {
           if (existing.status === WmsFulfillmentOrderStatus.ISSUE) {
             recoveredIssueCount += 1;
           }
+        } else if (
+          lines.length === 0
+          && existing.status === WmsFulfillmentOrderStatus.ISSUE
+          && emptyIssueReason
+          && existing.issueReason !== emptyIssueReason
+        ) {
+          await prisma.wmsFulfillmentOrder.update({
+            where: { id: existing.id },
+            data: {
+              issueReason: emptyIssueReason,
+              lastSyncedAt: now,
+            },
+          });
         }
       }
 
@@ -6328,6 +6409,7 @@ async function main() {
   await reconcileToniosWmsFulfillmentQueue();
   await backfillAdSpendStoreAndTeamAttribution();
   await backfill2026OrderCogsAndReports();
+  await syncToniosPosConnectionAndOrders();
   await reconcileToniosWmsFulfillmentQueue();
   await reconcileFamcoSharedStockPoolsAndQueue();
   await diagnoseErpFreshness();

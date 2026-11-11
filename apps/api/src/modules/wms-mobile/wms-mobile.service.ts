@@ -6,6 +6,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  Optional,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
@@ -44,6 +45,7 @@ import { EffectiveAccessService } from '../../common/services/effective-access.s
 import { MediaAssetsService, type UploadedImageFile } from '../../common/services/media-assets.service';
 import { WmsStaffActivityService } from '../../common/services/wms-staff-activity.service';
 import { OrdersService } from '../orders/orders.service';
+import { IntegrationService } from '../integrations/integration.service';
 import { WmsFulfillmentOpsService } from '../wms-fulfillment/wms-fulfillment-ops.service';
 import { WmsFulfillmentSyncService } from '../wms-fulfillment/wms-fulfillment-sync.service';
 import {
@@ -397,6 +399,8 @@ export class WmsMobileService {
     private readonly pickingHandoffQueue: Queue<WmsPickingHandoffWaitingForPrintingJobData>,
     @InjectQueue(WMS_PACKING_POST_COMPLETE_QUEUE)
     private readonly packingPostCompleteQueue: Queue<WmsPackingPostCompleteJobData>,
+    @Optional()
+    private readonly integrationService?: IntegrationService,
   ) {}
 
   private getPickingHandoffQueueJobOptions() {
@@ -3420,6 +3424,35 @@ export class WmsMobileService {
 
     if (body.storeId && !activeStore) {
       throw new ForbiddenException('Selected store is not available for WMS fulfillment resync');
+    }
+
+    if (this.integrationService) {
+      if (activeStore) {
+        try {
+          await this.integrationService.syncPancakeOrdersByStoreId(
+            activeStore.id,
+            activeStore.tenantId,
+            { days: 3, repairIssueOrders: true },
+          );
+        } catch (error: any) {
+          this.logger.warn(
+            `Live POS store sync skipped during picking queue resync for store=${activeStore.id}: ${error?.message || 'Unknown error'}`,
+          );
+        }
+      }
+
+      try {
+        await this.integrationService.reconcileOpenWmsIssueOrders({
+          tenantId,
+          storeId: activeStore?.id ?? null,
+          limit: 60,
+          forceCatalogSync: true,
+        });
+      } catch (error: any) {
+        this.logger.warn(
+          `Live ISSUE order reconciliation skipped during picking queue resync: ${error?.message || 'Unknown error'}`,
+        );
+      }
     }
 
     const result = await this.wmsFulfillmentSyncService.syncConfirmedPickingOrders({
@@ -9858,6 +9891,7 @@ export class WmsMobileService {
         customerName: true,
         customerPhone: true,
         orderSnapshot: true,
+        itemData: true,
       },
       orderBy: [{ insertedAt: 'asc' }],
       take: PICKING_SYNC_ORDER_LIMIT,
@@ -9869,7 +9903,11 @@ export class WmsMobileService {
         continue;
       }
 
-      const lines = await this.extractFulfillmentLinesFromOrderSnapshot(posOrder.orderSnapshot, store.id);
+      const lines = await this.extractFulfillmentLinesFromOrderSnapshot(
+        posOrder.orderSnapshot,
+        store.id,
+        posOrder.itemData,
+      );
       const posWarehouseRef = this.extractPosWarehouseRef(posOrder.orderSnapshot);
       const warehouseId = await this.resolveFulfillmentWarehouseId({
         tenantId: posOrder.tenantId,
@@ -10868,7 +10906,15 @@ export class WmsMobileService {
   private async extractFulfillmentLinesFromOrderSnapshot(
     orderSnapshot: Prisma.JsonValue | null,
     storeId: string,
+    fallbackItemData?: Prisma.JsonValue | null,
   ): Promise<FulfillmentLineDraft[]> {
+    if (typeof (this.wmsFulfillmentSyncService as any)?.extractFulfillmentLinesFromOrderSnapshot === 'function') {
+      return this.wmsFulfillmentSyncService.extractFulfillmentLinesFromOrderSnapshot(
+        orderSnapshot,
+        storeId,
+        fallbackItemData,
+      );
+    }
     const snapshot = this.asJsonRecord(orderSnapshot);
     const items = Array.isArray(snapshot?.items) ? snapshot.items : [];
     const groupedLines = new Map<string, FulfillmentLineDraft>();

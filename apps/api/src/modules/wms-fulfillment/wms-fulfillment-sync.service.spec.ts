@@ -675,4 +675,120 @@ describe('WmsFulfillmentSyncService line extraction & ISSUE recovery', () => {
       }),
     }));
   });
+
+  it('resolves unambiguous exact catalog variation name and nested combo components without guessing ambiguous names', async () => {
+    const prisma = {
+      posProduct: {
+        findMany: jest.fn<() => Promise<any[]>>().mockResolvedValue([
+          {
+            productId: 'prod-tonios',
+            variationId: 'var-tonios-only',
+            customId: 'TONIOS-01',
+            name: 'Tonios Classic Bottle',
+          },
+          {
+            productId: 'prod-multi',
+            variationId: 'var-multi-a',
+            customId: 'MULTI-A',
+            name: 'Ambiguous Tee',
+          },
+          {
+            productId: 'prod-multi',
+            variationId: 'var-multi-b',
+            customId: 'MULTI-B',
+            name: 'Ambiguous Tee',
+          },
+        ]),
+      },
+    };
+    const service = new WmsFulfillmentSyncService(prisma as any, {} as any, {} as any);
+
+    const matchedByName = await service.extractFulfillmentLinesFromOrderSnapshot(
+      {
+        items: [
+          {
+            variation_id: null,
+            product_id: null,
+            variation_info: { name: '  tonios classic bottle ' },
+            quantity: 2,
+          },
+        ],
+      },
+      'store-tonios',
+      null,
+    );
+    expect(matchedByName).toHaveLength(1);
+    expect(matchedByName[0]).toEqual(expect.objectContaining({
+      variationId: 'var-tonios-only',
+      productId: 'prod-tonios',
+      quantityRequired: 2,
+    }));
+
+    const ambiguousByName = await service.extractFulfillmentLinesFromOrderSnapshot(
+      {
+        items: [
+          {
+            variation_id: null,
+            product_id: null,
+            variation_info: { name: 'Ambiguous Tee' },
+            quantity: 1,
+          },
+        ],
+      },
+      'store-tonios',
+      null,
+    );
+    expect(ambiguousByName).toEqual([]);
+
+    const comboExpanded = await service.extractFulfillmentLinesFromOrderSnapshot(
+      {
+        items: [
+          {
+            variation_id: null,
+            product_id: null,
+            quantity: 2,
+            combo_items: [
+              {
+                variation_id: 'var-tonios-only',
+                product_id: 'prod-tonios',
+                quantity: 3,
+              },
+            ],
+          },
+        ],
+      },
+      'store-tonios',
+      null,
+    );
+    expect(comboExpanded).toHaveLength(1);
+    expect(comboExpanded[0]).toEqual(expect.objectContaining({
+      variationId: 'var-tonios-only',
+      quantityRequired: 6,
+    }));
+  });
+
+  it('produces actionable empty fulfillment issue reasons based on POS item payload state', () => {
+    const service = new WmsFulfillmentSyncService({} as any, {} as any, {} as any);
+
+    expect(service.resolveEmptyFulfillmentIssueReason({}, [])).toBe(
+      'Order line items have not arrived from Pancake POS yet — syncing from POS',
+    );
+    expect(service.resolveEmptyFulfillmentIssueReason({ items: [] }, [])).toBe(
+      'Order has no line items in Pancake POS — add a product variation in POS to pick',
+    );
+    expect(
+      service.resolveEmptyFulfillmentIssueReason(
+        { items: [{ quantity: 2, returned_count: 2 }] },
+        [],
+      ),
+    ).toBe('All order line items are marked returned in Pancake POS');
+    expect(
+      service.resolveEmptyFulfillmentIssueReason(
+        { items: [{ quantity: 1, variation_id: null, note_product: 'Custom freebie' }] },
+        [],
+      ),
+    ).toBe(
+      'Order item in Pancake POS is not linked to a catalog variation — link a product variation in POS to pick',
+    );
+  });
 });

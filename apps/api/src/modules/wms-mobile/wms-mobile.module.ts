@@ -1,5 +1,6 @@
 import { BullModule } from '@nestjs/bull';
 import { Module } from '@nestjs/common';
+import { IntegrationModule } from '../integrations/integration.module';
 import { OrdersModule } from '../orders/orders.module';
 import { WmsFulfillmentModule } from '../wms-fulfillment/wms-fulfillment.module';
 import { WmsInventoryModule } from '../wms-inventory/wms-inventory.module';
@@ -23,6 +24,7 @@ import {
     WmsFulfillmentModule,
     WmsSettingsModule,
     OrdersModule,
+    IntegrationModule,
     BullModule.registerQueue({
       name: WMS_PICKING_HANDOFF_QUEUE,
     }),

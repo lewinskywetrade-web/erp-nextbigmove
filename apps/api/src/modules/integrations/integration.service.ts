@@ -19,6 +19,7 @@ import {
   IntegrationStatus,
   PosProductCogs,
   Prisma,
+  WmsFulfillmentLineStatus,
   WmsFulfillmentOrderStatus,
   WmsProductProfileStatus,
 } from '@prisma/client';
@@ -30,6 +31,7 @@ import {
   PosOrderService,
   PosOrderUpsertOutcome,
 } from './services/pos-order.service';
+import { normalizePancakeSourceVersion } from './services/pos-order-freshness.util';
 import {
   CreateIntegrationDto,
   UpdateIntegrationDto,
@@ -225,6 +227,7 @@ export class IntegrationService {
   private readonly logger = new Logger(IntegrationService.name);
   private readonly PANCAKE_WEBHOOK_SETTINGS_KEY = 'pancakePosWebhook';
   private readonly POS_GEO_CACHE_VERSION_KEY = 'pos_geo:version';
+  private readonly lastStoreCatalogAutoSyncAt = new Map<string, number>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -1708,12 +1711,22 @@ export class IntegrationService {
       reconcileTargetsByTenant.set(route.tenantId, reconcileTargets);
 
       try {
+        const ordersForUpsert = await this.hydrateIncompleteWebhookOrdersFromPancake(
+          route.tenantId,
+          {
+            id: route.store.id,
+            shopId: route.shopId,
+            integrationId: route.store.integrationId,
+            apiKey: route.store.apiKey,
+          },
+          route.orders,
+        );
         const result = await this.withTransientDbRetry(
           () =>
             this.posOrderService.upsertPosOrdersWithOutcomes(
               route.tenantId,
               route.store.id,
-              route.orders,
+              ordersForUpsert,
               route.store.teamId,
             ),
           `pancake webhook upsert tenant=${route.tenantId} shop_id=${route.shopId}`,
@@ -1742,7 +1755,7 @@ export class IntegrationService {
               integrationId: route.store.integrationId,
               apiKey: route.store.apiKey,
             },
-            route.orders,
+            ordersForUpsert,
             result.outcomes,
             destinationCfg,
             requestId,
@@ -5665,11 +5678,269 @@ export class IntegrationService {
     return orders;
   }
 
-  private async fetchSingleOrderFromPancake(
+  private readRawOrderIdentifier(value: unknown): string | null {
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      return trimmed.length > 0 ? trimmed : null;
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return String(value);
+    }
+    return null;
+  }
+
+  private webhookOrderNeedsLiveHydration(order: any): boolean {
+    const rawStatus =
+      order?.status === undefined || order?.status === null
+        ? null
+        : Number(order.status);
+    if (
+      rawStatus !== null
+      && rawStatus !== 1
+      && rawStatus !== 9
+      && rawStatus !== 12
+    ) {
+      return false;
+    }
+
+    const orderId =
+      this.readRawOrderIdentifier(order?.id)
+      ?? this.readRawOrderIdentifier(order?.order_id);
+    if (!orderId) {
+      return false;
+    }
+
+    if (!Array.isArray(order?.items) || order.items.length === 0) {
+      return true;
+    }
+
+    return order.items.some((item: any) => {
+      if (!item || typeof item !== 'object') return true;
+      const qtyRaw = Number(item.quantity ?? 0);
+      if (Number.isFinite(qtyRaw) && qtyRaw <= 0) return false;
+      const variationInfo =
+        item.variation_info && typeof item.variation_info === 'object'
+          ? item.variation_info
+          : null;
+      const productId =
+        this.readRawOrderIdentifier(item.product_id)
+        ?? this.readRawOrderIdentifier(item.productId)
+        ?? this.readRawOrderIdentifier(variationInfo?.product_id)
+        ?? this.readRawOrderIdentifier(variationInfo?.productId);
+      const explicitVariationId =
+        this.readRawOrderIdentifier(item.variation_id)
+        ?? this.readRawOrderIdentifier(item.variationId)
+        ?? this.readRawOrderIdentifier(variationInfo?.variation_id)
+        ?? this.readRawOrderIdentifier(variationInfo?.variationId);
+      const variationInfoId = this.readRawOrderIdentifier(variationInfo?.id);
+      const variationId =
+        explicitVariationId
+        ?? (variationInfoId && (!productId || variationInfoId !== productId)
+          ? variationInfoId
+          : null);
+      return !variationId || (Boolean(productId) && variationId === productId);
+    });
+  }
+
+  private async maybeAutoSyncStoreCatalog(
+    storeId: string,
+    tenantId: string,
+    cooldownMs: number,
+  ): Promise<boolean> {
+    const now = Date.now();
+    const lastSyncedAt = this.lastStoreCatalogAutoSyncAt.get(storeId) ?? 0;
+    if (now - lastSyncedAt < cooldownMs) {
+      return false;
+    }
+    this.lastStoreCatalogAutoSyncAt.set(storeId, now);
+    try {
+      await this.syncPancakeProductsByStoreId(storeId, tenantId);
+      return true;
+    } catch (error: any) {
+      this.logger.warn(
+        `Skipped automatic catalog sync for POS store ${storeId}: ${error?.message || 'Unknown error'}`,
+      );
+      return false;
+    }
+  }
+
+  private async ensureStoreCatalogForFulfillableOrders(
+    tenantId: string,
+    storeId: string,
+    orders: any[],
+  ): Promise<void> {
+    if (typeof (this.prisma as any).posProduct?.findMany !== 'function') {
+      return;
+    }
+
+    const candidateVariationIds = new Set<string>();
+    let hasUnmappedFulfillableItem = false;
+
+    for (const order of orders) {
+      const status = Number(order?.status);
+      if (status !== 1 && status !== 9 && status !== 12) {
+        continue;
+      }
+      if (!Array.isArray(order?.items) || order.items.length === 0) {
+        continue;
+      }
+      for (const item of order.items) {
+        if (!item || typeof item !== 'object') continue;
+        const variationInfo =
+          item.variation_info && typeof item.variation_info === 'object'
+            ? item.variation_info
+            : null;
+        const variationId =
+          this.readRawOrderIdentifier(item.variation_id)
+          ?? this.readRawOrderIdentifier(item.variationId)
+          ?? this.readRawOrderIdentifier(variationInfo?.variation_id)
+          ?? this.readRawOrderIdentifier(variationInfo?.id);
+        if (variationId) {
+          candidateVariationIds.add(variationId);
+        } else {
+          hasUnmappedFulfillableItem = true;
+        }
+      }
+    }
+
+    if (candidateVariationIds.size === 0 && !hasUnmappedFulfillableItem) {
+      return;
+    }
+
+    if (candidateVariationIds.size > 0 && !hasUnmappedFulfillableItem) {
+      const ids = Array.from(candidateVariationIds);
+      const existingRows = await this.prisma.posProduct.findMany({
+        where: {
+          storeId,
+          variationId: { in: ids },
+        },
+        select: {
+          variationId: true,
+          productId: true,
+        },
+      });
+      const stockableMatched = new Set(
+        existingRows
+          .filter((row) => row.variationId && row.variationId !== row.productId)
+          .map((row) => row.variationId!),
+      );
+      if (ids.every((id) => stockableMatched.has(id))) {
+        return;
+      }
+    }
+
+    await this.maybeAutoSyncStoreCatalog(storeId, tenantId, 2 * 60_000);
+  }
+
+  private async hydrateIncompleteWebhookOrdersFromPancake(
+    tenantId: string,
+    store: {
+      id: string;
+      shopId: string;
+      integrationId?: string | null;
+      apiKey?: string | null;
+    },
+    orders: any[],
+  ): Promise<any[]> {
+    if (!Array.isArray(orders) || orders.length === 0) {
+      return orders;
+    }
+
+    const candidateIndices: number[] = [];
+    for (let idx = 0; idx < orders.length; idx += 1) {
+      if (this.webhookOrderNeedsLiveHydration(orders[idx])) {
+        candidateIndices.push(idx);
+        if (candidateIndices.length >= 10) {
+          break;
+        }
+      }
+    }
+
+    const hydrated = [...orders];
+    if (candidateIndices.length > 0 && store.shopId) {
+      let apiKey: string | null = null;
+      try {
+        apiKey = await this.resolveStoreApiKeyForWebhook(tenantId, {
+          id: store.id,
+          integrationId: store.integrationId ?? null,
+          apiKey: store.apiKey ?? null,
+        });
+      } catch {
+        apiKey = null;
+      }
+
+      if (apiKey) {
+        for (const idx of candidateIndices) {
+          const rawOrder = hydrated[idx];
+          const orderId =
+            this.readRawOrderIdentifier(rawOrder?.id)
+            ?? this.readRawOrderIdentifier(rawOrder?.order_id);
+          if (!orderId) continue;
+
+          const liveRes = await this.fetchSingleOrderFromPancakeDetailed(
+            store.shopId,
+            orderId,
+            apiKey,
+          );
+          if (liveRes.status !== 'ok') {
+            continue;
+          }
+
+          const liveOrder = liveRes.data;
+          const webhookVer = normalizePancakeSourceVersion(rawOrder?.updated_at);
+          const liveVer = normalizePancakeSourceVersion(liveOrder?.updated_at);
+          const liveStatus = Number(liveOrder?.status);
+          const liveItems = Array.isArray(liveOrder?.items) ? liveOrder.items : null;
+
+          if (!Array.isArray(rawOrder?.items)) {
+            hydrated[idx] = {
+              ...rawOrder,
+              ...liveOrder,
+              shop_id: liveOrder.shop_id ?? store.shopId,
+              ...(liveVer && webhookVer && liveVer < webhookVer
+                ? { updated_at: rawOrder.updated_at }
+                : {}),
+            };
+            continue;
+          }
+
+          const isNotStaleLiveSnapshot = !webhookVer || !liveVer || liveVer >= webhookVer;
+          if (
+            isNotStaleLiveSnapshot
+            && (
+              liveStatus === 6
+              || liveStatus === 7
+              || (liveItems && liveItems.length > 0)
+            )
+          ) {
+            hydrated[idx] = {
+              ...rawOrder,
+              ...liveOrder,
+              shop_id: liveOrder.shop_id ?? store.shopId,
+            };
+          }
+        }
+      }
+    }
+
+    try {
+      await this.ensureStoreCatalogForFulfillableOrders(tenantId, store.id, hydrated);
+    } catch {
+      // Best-effort catalog sync; never block webhook persistence.
+    }
+
+    return hydrated;
+  }
+
+  private async fetchSingleOrderFromPancakeDetailed(
     shopId: string,
     posOrderId: string,
     apiKey: string,
-  ): Promise<any | null> {
+  ): Promise<
+    | { status: 'ok'; data: Record<string, any> }
+    | { status: 'not_found' }
+    | { status: 'error'; httpStatus?: number }
+  > {
     const params = new URLSearchParams({ api_key: apiKey });
     const url = `https://pos.pages.fm/api/v1/shops/${encodeURIComponent(shopId)}/orders/${encodeURIComponent(posOrderId)}?${params.toString()}`;
     try {
@@ -5679,17 +5950,312 @@ export class IntegrationService {
         headers: { accept: 'application/json' },
         signal: AbortSignal.timeout(20_000),
       });
+      if (response.status === 404) {
+        return { status: 'not_found' };
+      }
       if (!response.ok) {
-        return null;
+        return { status: 'error', httpStatus: response.status };
       }
       const body = await response.json().catch(() => null);
       if (body?.success === true && body.data && typeof body.data === 'object' && !Array.isArray(body.data)) {
-        return body.data;
+        return { status: 'ok', data: body.data as Record<string, any> };
       }
-      return null;
+      if (
+        body?.success === false
+        && typeof body?.message === 'string'
+        && /not\s*found|khong\s*tim\s*thay|không\s*tìm\s*thấy/i.test(body.message)
+      ) {
+        return { status: 'not_found' };
+      }
+      return { status: 'error', httpStatus: response.status };
     } catch {
-      return null;
+      return { status: 'error' };
     }
+  }
+
+  private async fetchSingleOrderFromPancake(
+    shopId: string,
+    posOrderId: string,
+    apiKey: string,
+  ): Promise<any | null> {
+    const res = await this.fetchSingleOrderFromPancakeDetailed(shopId, posOrderId, apiKey);
+    return res.status === 'ok' ? res.data : null;
+  }
+
+  async reconcileOpenWmsIssueOrders(params?: {
+    tenantId?: string | null;
+    storeId?: string | null;
+    orderIds?: string[];
+    limit?: number;
+    forceCatalogSync?: boolean;
+  }): Promise<{
+    evaluatedCount: number;
+    recoveredCount: number;
+    canceledCount: number;
+    remainingIssueCount: number;
+  }> {
+    const candidates = await this.prisma.wmsFulfillmentOrder.findMany({
+      where: {
+        ...(params?.tenantId ? { tenantId: params.tenantId } : {}),
+        ...(params?.storeId ? { storeId: params.storeId } : {}),
+        ...(params?.orderIds && params.orderIds.length > 0
+          ? { id: { in: params.orderIds } }
+          : {}),
+        status: WmsFulfillmentOrderStatus.ISSUE,
+        basketId: null,
+        pickedQuantity: 0,
+        store: {
+          is: {
+            status: IntegrationStatus.ACTIVE,
+            NOT: { enabled: false },
+          },
+        },
+      },
+      select: {
+        id: true,
+        tenantId: true,
+        storeId: true,
+        shopId: true,
+        posOrderId: true,
+        posOrderDbId: true,
+        totalQuantity: true,
+        issueReason: true,
+        store: {
+          select: {
+            id: true,
+            tenantId: true,
+            teamId: true,
+            shopId: true,
+            integrationId: true,
+            apiKey: true,
+            status: true,
+            enabled: true,
+          },
+        },
+        tenant: {
+          select: {
+            id: true,
+            wmsFulfillmentGoLiveAt: true,
+          },
+        },
+        posOrder: {
+          select: {
+            id: true,
+            status: true,
+            isVoid: true,
+            insertedAt: true,
+          },
+        },
+      },
+      orderBy: [{ createdAt: 'desc' }],
+      take: Math.min(Math.max(params?.limit ?? 60, 1), 200),
+    });
+
+    if (candidates.length === 0) {
+      return {
+        evaluatedCount: 0,
+        recoveredCount: 0,
+        canceledCount: 0,
+        remainingIssueCount: 0,
+      };
+    }
+
+    const now = new Date();
+    const activeByStoreId = new Map<
+      string,
+      {
+        store: (typeof candidates)[number]['store'];
+        rows: typeof candidates;
+      }
+    >();
+
+    for (const candidate of candidates) {
+      const goLiveAt = candidate.tenant?.wmsFulfillmentGoLiveAt ?? null;
+      if (goLiveAt && candidate.posOrder.insertedAt < goLiveAt) {
+        await this.prisma.wmsFulfillmentLine.updateMany({
+          where: { fulfillmentOrderId: candidate.id },
+          data: {
+            quantityAllocated: 0,
+            quantityPicked: 0,
+            status: WmsFulfillmentLineStatus.CANCELED,
+            issueReason: 'Excluded before client WMS fulfillment go-live.',
+          },
+        });
+        await this.prisma.wmsFulfillmentOrder.updateMany({
+          where: {
+            id: candidate.id,
+            status: WmsFulfillmentOrderStatus.ISSUE,
+            basketId: null,
+            pickedQuantity: 0,
+          },
+          data: {
+            status: WmsFulfillmentOrderStatus.CANCELED,
+            issueReason: 'Excluded before client WMS fulfillment go-live.',
+            allocatedQuantity: 0,
+            pickedQuantity: 0,
+            completedAt: now,
+            lastSyncedAt: now,
+          },
+        });
+        continue;
+      }
+
+      const group = activeByStoreId.get(candidate.store.id) ?? {
+        store: candidate.store,
+        rows: [],
+      };
+      group.rows.push(candidate);
+      activeByStoreId.set(candidate.store.id, group);
+    }
+
+    for (const { store, rows } of activeByStoreId.values()) {
+      const refsToSync = new Map<string, { shopId: string; posOrderId: string }>();
+      for (const row of rows) {
+        const refKey = `${row.shopId}::${row.posOrderId}`;
+        refsToSync.set(refKey, { shopId: row.shopId, posOrderId: row.posOrderId });
+      }
+
+      let apiKey: string | null = null;
+      try {
+        apiKey = await this.resolveStoreApiKeyForWebhook(store.tenantId, {
+          id: store.id,
+          integrationId: store.integrationId,
+          apiKey: store.apiKey,
+        });
+      } catch {
+        apiKey = null;
+      }
+
+      if (apiKey && store.shopId) {
+        if (store.status === 'ACTIVE' && store.enabled !== false) {
+          const existingOwnership = await this.prisma.posShopOwnership.findUnique({
+            where: { shopId: store.shopId },
+            select: { shopId: true },
+          });
+          if (!existingOwnership) {
+            try {
+              await this.posShopOwnershipService.claimShopOwnership({
+                storeId: store.id,
+                reason: 'Auto-claimed during WMS issue order reconciliation',
+              });
+            } catch {
+              // Ignore ownership auto-claim conflicts; resolveOrderRoutes handles routing safely.
+            }
+          }
+        }
+
+        await this.maybeAutoSyncStoreCatalog(
+          store.id,
+          store.tenantId,
+          params?.forceCatalogSync ? 30_000 : 5 * 60_000,
+        );
+
+        const liveOrders: Record<string, any>[] = [];
+        for (const row of rows) {
+          const posOrderId = row.posOrderId?.trim();
+          if (!posOrderId) continue;
+
+          const liveRes = await this.fetchSingleOrderFromPancakeDetailed(
+            store.shopId,
+            posOrderId,
+            apiKey,
+          );
+          if (liveRes.status === 'not_found') {
+            if (!row.posOrder.isVoid) {
+              await this.prisma.posOrder.updateMany({
+                where: {
+                  id: row.posOrderDbId,
+                  tenantId: row.tenantId,
+                },
+                data: {
+                  isVoid: true,
+                },
+              });
+            }
+            continue;
+          }
+
+          if (liveRes.status === 'ok') {
+            liveOrders.push({
+              ...liveRes.data,
+              shop_id: liveRes.data.shop_id ?? store.shopId,
+            });
+          }
+        }
+
+        if (liveOrders.length > 0) {
+          const routing = await this.posShopOwnershipService.resolveOrderRoutes(
+            store.tenantId,
+            liveOrders,
+          );
+          const matchingRoute = routing.routes.find(
+            (route) => route.tenantId === store.tenantId && route.store.id === store.id,
+          );
+          const ordersForStore = matchingRoute?.orders ?? liveOrders;
+          if (ordersForStore.length > 0) {
+            await this.posOrderService.upsertPosOrdersWithOutcomes(
+              store.tenantId,
+              store.id,
+              ordersForStore,
+              store.teamId ?? null,
+              { allowIncompleteOrderHydration: true },
+            );
+          }
+
+          try {
+            await this.ensureStoreOrdersHavePositiveCogs(store.tenantId, store.shopId);
+          } catch {
+            // Non-blocking COGS backfill.
+          }
+        }
+      }
+
+      if (this.wmsFulfillmentSyncService && refsToSync.size > 0) {
+        await this.wmsFulfillmentSyncService.syncConfirmedPickingOrders({
+          tenantId: store.tenantId,
+          storeId: store.id,
+          actorId: null,
+          stores: [
+            {
+              id: store.id,
+              tenantId: store.tenantId,
+              shopId: store.shopId,
+            },
+          ],
+          posOrderRefs: Array.from(refsToSync.values()),
+        });
+      }
+    }
+
+    const refreshedRows = await this.prisma.wmsFulfillmentOrder.findMany({
+      where: {
+        id: { in: candidates.map((row) => row.id) },
+      },
+      select: {
+        id: true,
+        status: true,
+      },
+    });
+
+    let recoveredCount = 0;
+    let canceledCount = 0;
+    let remainingIssueCount = 0;
+    for (const row of refreshedRows) {
+      if (row.status === WmsFulfillmentOrderStatus.ISSUE) {
+        remainingIssueCount += 1;
+      } else if (row.status === WmsFulfillmentOrderStatus.CANCELED) {
+        canceledCount += 1;
+      } else {
+        recoveredCount += 1;
+      }
+    }
+
+    return {
+      evaluatedCount: candidates.length,
+      recoveredCount,
+      canceledCount,
+      remainingIssueCount,
+    };
   }
 
   async syncPancakeOrdersByStoreId(
@@ -5758,6 +6324,7 @@ export class IntegrationService {
     }
 
     let repairedLookupCount = 0;
+    let hasOpenIssueOrders = false;
     if (options?.repairIssueOrders !== false) {
       const openFulfillmentOrders = await this.prisma.wmsFulfillmentOrder.findMany({
         where: {
@@ -5773,28 +6340,66 @@ export class IntegrationService {
           },
         },
         select: {
+          posOrderDbId: true,
           posOrderId: true,
           status: true,
+          basketId: true,
+          pickedQuantity: true,
         },
         orderBy: [
           { status: 'asc' },
-          { createdAt: 'asc' },
+          { createdAt: 'desc' },
         ],
         take: 80,
       });
 
-      const missingIds = Array.from(
-        new Set(
-          openFulfillmentOrders
-            .map((row) => row.posOrderId?.trim())
-            .filter((id): id is string => Boolean(id) && !byOrderId.has(id)),
-        ),
-      ).slice(0, 50);
+      hasOpenIssueOrders = openFulfillmentOrders.some(
+        (row) => row.status === WmsFulfillmentOrderStatus.ISSUE,
+      );
+      if (hasOpenIssueOrders) {
+        await this.maybeAutoSyncStoreCatalog(store.id, tenantId, 60_000);
+      }
 
-      for (const posOrderId of missingIds) {
-        const fetched = await this.fetchSingleOrderFromPancake(store.shopId, posOrderId, apiKey);
-        if (fetched) {
-          byOrderId.set(posOrderId, fetched);
+      const targetedRows = openFulfillmentOrders
+        .filter((row) => {
+          const id = row.posOrderId?.trim();
+          if (!id) return false;
+          // Always fetch authoritative single-order snapshot for ISSUE orders
+          // even when they appeared in the list window.
+          return row.status === WmsFulfillmentOrderStatus.ISSUE || !byOrderId.has(id);
+        })
+        .slice(0, 50);
+
+      const seenPosOrderIds = new Set<string>();
+      for (const row of targetedRows) {
+        const posOrderId = row.posOrderId.trim();
+        if (seenPosOrderIds.has(posOrderId)) continue;
+        seenPosOrderIds.add(posOrderId);
+
+        const fetched = await this.fetchSingleOrderFromPancakeDetailed(
+          store.shopId,
+          posOrderId,
+          apiKey,
+        );
+        if (fetched.status === 'ok') {
+          byOrderId.set(posOrderId, fetched.data);
+          repairedLookupCount += 1;
+        } else if (
+          fetched.status === 'not_found'
+          && row.status === WmsFulfillmentOrderStatus.ISSUE
+          && !row.basketId
+          && row.pickedQuantity === 0
+        ) {
+          byOrderId.delete(posOrderId);
+          await this.prisma.posOrder.updateMany({
+            where: {
+              id: row.posOrderDbId,
+              tenantId,
+            },
+            data: {
+              isVoid: true,
+            },
+          });
           repairedLookupCount += 1;
         }
       }
@@ -5815,6 +6420,7 @@ export class IntegrationService {
           store.id,
           ordersForStore,
           store.teamId ?? null,
+          hasOpenIssueOrders ? { allowIncompleteOrderHydration: true } : {},
         );
         upsertedCount = upsertResult.upserted;
       }

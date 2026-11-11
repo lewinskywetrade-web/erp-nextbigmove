@@ -118,6 +118,7 @@ export interface PosOrderUpsertOutcome {
 
 export interface PosOrderUpsertOptions {
   requireProjectionSuccess?: boolean;
+  allowIncompleteOrderHydration?: boolean;
 }
 
 export function shouldTreatNoProductSnapshotAsVoid(
@@ -727,6 +728,15 @@ export class PosOrderService {
       WHERE "tenantId"=$1::uuid AND "shopId"=$2 AND "posOrderId"=$3 FOR UPDATE NOWAIT`, tenantId, shopId, posOrderId);
   }
 
+  private hasIdentifiableProductItems(items: unknown): boolean {
+    if (!Array.isArray(items) || items.length === 0) return false;
+    return items.some((item: any) => [
+      item?.product_id, item?.productId, item?.variation_id, item?.variationId,
+      item?.product_display_id, item?.productDisplayId, item?.variation_info?.product_display_id,
+      item?.variation_info?.display_id, item?.variation_info?.barcode,
+    ].some((value) => this.readCogsIdentifier(value) !== null));
+  }
+
   private async sourceVersionSkipReason(
     tx: Prisma.TransactionClient,
     identity: { tenantId: string; shopId: string; posOrderId: string },
@@ -744,6 +754,42 @@ export class PosOrderService {
     }
     if (!incomingVersion && (savedVersion || deleting)) return 'SOURCE_VERSION_REQUIRED';
     return incomingVersion && savedVersion && incomingVersion < savedVersion ? 'STALE_SOURCE_VERSION' : null;
+  }
+
+  private async evaluateSourceVersionForPersist(
+    tx: Prisma.TransactionClient,
+    identity: { tenantId: string; shopId: string; posOrderId: string },
+    previous: { orderSnapshot: unknown; statusHistory: unknown } | null,
+    incomingVersion: string | null,
+    allowIncompleteHydration = false,
+  ): Promise<{ skipReason: string | null; effectiveVersion: string | null }> {
+    const ledger = await tx.posOrderSourceVersion.findUnique({ where: { tenantId_shopId_posOrderId: identity } });
+    let savedVersion = savedPancakeSourceVersion(previous?.orderSnapshot, previous?.statusHistory);
+    if (ledger) {
+      const ledgerVersion = normalizePancakeSourceVersion(ledger.sourceVersion);
+      if (!ledgerVersion) throw new Error('Invalid saved POS source version');
+      if (!savedVersion || ledgerVersion > savedVersion) savedVersion = ledgerVersion;
+      if (ledger.deleted && incomingVersion === ledgerVersion) {
+        return { skipReason: 'SOURCE_DELETED', effectiveVersion: incomingVersion };
+      }
+      if (ledger.deleted) {
+        allowIncompleteHydration = false;
+      }
+    }
+    if (allowIncompleteHydration) {
+      const effectiveVersion =
+        incomingVersion && (!savedVersion || incomingVersion >= savedVersion)
+          ? incomingVersion
+          : (savedVersion ?? incomingVersion);
+      return { skipReason: null, effectiveVersion };
+    }
+    if (!incomingVersion && savedVersion) {
+      return { skipReason: 'SOURCE_VERSION_REQUIRED', effectiveVersion: incomingVersion };
+    }
+    if (incomingVersion && savedVersion && incomingVersion < savedVersion) {
+      return { skipReason: 'STALE_SOURCE_VERSION', effectiveVersion: incomingVersion };
+    }
+    return { skipReason: null, effectiveVersion: incomingVersion };
   }
 
   private async saveSourceVersion(tx: Prisma.TransactionClient,
@@ -1284,13 +1330,28 @@ export class PosOrderService {
             where: { tenantId_shopId_posOrderId: identity },
             select: { id: true, orderSnapshot: true, statusHistory: true, itemData: true, totalQuantity: true, isVoid: true, status: true },
           });
-          const skipReason = await this.sourceVersionSkipReason(client, identity, previous, sourceVersion.version);
-          if (skipReason) return { skipped: skipReason, order: null };
-          if (!hasItemsPayload || rawOrder.status === undefined || rawOrder.status === null) {
-            const previousSnapshot = previous?.orderSnapshot && typeof previous.orderSnapshot === 'object'
-              && !Array.isArray(previous.orderSnapshot)
-              ? previous.orderSnapshot as Record<string, unknown>
+          const previousSnapshotForVersion = previous?.orderSnapshot
+            && typeof previous.orderSnapshot === 'object'
+            && !Array.isArray(previous.orderSnapshot)
+              ? (previous.orderSnapshot as Record<string, unknown>)
               : null;
+          const canHydrateIncompletePrevious = Boolean(
+            options.allowIncompleteOrderHydration
+            && previous
+            && !this.hasIdentifiableProductItems(previousSnapshotForVersion?.items)
+            && (hasProduct || order.status === 6 || order.status === 7),
+          );
+          const versionDecision = await this.evaluateSourceVersionForPersist(
+            client,
+            identity,
+            previous,
+            sourceVersion.version,
+            canHydrateIncompletePrevious,
+          );
+          if (versionDecision.skipReason) return { skipped: versionDecision.skipReason, order: null };
+          const effectiveSourceVersion = versionDecision.effectiveVersion;
+          if (!hasItemsPayload || rawOrder.status === undefined || rawOrder.status === null) {
+            const previousSnapshot = previousSnapshotForVersion;
             if (!hasItemsPayload && !previous) order.cogsUnresolved = true;
             if (!hasItemsPayload && order.orderSnapshot && previousSnapshot && Array.isArray(previousSnapshot.items)) {
               order.orderSnapshot.items = previousSnapshot.items;
@@ -1309,8 +1370,8 @@ export class PosOrderService {
           isConfirmedNoProductSnapshot = isNoProductOrder && !shouldTreatAsVoid;
           if (shouldTreatAsVoid) order.isVoid = true;
           if (hasItemsPayload && items.length === 0) order.cogsUnresolved = !order.isVoid || undefined;
-          if (sourceVersion.version && order.orderSnapshot) {
-            order.orderSnapshot[PANCAKE_SOURCE_VERSION_KEY] = sourceVersion.version;
+          if (effectiveSourceVersion && order.orderSnapshot) {
+            order.orderSnapshot[PANCAKE_SOURCE_VERSION_KEY] = effectiveSourceVersion;
           }
           const write = {
             where: {
@@ -1414,7 +1475,7 @@ export class PosOrderService {
               assigningCare: order.assigningCare,
             },
           };
-          await this.saveSourceVersion(client, identity, sourceVersion.version, false);
+          await this.saveSourceVersion(client, identity, effectiveSourceVersion, false);
           const persistedOrder = previous
             ? await client.posOrder.upsert(write)
             : await client.posOrder.create({ data: write.create });
