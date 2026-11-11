@@ -23,6 +23,7 @@ import { ClsService } from 'nestjs-cls';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { WmsStaffActivityService } from '../../common/services/wms-staff-activity.service';
 import { WmsFulfillmentSyncService } from '../wms-fulfillment/wms-fulfillment-sync.service';
+import { linkProfilesIntoSharedStockPoolTx } from '../wms-fulfillment/wms-stock-pool.util';
 import { CreateWmsInventoryAdjustmentDto } from './dto/create-wms-inventory-adjustment.dto';
 import { CreateWmsInventoryStoreTransferDto } from './dto/create-wms-inventory-store-transfer.dto';
 import { CreateWmsInventoryTransferDto } from './dto/create-wms-inventory-transfer.dto';
@@ -1170,7 +1171,9 @@ export class WmsInventoryService {
         && this.isStockableVariation(profile.productId, profile.variationId)
         && !(isSameStoreTarget && profile.variationId === sourceProfile?.variationId)
       ))
-      .map((profile) => this.mapStoreTransferProductOption(profile));
+      .map((profile) =>
+        this.mapStoreTransferProductOption(profile, sourceProfile?.stockPoolGroupId ?? null),
+      );
     const suggestion = this.resolveStoreTransferSuggestion({
       sourceProfile,
       products: mappedProducts,
@@ -1741,6 +1744,14 @@ export class WmsInventoryService {
         });
       }
 
+      const poolLinkResult =
+        body.shareStockPool === true && sourceProductProfileId
+          ? await linkProfilesIntoSharedStockPoolTx(tx, {
+              tenantId: scope.activeTenantId!,
+              profileIds: [sourceProductProfileId, targetProfile.id],
+            })
+          : null;
+
       await tx.wmsInventoryMovement.createMany({
         data: units.map((unit) => ({
           tenantId: scope.activeTenantId!,
@@ -1825,6 +1836,7 @@ export class WmsInventoryService {
         transfer: storeTransfer,
         units: updatedUnits,
         sourceVariationId,
+        poolLinkResult,
       };
     });
 
@@ -1837,6 +1849,9 @@ export class WmsInventoryService {
 
     addRefreshScope(result.transfer.fromStoreId, result.sourceVariationId);
     addRefreshScope(result.transfer.toStoreId, targetProfile.variationId);
+    for (const affected of result.poolLinkResult?.affectedScopes ?? []) {
+      addRefreshScope(affected.storeId, affected.variationId);
+    }
 
     for (const [storeId, variationIds] of fulfillmentRefreshScopes) {
       await this.wmsFulfillmentSyncService.refreshDemandQueueForScope({
@@ -1861,6 +1876,8 @@ export class WmsInventoryService {
         targetVariationId: targetProfile.variationId,
         unitCount: result.units.length,
         changeScope: result.transfer.fromStoreId === result.transfer.toStoreId ? 'SAME_STORE' : 'CROSS_STORE',
+        shareStockPool: Boolean(body.shareStockPool),
+        stockPoolGroupId: result.poolLinkResult?.stockPoolGroupId ?? null,
       },
     });
 
@@ -3685,17 +3702,21 @@ export class WmsInventoryService {
         : null;
   }
 
-  private mapStoreTransferProductOption(profile: {
-    id: string;
-    posProductId: string;
-    productId: string;
-    variationId: string;
-    posProduct: {
-      customId: string | null;
-      productSnapshot: Prisma.JsonValue | null;
-      name: string;
-    };
-  }) {
+  private mapStoreTransferProductOption(
+    profile: {
+      id: string;
+      posProductId: string;
+      productId: string;
+      variationId: string;
+      stockPoolGroupId?: string | null;
+      posProduct: {
+        customId: string | null;
+        productSnapshot: Prisma.JsonValue | null;
+        name: string;
+      };
+    },
+    sourceStockPoolGroupId: string | null = null,
+  ) {
     return {
       id: profile.id,
       profileId: profile.id,
@@ -3706,6 +3727,11 @@ export class WmsInventoryService {
       productCustomId: profile.posProduct.customId,
       name: profile.posProduct.name,
       label: profile.posProduct.name,
+      alreadyPooled: Boolean(
+        sourceStockPoolGroupId
+        && profile.stockPoolGroupId
+        && profile.stockPoolGroupId === sourceStockPoolGroupId,
+      ),
     };
   }
 
@@ -3741,6 +3767,7 @@ export class WmsInventoryService {
       id: string;
       productId: string;
       variationId: string;
+      stockPoolGroupId?: string | null;
       posProduct: {
         customId: string | null;
         productSnapshot: Prisma.JsonValue | null;
@@ -3752,6 +3779,16 @@ export class WmsInventoryService {
       targetProfileId: string;
     } | null;
   }) {
+    const pooledProduct = params.products.find((product) => product.alreadyPooled) ?? null;
+    if (pooledProduct) {
+      return {
+        profileId: pooledProduct.profileId,
+        label: pooledProduct.label,
+        reason: 'Linked shared stock pool',
+        confidence: 'high',
+      };
+    }
+
     const savedProduct = params.savedEquivalence
       ? params.products.find((product) => product.profileId === params.savedEquivalence?.targetProfileId) ?? null
       : null;

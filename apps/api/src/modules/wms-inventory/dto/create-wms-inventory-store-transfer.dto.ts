@@ -1,6 +1,7 @@
 import {
   ArrayMinSize,
   IsArray,
+  IsBoolean,
   IsOptional,
   IsString,
   IsUUID,
@@ -18,6 +19,10 @@ export class CreateWmsInventoryStoreTransferDto {
 
   @IsUUID()
   targetProfileId!: string;
+
+  @IsOptional()
+  @IsBoolean()
+  shareStockPool?: boolean;
 
   @IsOptional()
   @IsString()

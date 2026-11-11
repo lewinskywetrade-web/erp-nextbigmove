@@ -15,6 +15,7 @@ type InventoryStoreTransferModalProps = {
   options: WmsInventoryStoreTransferOptionsResponse | null;
   targetStoreId: string;
   targetProfileId: string;
+  shareStockPool: boolean;
   notes: string;
   preview: WmsInventoryStoreTransferPreviewResponse | null;
   isLoadingOptions: boolean;
@@ -24,6 +25,7 @@ type InventoryStoreTransferModalProps = {
   errorMessage: string | null;
   onTargetStoreChange: (value: string) => void;
   onTargetProfileChange: (value: string) => void;
+  onShareStockPoolChange: (value: boolean) => void;
   onNotesChange: (value: string) => void;
   onSubmit: () => Promise<void>;
   onClose: () => void;
@@ -35,6 +37,7 @@ export function InventoryStoreTransferModal({
   options,
   targetStoreId,
   targetProfileId,
+  shareStockPool,
   notes,
   preview,
   isLoadingOptions,
@@ -44,6 +47,7 @@ export function InventoryStoreTransferModal({
   errorMessage,
   onTargetStoreChange,
   onTargetProfileChange,
+  onShareStockPoolChange,
   onNotesChange,
   onSubmit,
   onClose,
@@ -197,6 +201,32 @@ export function InventoryStoreTransferModal({
               isLoading={isLoadingPreview}
               errorMessage={previewErrorMessage}
             />
+          ) : null}
+
+          {targetStoreId && targetProfileId ? (
+            <label className="flex cursor-pointer items-start gap-3 rounded-2xl border border-[#dce4ea] bg-[#fbfcfc] px-4 py-3 transition hover:border-[#bfd0dc]">
+              <input
+                type="checkbox"
+                checked={shareStockPool}
+                onChange={(event) => onShareStockPoolChange(event.target.checked)}
+                className="mt-0.5 h-4 w-4 rounded border-[#c4d3de] text-primary focus:ring-primary"
+              />
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[13px] font-semibold text-primary">
+                    Keep linked as shared stock pool
+                  </span>
+                  {selectedTargetProduct?.alreadyPooled ? (
+                    <span className="inline-flex items-center rounded-full border border-[#b9decb] bg-[#ecf8f2] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-[#286348]">
+                      Already linked
+                    </span>
+                  ) : null}
+                </div>
+                <p className="mt-0.5 text-[12px] text-[#667b8a]">
+                  Orders on either variant or store will automatically share available bin stock and auto-assign units on pick.
+                </p>
+              </div>
+            </label>
           ) : null}
 
           <label className="block">

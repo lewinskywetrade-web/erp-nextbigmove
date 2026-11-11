@@ -1,4 +1,4 @@
-import { createDecipheriv, createHash } from 'crypto';
+import { createDecipheriv, createHash, randomUUID } from 'crypto';
 import { existsSync, readFileSync } from 'fs';
 import { resolve } from 'path';
 import {
@@ -5664,6 +5664,658 @@ async function reconcileToniosWmsFulfillmentQueue() {
   }
 }
 
+async function reconcileFamcoSharedStockPoolsAndQueue() {
+  try {
+    const famcoTenants = await prisma.tenant.findMany({
+      where: {
+        OR: [
+          { name: { contains: 'famco', mode: 'insensitive' } },
+          { slug: { contains: 'famco', mode: 'insensitive' } },
+          {
+            posStores: {
+              some: {
+                OR: [
+                  { name: { contains: 'famco', mode: 'insensitive' } },
+                  { shopName: { contains: 'famco', mode: 'insensitive' } },
+                ],
+              },
+            },
+          },
+        ],
+      },
+      select: {
+        id: true,
+        name: true,
+        slug: true,
+        wmsFulfillmentGoLiveAt: true,
+        posStores: {
+          select: {
+            id: true,
+            name: true,
+            shopName: true,
+          },
+        },
+      },
+    });
+
+    if (famcoTenants.length === 0) {
+      console.log('[FAMCO_POOL_RECONCILE] No Famco tenant found; skipping.');
+      return;
+    }
+
+    const now = new Date();
+
+    for (const tenant of famcoTenants) {
+      // 1. Ensure default WmsProductProfiles exist for all stockable PosProducts in Famco stores
+      const posProducts = await prisma.posProduct.findMany({
+        where: {
+          variationId: { not: null },
+          store: { tenantId: tenant.id },
+        },
+        select: {
+          id: true,
+          storeId: true,
+          productId: true,
+          variationId: true,
+          warehouseId: true,
+        },
+      });
+      const stockablePosProducts = posProducts.filter(
+        (product) => Boolean(product.variationId) && product.variationId !== product.productId,
+      );
+      if (stockablePosProducts.length > 0) {
+        const existingProfileRows = await prisma.wmsProductProfile.findMany({
+          where: {
+            posProductId: { in: stockablePosProducts.map((p) => p.id) },
+          },
+          select: { posProductId: true },
+        });
+        const existingPosProductIds = new Set<string>(
+          existingProfileRows.map((row) => row.posProductId),
+        );
+        const missingProducts = stockablePosProducts.filter(
+          (product) => !existingPosProductIds.has(product.id),
+        );
+        if (missingProducts.length > 0) {
+          await prisma.wmsProductProfile.createMany({
+            data: missingProducts.map((product) => ({
+              tenantId: tenant.id,
+              storeId: product.storeId,
+              posProductId: product.id,
+              productId: product.productId,
+              variationId: product.variationId!,
+              posWarehouseRef: product.warehouseId,
+              status: WmsProductProfileStatus.DEFAULT,
+              isSerialized: true,
+            })),
+            skipDuplicates: true,
+          });
+        }
+      }
+
+      // 2. Load non-archived stockable profiles for Famco
+      const rawProfiles = await prisma.wmsProductProfile.findMany({
+        where: {
+          tenantId: tenant.id,
+          status: { not: WmsProductProfileStatus.ARCHIVED },
+        },
+        select: {
+          id: true,
+          storeId: true,
+          productId: true,
+          variationId: true,
+          posWarehouseRef: true,
+          stockPoolGroupId: true,
+          posProduct: {
+            select: {
+              productId: true,
+              variationId: true,
+            },
+          },
+        },
+      });
+      const profiles = rawProfiles.filter(
+        (p) =>
+          Boolean(p.variationId)
+          && p.variationId !== p.productId
+          && Boolean(p.posProduct.variationId)
+          && p.posProduct.variationId !== p.posProduct.productId,
+      );
+
+      const profileById = new Map<string, (typeof profiles)[number]>();
+      const profileByStoreVariation = new Map<string, (typeof profiles)[number]>();
+      for (const profile of profiles) {
+        profileById.set(profile.id, profile);
+        profileByStoreVariation.set(`${profile.storeId}::${profile.variationId}`, profile);
+      }
+
+      const existingPooledProfileCount = profiles.filter((p) => Boolean(p.stockPoolGroupId)).length;
+      let equivalenceRowCount = 0;
+      let storeTransferItemCount = 0;
+      let backfilledPoolGroupCount = 0;
+
+      // 3. Auto-backfill Famco's verified Change Variant history on initial rollout
+      if (existingPooledProfileCount === 0 && profiles.length > 0) {
+        const [equivalences, transferItems] = await Promise.all([
+          prisma.wmsProductProfileEquivalence.findMany({
+            where: { tenantId: tenant.id },
+            select: {
+              sourceProfileId: true,
+              targetProfileId: true,
+              sourceStoreId: true,
+              sourceVariationId: true,
+              targetStoreId: true,
+              targetVariationId: true,
+            },
+          }),
+          prisma.wmsInventoryStoreTransferItem.findMany({
+            where: {
+              transfer: {
+                tenantId: tenant.id,
+              },
+            },
+            select: {
+              fromProductProfileId: true,
+              toProductProfileId: true,
+              fromStoreId: true,
+              fromVariationId: true,
+              toStoreId: true,
+              toVariationId: true,
+            },
+          }),
+        ]);
+        equivalenceRowCount = equivalences.length;
+        storeTransferItemCount = transferItems.length;
+
+        const parentById = new Map<string, string>();
+        const findRoot = (id: string): string => {
+          let current = id;
+          while (parentById.has(current) && parentById.get(current) !== current) {
+            current = parentById.get(current)!;
+          }
+          let walk = id;
+          while (parentById.has(walk) && parentById.get(walk) !== current) {
+            const next = parentById.get(walk)!;
+            parentById.set(walk, current);
+            walk = next;
+          }
+          if (!parentById.has(id)) {
+            parentById.set(id, id);
+          }
+          return current;
+        };
+        const unionProfiles = (leftId: string | undefined, rightId: string | undefined) => {
+          if (!leftId || !rightId || leftId === rightId) {
+            return;
+          }
+          if (!profileById.has(leftId) || !profileById.has(rightId)) {
+            return;
+          }
+          const leftRoot = findRoot(leftId);
+          const rightRoot = findRoot(rightId);
+          if (leftRoot !== rightRoot) {
+            parentById.set(rightRoot, leftRoot);
+          }
+        };
+
+        for (const eq of equivalences) {
+          const src =
+            profileById.get(eq.sourceProfileId)
+            ?? profileByStoreVariation.get(`${eq.sourceStoreId}::${eq.sourceVariationId}`);
+          const dst =
+            profileById.get(eq.targetProfileId)
+            ?? profileByStoreVariation.get(`${eq.targetStoreId}::${eq.targetVariationId}`);
+          unionProfiles(src?.id, dst?.id);
+        }
+
+        for (const item of transferItems) {
+          const src =
+            profileById.get(item.fromProductProfileId)
+            ?? profileByStoreVariation.get(`${item.fromStoreId}::${item.fromVariationId}`);
+          const dst =
+            profileById.get(item.toProductProfileId)
+            ?? profileByStoreVariation.get(`${item.toStoreId}::${item.toVariationId}`);
+          unionProfiles(src?.id, dst?.id);
+        }
+
+        const componentsByRoot = new Map<string, string[]>();
+        for (const profileId of Array.from(parentById.keys())) {
+          const root = findRoot(profileId);
+          const list = componentsByRoot.get(root) ?? [];
+          list.push(profileId);
+          componentsByRoot.set(root, list);
+        }
+
+        for (const memberIds of Array.from(componentsByRoot.values())) {
+          if (memberIds.length < 2) {
+            continue;
+          }
+          const groupId = randomUUID();
+          await prisma.wmsProductProfile.updateMany({
+            where: {
+              tenantId: tenant.id,
+              id: { in: memberIds },
+            },
+            data: {
+              stockPoolGroupId: groupId,
+            },
+          });
+          for (const memberId of memberIds) {
+            const p = profileById.get(memberId);
+            if (p) {
+              p.stockPoolGroupId = groupId;
+            }
+          }
+          backfilledPoolGroupCount += 1;
+        }
+      }
+
+      // 4. Build active pool index (>= 2 members per group) for live Famco queue refresh
+      const rawMembersByGroup = new Map<string, Array<(typeof profiles)[number]>>();
+      for (const profile of profiles) {
+        if (!profile.stockPoolGroupId) {
+          continue;
+        }
+        const list = rawMembersByGroup.get(profile.stockPoolGroupId) ?? [];
+        list.push(profile);
+        rawMembersByGroup.set(profile.stockPoolGroupId, list);
+      }
+
+      const activeMembersByGroup = new Map<string, Array<(typeof profiles)[number]>>();
+      const groupIdByStoreVariation = new Map<string, string>();
+      let pooledProfileCount = 0;
+      for (const [groupId, groupMembers] of Array.from(rawMembersByGroup.entries())) {
+        if (groupMembers.length < 2) {
+          continue;
+        }
+        activeMembersByGroup.set(groupId, groupMembers);
+        pooledProfileCount += groupMembers.length;
+        for (const member of groupMembers) {
+          groupIdByStoreVariation.set(`${member.storeId}::${member.variationId}`, groupId);
+        }
+      }
+
+      const queueStatsBefore = await prisma.wmsFulfillmentOrder.groupBy({
+        by: ['status'],
+        where: {
+          tenantId: tenant.id,
+          assignmentMode: WmsFulfillmentAssignmentMode.BASKET_DEMAND,
+          basketId: null,
+          status: {
+            in: [
+              WmsFulfillmentOrderStatus.READY,
+              WmsFulfillmentOrderStatus.RESTOCKING,
+              WmsFulfillmentOrderStatus.PARTIAL,
+            ],
+          },
+          posOrder: {
+            is: {
+              status: 1,
+              isVoid: false,
+            },
+          },
+        },
+        _count: { _all: true },
+      });
+
+      // 5. Recompute Famco's open BASKET_DEMAND queue across all Famco stores using shared stock pools
+      const [putawayBinUnits, activeDemandBins, rawCandidateOrders] = await Promise.all([
+        prisma.wmsInventoryUnit.findMany({
+          where: {
+            tenantId: tenant.id,
+            status: WmsInventoryUnitStatus.PUTAWAY,
+            currentLocationId: { not: null },
+            currentLocation: { is: { kind: WmsLocationKind.BIN, isActive: true } },
+            OR: [{ expirationDate: null }, { expirationDate: { gt: now } }],
+            pickReservations: { none: { status: { in: ['RESERVED', 'PICKED'] } } },
+            basketUnits: { none: { status: { in: ['PICKED', 'PACKED'] } } },
+          },
+          select: {
+            warehouseId: true,
+            storeId: true,
+            variationId: true,
+            posWarehouseRef: true,
+          },
+        }),
+        prisma.wmsBasketPickDemandBin.findMany({
+          where: {
+            tenantId: tenant.id,
+            basket: {
+              status: { in: ['ASSIGNED', 'IN_PICKING', 'FULL_HELD'] },
+            },
+            demand: {
+              fulfillmentOrder: {
+                status: {
+                  in: [
+                    WmsFulfillmentOrderStatus.READY,
+                    WmsFulfillmentOrderStatus.PARTIAL,
+                    WmsFulfillmentOrderStatus.RESTOCKING,
+                    WmsFulfillmentOrderStatus.ISSUE,
+                    WmsFulfillmentOrderStatus.IN_PICKING,
+                    WmsFulfillmentOrderStatus.READY_FOR_PACK,
+                    WmsFulfillmentOrderStatus.PICKED,
+                    WmsFulfillmentOrderStatus.PACKING,
+                  ],
+                },
+              },
+            },
+          },
+          select: {
+            warehouseId: true,
+            variationId: true,
+            quantityTarget: true,
+            quantityPicked: true,
+            demand: {
+              select: {
+                storeId: true,
+              },
+            },
+          },
+        }),
+        prisma.wmsFulfillmentOrder.findMany({
+          where: {
+            tenantId: tenant.id,
+            assignmentMode: WmsFulfillmentAssignmentMode.BASKET_DEMAND,
+            basketId: null,
+            status: {
+              in: [
+                WmsFulfillmentOrderStatus.READY,
+                WmsFulfillmentOrderStatus.RESTOCKING,
+                WmsFulfillmentOrderStatus.PARTIAL,
+              ],
+            },
+            posOrder: {
+              is: {
+                status: 1,
+                isVoid: false,
+              },
+            },
+          },
+          include: {
+            posOrder: {
+              select: {
+                dateLocal: true,
+                insertedAt: true,
+              },
+            },
+            lines: true,
+          },
+        }),
+      ]);
+
+      const tenantGoLiveAt = tenant.wmsFulfillmentGoLiveAt ?? null;
+
+      const candidateQueueOrders = rawCandidateOrders
+        .filter((order) => {
+          if (tenantGoLiveAt && order.posOrder.insertedAt < tenantGoLiveAt) {
+            return false;
+          }
+          return true;
+        })
+        .sort((left, right) => {
+          const leftPriority = left.priorityOverrideAt ? left.priorityOverrideAt.getTime() : null;
+          const rightPriority = right.priorityOverrideAt ? right.priorityOverrideAt.getTime() : null;
+          if (leftPriority !== null && rightPriority === null) {
+            return -1;
+          }
+          if (leftPriority === null && rightPriority !== null) {
+            return 1;
+          }
+          if (leftPriority !== null && rightPriority !== null && leftPriority !== rightPriority) {
+            return leftPriority - rightPriority;
+          }
+          const dateDiff = left.posOrder.dateLocal.localeCompare(right.posOrder.dateLocal);
+          if (dateDiff !== 0) {
+            return dateDiff;
+          }
+          const createdDiff = left.createdAt.getTime() - right.createdAt.getTime();
+          if (createdDiff !== 0) {
+            return createdDiff;
+          }
+          return left.id.localeCompare(right.id);
+        });
+
+      const buildAllocKey = (warehouseId: string, storeId: string, variationId: string) => {
+        const groupId = groupIdByStoreVariation.get(`${storeId}::${variationId}`) ?? null;
+        return groupId
+          ? `${warehouseId}::pool:${groupId}`
+          : `${warehouseId}::${storeId}::${variationId}`;
+      };
+
+      const heldByAllocKey = new Map<string, number>();
+      for (const bin of activeDemandBins) {
+        const held = Math.max((bin.quantityTarget ?? 0) - (bin.quantityPicked ?? 0), 0);
+        if (held <= 0) {
+          continue;
+        }
+        const allocKey = buildAllocKey(bin.warehouseId, bin.demand.storeId, bin.variationId);
+        heldByAllocKey.set(allocKey, (heldByAllocKey.get(allocKey) ?? 0) + held);
+      }
+
+      const virtualUsedByAllocKey = new Map<string, number>();
+      const availableFor = (
+        warehouseId: string,
+        orderStoreId: string,
+        variationId: string,
+        orderPosWhRef: string | null,
+      ) => {
+        const groupId = groupIdByStoreVariation.get(`${orderStoreId}::${variationId}`) ?? null;
+        const allocKey = buildAllocKey(warehouseId, orderStoreId, variationId);
+        let rawCount = 0;
+        if (groupId) {
+          const members = activeMembersByGroup.get(groupId) ?? [];
+          rawCount = putawayBinUnits.filter(
+            (u) =>
+              u.warehouseId === warehouseId
+              && members.some((m) => m.storeId === u.storeId && m.variationId === u.variationId),
+          ).length;
+        } else {
+          rawCount = putawayBinUnits.filter(
+            (u) =>
+              u.warehouseId === warehouseId
+              && u.storeId === orderStoreId
+              && u.variationId === variationId
+              && (!orderPosWhRef || !u.posWarehouseRef || u.posWarehouseRef === orderPosWhRef),
+          ).length;
+        }
+        const held = heldByAllocKey.get(allocKey) ?? 0;
+        const used = virtualUsedByAllocKey.get(allocKey) ?? 0;
+        return Math.max(rawCount - held - used, 0);
+      };
+
+      const warehouseIds = Array.from(new Set(putawayBinUnits.map((u) => u.warehouseId)));
+      const incompleteOrders: typeof candidateQueueOrders = [];
+
+      // Pass 1: Complete orders first across all Famco stores
+      for (const order of candidateQueueOrders) {
+        const activeLines = order.lines.filter(
+          (l) => l.status !== WmsFulfillmentLineStatus.CANCELED && l.quantityRequired > 0,
+        );
+        if (activeLines.length === 0) {
+          continue;
+        }
+
+        let fullWarehouseId: string | null = null;
+        for (const whId of warehouseIds) {
+          const canFulfillAll = activeLines.every(
+            (l) =>
+              availableFor(whId, order.storeId, l.variationId, order.posWarehouseRef)
+              >= l.quantityRequired,
+          );
+          if (canFulfillAll) {
+            fullWarehouseId = whId;
+            break;
+          }
+        }
+
+        if (!fullWarehouseId) {
+          incompleteOrders.push(order);
+          continue;
+        }
+
+        let orderTotal = 0;
+        for (const line of activeLines) {
+          const allocKey = buildAllocKey(fullWarehouseId, order.storeId, line.variationId);
+          virtualUsedByAllocKey.set(
+            allocKey,
+            (virtualUsedByAllocKey.get(allocKey) ?? 0) + line.quantityRequired,
+          );
+          orderTotal += line.quantityRequired;
+          await prisma.wmsFulfillmentLine.update({
+            where: { id: line.id },
+            data: {
+              quantityAllocated: line.quantityRequired,
+              quantityPicked: 0,
+              status: WmsFulfillmentLineStatus.READY,
+              issueReason: null,
+            },
+          });
+        }
+
+        await prisma.wmsFulfillmentOrder.update({
+          where: { id: order.id },
+          data: {
+            warehouseId: null,
+            totalQuantity: orderTotal,
+            allocatedQuantity: orderTotal,
+            pickedQuantity: 0,
+            status: WmsFulfillmentOrderStatus.READY,
+            issueReason: null,
+            lastSyncedAt: now,
+          },
+        });
+      }
+
+      // Pass 2: Partial / Restocking orders
+      for (const order of incompleteOrders) {
+        const activeLines = order.lines.filter(
+          (l) => l.status !== WmsFulfillmentLineStatus.CANCELED && l.quantityRequired > 0,
+        );
+        if (activeLines.length === 0) {
+          continue;
+        }
+
+        let bestWarehouseId: string | null = warehouseIds[0] ?? null;
+        let bestAllocTotal = -1;
+        for (const whId of warehouseIds) {
+          const allocSum = activeLines.reduce(
+            (sum, l) =>
+              sum
+              + Math.min(
+                availableFor(whId, order.storeId, l.variationId, order.posWarehouseRef),
+                l.quantityRequired,
+              ),
+            0,
+          );
+          if (allocSum > bestAllocTotal) {
+            bestAllocTotal = allocSum;
+            bestWarehouseId = whId;
+          }
+        }
+
+        let orderTotal = 0;
+        let orderAlloc = 0;
+        for (const line of activeLines) {
+          const avail = bestWarehouseId
+            ? availableFor(bestWarehouseId, order.storeId, line.variationId, order.posWarehouseRef)
+            : 0;
+          const alloc = Math.min(avail, line.quantityRequired);
+          if (bestWarehouseId && alloc > 0) {
+            const allocKey = buildAllocKey(bestWarehouseId, order.storeId, line.variationId);
+            virtualUsedByAllocKey.set(allocKey, (virtualUsedByAllocKey.get(allocKey) ?? 0) + alloc);
+          }
+          orderTotal += line.quantityRequired;
+          orderAlloc += alloc;
+          const missing = Math.max(line.quantityRequired - avail, 0);
+          const lineStatus =
+            alloc >= line.quantityRequired
+              ? WmsFulfillmentLineStatus.READY
+              : alloc > 0
+                ? WmsFulfillmentLineStatus.PARTIAL
+                : WmsFulfillmentLineStatus.RESTOCKING;
+          await prisma.wmsFulfillmentLine.update({
+            where: { id: line.id },
+            data: {
+              quantityAllocated: alloc,
+              quantityPicked: 0,
+              status: lineStatus,
+              issueReason:
+                lineStatus === WmsFulfillmentLineStatus.READY
+                  ? 'Stock is available for this item, but the complete order cannot be fulfilled yet.'
+                  : avail <= 0
+                    ? `Needs ${line.quantityRequired} unit${line.quantityRequired === 1 ? '' : 's'} in putaway bin inventory.`
+                    : `${avail} of ${line.quantityRequired} required unit${line.quantityRequired === 1 ? '' : 's'} available in the selected warehouse; needs ${missing} more.`,
+            },
+          });
+        }
+
+        await prisma.wmsFulfillmentOrder.update({
+          where: { id: order.id },
+          data: {
+            warehouseId: null,
+            totalQuantity: orderTotal,
+            allocatedQuantity: orderAlloc,
+            pickedQuantity: 0,
+            status:
+              orderAlloc > 0
+                ? WmsFulfillmentOrderStatus.PARTIAL
+                : WmsFulfillmentOrderStatus.RESTOCKING,
+            issueReason: null,
+            lastSyncedAt: now,
+          },
+        });
+      }
+
+      const queueStatsAfter = await prisma.wmsFulfillmentOrder.groupBy({
+        by: ['status'],
+        where: {
+          tenantId: tenant.id,
+          assignmentMode: WmsFulfillmentAssignmentMode.BASKET_DEMAND,
+          basketId: null,
+          status: {
+            in: [
+              WmsFulfillmentOrderStatus.READY,
+              WmsFulfillmentOrderStatus.RESTOCKING,
+              WmsFulfillmentOrderStatus.PARTIAL,
+            ],
+          },
+          posOrder: {
+            is: {
+              status: 1,
+              isVoid: false,
+            },
+          },
+        },
+        _count: { _all: true },
+      });
+
+      console.log(
+        '[FAMCO_POOL_RECONCILE]',
+        JSON.stringify({
+          tenantId: tenant.id,
+          tenantName: tenant.name,
+          storeCount: tenant.posStores.length,
+          existingPooledProfileCount,
+          equivalenceRowCount,
+          storeTransferItemCount,
+          backfilledPoolGroupCount,
+          activePoolGroupCount: activeMembersByGroup.size,
+          pooledProfileCount,
+          putawayBinUnitCount: putawayBinUnits.length,
+          evaluatedQueueOrderCount: candidateQueueOrders.length,
+          queueStatsBefore,
+          queueStatsAfter,
+        }),
+      );
+    }
+  } catch (err: any) {
+    console.error(
+      'Warning during Famco shared stock pool reconciliation:',
+      err?.message || err,
+    );
+  }
+}
+
 async function main() {
   console.log('Starting database seed...');
   await ensureSuperAdmin();
@@ -5677,6 +6329,7 @@ async function main() {
   await backfillAdSpendStoreAndTeamAttribution();
   await backfill2026OrderCogsAndReports();
   await reconcileToniosWmsFulfillmentQueue();
+  await reconcileFamcoSharedStockPoolsAndQueue();
   await diagnoseErpFreshness();
   console.log('Seed completed successfully!');
 }

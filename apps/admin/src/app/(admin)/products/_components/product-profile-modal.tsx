@@ -1,9 +1,12 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { Link2, Trash2 } from 'lucide-react';
 import { WmsModal } from '../../_components/wms-modal';
+import { WmsSearchableSelect } from '../../_components/wms-searchable-select';
 import type {
   UpdateWmsProductProfileInput,
+  WmsProductPoolCandidateOption,
   WmsProductProfileRecord,
   WmsProductsOverviewResponse,
   WmsProductProfileStatus,
@@ -13,6 +16,7 @@ type ProductProfileModalProps = {
   open: boolean;
   profile: WmsProductProfileRecord | null;
   locationOptions: WmsProductsOverviewResponse['locationOptions'];
+  poolCandidateOptions?: WmsProductPoolCandidateOption[];
   canEditProfile: boolean;
   isSaving: boolean;
   onClose: () => void;
@@ -30,6 +34,7 @@ type ProductProfileModalFormState = {
   inhouseUnitCost: string;
   supplierUnitCost: string;
   notes: string;
+  linkedProfileIds: string[];
 };
 
 type LocationOption = {
@@ -60,10 +65,15 @@ function toOptionalNumber(value: string) {
   return parsed;
 }
 
+function normalizeMatchToken(value: string | null | undefined) {
+  return value?.trim().toLowerCase() ?? '';
+}
+
 export function ProductProfileModal({
   open,
   profile,
   locationOptions,
+  poolCandidateOptions = [],
   canEditProfile,
   isSaving,
   onClose,
@@ -82,6 +92,7 @@ export function ProductProfileModal({
     inhouseUnitCost: toInputCost(profile?.inhouseUnitCost),
     supplierUnitCost: toInputCost(profile?.supplierUnitCost),
     notes: profile?.notes ?? '',
+    linkedProfileIds: (profile?.linkedProfiles ?? []).map((peer) => peer.profileId),
   });
 
   useEffect(() => {
@@ -96,14 +107,120 @@ export function ProductProfileModal({
       inhouseUnitCost: toInputCost(profile?.inhouseUnitCost),
       supplierUnitCost: toInputCost(profile?.supplierUnitCost),
       notes: profile?.notes ?? '',
+      linkedProfileIds: (profile?.linkedProfiles ?? []).map((peer) => peer.profileId),
     });
   }, [profile]);
+
+  const candidateById = useMemo(() => {
+    const map = new Map<string, WmsProductPoolCandidateOption>();
+    for (const candidate of poolCandidateOptions) {
+      map.set(candidate.profileId, candidate);
+    }
+    for (const peer of profile?.linkedProfiles ?? []) {
+      if (!map.has(peer.profileId)) {
+        map.set(peer.profileId, {
+          ...peer,
+          stockPoolGroupId: profile?.stockPoolGroupId ?? null,
+        });
+      }
+    }
+    return map;
+  }, [poolCandidateOptions, profile?.linkedProfiles, profile?.stockPoolGroupId]);
+
+  const selectedLinkedCandidates = useMemo(
+    () =>
+      formState.linkedProfileIds
+        .map((id) => candidateById.get(id))
+        .filter((item): item is WmsProductPoolCandidateOption => Boolean(item)),
+    [candidateById, formState.linkedProfileIds],
+  );
+
+  const availablePoolSelectOptions = useMemo(() => {
+    if (!profile?.profileId) {
+      return [];
+    }
+    const selectedSet = new Set<string>([profile.profileId, ...formState.linkedProfileIds]);
+    const selfCustomId = normalizeMatchToken(profile.productCustomId);
+    const selfDisplayId = normalizeMatchToken(profile.variationDisplayId);
+    const selfName = normalizeMatchToken(profile.name);
+
+    return poolCandidateOptions
+      .filter((candidate) => !selectedSet.has(candidate.profileId))
+      .map((candidate) => {
+        const candCustomId = normalizeMatchToken(candidate.productCustomId);
+        const candDisplayId = normalizeMatchToken(candidate.variationDisplayId);
+        const candName = normalizeMatchToken(candidate.name);
+        const isSuggested = Boolean(
+          (selfCustomId && candCustomId === selfCustomId)
+          || (selfDisplayId && candDisplayId === selfDisplayId)
+          || (selfName && candName === selfName),
+        );
+        const identity = candidate.variationDisplayId ?? candidate.productCustomId ?? candidate.variationId;
+        return {
+          candidate,
+          isSuggested,
+          option: {
+            value: candidate.profileId,
+            label: `${candidate.storeName} · ${candidate.name} · ${identity}`,
+            hint: isSuggested
+              ? `Suggested · ${candidate.directBinUnits} in bins`
+              : `${candidate.directBinUnits} in bins`,
+          },
+        };
+      })
+      .sort((left, right) => {
+        if (left.isSuggested !== right.isSuggested) {
+          return left.isSuggested ? -1 : 1;
+        }
+        if (right.candidate.directBinUnits !== left.candidate.directBinUnits) {
+          return right.candidate.directBinUnits - left.candidate.directBinUnits;
+        }
+        return left.option.label.localeCompare(right.option.label);
+      })
+      .map((entry) => entry.option);
+  }, [formState.linkedProfileIds, poolCandidateOptions, profile]);
+
+  const pooledBinPreviewTotal = useMemo(() => {
+    const ownDirect = profile?.directBinUnits ?? 0;
+    const peersDirect = selectedLinkedCandidates.reduce((sum, peer) => sum + peer.directBinUnits, 0);
+    return ownDirect + peersDirect;
+  }, [profile?.directBinUnits, selectedLinkedCandidates]);
 
   if (!open || !profile) {
     return null;
   }
 
   const inputsDisabled = isSaving || !canEditProfile;
+
+  const handleAddLinkedProfile = (profileIdToAdd: string) => {
+    if (!profileIdToAdd) {
+      return;
+    }
+    const picked = candidateById.get(profileIdToAdd);
+    const groupPeerIds =
+      picked?.stockPoolGroupId
+        ? poolCandidateOptions
+            .filter(
+              (candidate) =>
+                candidate.stockPoolGroupId === picked.stockPoolGroupId
+                && candidate.profileId !== profile.profileId,
+            )
+            .map((candidate) => candidate.profileId)
+        : [profileIdToAdd];
+    setFormState((current) => ({
+      ...current,
+      linkedProfileIds: Array.from(
+        new Set([...current.linkedProfileIds, profileIdToAdd, ...groupPeerIds]),
+      ),
+    }));
+  };
+
+  const handleRemoveLinkedProfile = (profileIdToRemove: string) => {
+    setFormState((current) => ({
+      ...current,
+      linkedProfileIds: current.linkedProfileIds.filter((id) => id !== profileIdToRemove),
+    }));
+  };
 
   const footer = (
     <div className="flex items-center justify-end gap-3">
@@ -123,6 +240,7 @@ export function ProductProfileModal({
             inhouseUnitCost: toOptionalNumber(formState.inhouseUnitCost),
             supplierUnitCost: toOptionalNumber(formState.supplierUnitCost),
             notes: formState.notes?.trim() ? formState.notes.trim() : null,
+            linkedProfileIds: formState.linkedProfileIds,
           });
         }}
         className="btn btn-md btn-primary"
@@ -297,6 +415,72 @@ export function ProductProfileModal({
               </span>
             </span>
           </label>
+
+          <div className="rounded-2xl border border-[#dce4ea] bg-[#fbfcfc] p-4 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Link2 className="h-4 w-4 text-[#235c42]" />
+                <span className="text-sm font-semibold text-primary">
+                  Shared Stock Pool (Linked Variants)
+                </span>
+              </div>
+              <span className="inline-flex items-center rounded-full border border-[#b9decb] bg-[#ecf8f2] px-2.5 py-0.5 text-[11px] font-semibold tabular-nums text-[#235c42]">
+                {pooledBinPreviewTotal.toLocaleString()} pooled in bins ({(profile.directBinUnits ?? 0).toLocaleString()} direct)
+              </span>
+            </div>
+
+            <p className="text-xs leading-5 text-[#6f8290]">
+              Link sister-store or legacy variations that share the same physical bin stock. Orders on any linked variant become Ready immediately and auto-assign scanned units on pick.
+            </p>
+
+            {selectedLinkedCandidates.length > 0 ? (
+              <div className="space-y-2">
+                {selectedLinkedCandidates.map((peer) => (
+                  <div
+                    key={peer.profileId}
+                    className="flex items-center justify-between gap-3 rounded-xl border border-[#e3ebef] bg-white px-3 py-2"
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate text-[12.5px] font-semibold text-primary">
+                        {peer.storeName} · {peer.name}
+                      </p>
+                      <p className="truncate text-[11px] text-[#6d8291]">
+                        {peer.variationDisplayId ?? peer.productCustomId ?? peer.variationId} · {peer.directBinUnits.toLocaleString()} in bins
+                      </p>
+                    </div>
+                    {!inputsDisabled ? (
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveLinkedProfile(peer.profileId)}
+                        className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-[#e5edf2] text-[#7a8f9e] transition hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                        title="Unlink from shared stock pool"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="rounded-xl border border-dashed border-[#d7e0e7] bg-white px-3 py-2.5 text-xs text-[#758997]">
+                Not linked to any shared stock pool yet.
+              </div>
+            )}
+
+            {!inputsDisabled && availablePoolSelectOptions.length > 0 ? (
+              <WmsSearchableSelect
+                label="Add variant"
+                value=""
+                onChange={handleAddLinkedProfile}
+                options={availablePoolSelectOptions}
+                allLabel="Select sister-store or legacy variant to link..."
+                placeholder="Search store, product name, or variation ID..."
+                clearable={false}
+                triggerClassName="h-10 w-full bg-white"
+                popoverMinWidth={420}
+              />
+            ) : null}
+          </div>
 
           <label className="space-y-2">
             <span className="form-label">Notes</span>

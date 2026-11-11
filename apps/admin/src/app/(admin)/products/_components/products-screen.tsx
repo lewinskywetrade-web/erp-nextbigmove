@@ -153,6 +153,7 @@ export function ProductsScreen() {
         open={controller.profileModal.open}
         profile={controller.profileModal.profile}
         locationOptions={controller.overview?.locationOptions ?? []}
+        poolCandidateOptions={controller.overview?.poolCandidateOptions ?? []}
         canEditProfile={controller.canEditProfile}
         isSaving={controller.isSavingProfile}
         onClose={controller.closeProfileModal}

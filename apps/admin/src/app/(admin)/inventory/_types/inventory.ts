@@ -156,6 +156,7 @@ export type WmsInventoryStoreTransferOptionsResponse = {
     productCustomId: string | null;
     name: string;
     label: string;
+    alreadyPooled?: boolean;
   }>;
   suggestion: {
     profileId: string;
@@ -294,6 +295,7 @@ export type CreateWmsInventoryStoreTransferInput = {
   unitIds: string[];
   targetStoreId: string;
   targetProfileId: string;
+  shareStockPool?: boolean;
   notes?: string;
 };
 

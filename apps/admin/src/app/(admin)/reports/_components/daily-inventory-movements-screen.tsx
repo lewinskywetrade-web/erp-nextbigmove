@@ -945,14 +945,14 @@ export function DailyInventoryMovementsScreen() {
                 Client Recipients:{' '}
                 <strong className="text-primary">
                   {emailRecipientsText.trim() ||
-                    selectedSubscription?.effectiveRecipients.join(', ') ||
+                    activeSubscription?.effectiveRecipients.join(', ') ||
                     'Client default email'}
                 </strong>
               </span>
               <a
                 href={`https://mail.google.com/mail/?view=cm&fs=1&to=${encodeURIComponent(
                   emailRecipientsText.trim() ||
-                    selectedSubscription?.effectiveRecipients.join(',') ||
+                    activeSubscription?.effectiveRecipients.join(',') ||
                     '',
                 )}&su=${encodeURIComponent(previewHtml.subject)}`}
                 target="_blank"

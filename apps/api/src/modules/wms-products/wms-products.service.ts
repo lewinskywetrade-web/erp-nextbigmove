@@ -3,17 +3,26 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import {
   Prisma,
   TenantStatus,
+  WmsBasketUnitStatus,
+  WmsInventoryUnitStatus,
   WmsLocationKind,
+  WmsPickReservationStatus,
   WmsProductProfileStatus,
 } from '@prisma/client';
 import { ClsService } from 'nestjs-cls';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { IntegrationService } from '../integrations/integration.service';
 import { WmsCogsSyncService, WmsCogsSyncResult } from '../product-cogs/wms-cogs-sync.service';
+import { WmsFulfillmentSyncService } from '../wms-fulfillment/wms-fulfillment-sync.service';
+import {
+  extractVariationDisplayIdFromSnapshot,
+  syncProfileStockPoolLinksTx,
+} from '../wms-fulfillment/wms-stock-pool.util';
 import { GetWmsProductsOverviewDto } from './dto/get-wms-products-overview.dto';
 import { GetWmsVariationIntegrityAuditDto } from './dto/get-wms-variation-integrity-audit.dto';
 import { UpdateWmsProductProfileDto } from './dto/update-wms-product-profile.dto';
@@ -93,6 +102,25 @@ type AuditCanonicalVariationProduct = {
   };
 };
 
+type LinkedStockPoolPeerSummary = {
+  profileId: string;
+  storeId: string;
+  storeName: string;
+  name: string;
+  productId: string;
+  variationId: string;
+  variationDisplayId: string | null;
+  productCustomId: string | null;
+  directBinUnits: number;
+};
+
+type ProfileStockPoolMetadata = {
+  stockPoolGroupId: string | null;
+  directBinUnits: number;
+  pooledBinUnits: number;
+  linkedProfiles: LinkedStockPoolPeerSummary[];
+};
+
 @Injectable()
 export class WmsProductsService {
   constructor(
@@ -100,6 +128,7 @@ export class WmsProductsService {
     private readonly cls: ClsService,
     private readonly integrationService: IntegrationService,
     private readonly cogsSync: WmsCogsSyncService,
+    @Optional() private readonly wmsFulfillmentSyncService?: WmsFulfillmentSyncService,
   ) {}
 
   async getOverview(query: GetWmsProductsOverviewDto) {
@@ -128,12 +157,13 @@ export class WmsProductsService {
           activePosWarehouseId: null,
         },
         locationOptions: [],
+        poolCandidateOptions: [],
         products: [],
       };
     }
 
     if (scope.activeTenantId) {
-      await this.ensureDefaultProfiles(scope.activeTenantId, query.storeId);
+      await this.ensureDefaultProfiles(scope.activeTenantId);
     } else if (isAllTenantScope) {
       for (const tenant of scope.tenants) {
         await this.ensureDefaultProfiles(tenant.id, query.storeId);
@@ -218,104 +248,228 @@ export class WmsProductsService {
         : {}),
     };
 
-    const [profileCandidates, productCandidates, warehouseCounts, locationOptions] =
-      await Promise.all([
-        this.prisma.wmsProductProfile.findMany({
-          where,
-          include: {
-            posProduct: {
-              select: {
-                id: true,
-                productId: true,
-                variationId: true,
-                warehouseId: true,
-                customId: true,
-                productSnapshot: true,
-                name: true,
-                retailPrice: true,
-                createdAt: true,
-                updatedAt: true,
-                store: {
-                  select: {
-                    id: true,
-                    name: true,
-                    shopName: true,
-                    tenant: {
-                      select: {
-                        name: true,
-                      },
+    const now = new Date();
+    const [
+      profileCandidates,
+      productCandidates,
+      warehouseCounts,
+      locationOptions,
+      tenantPoolProfilesRaw,
+      binUnitGroups,
+    ] = await Promise.all([
+      this.prisma.wmsProductProfile.findMany({
+        where,
+        include: {
+          posProduct: {
+            select: {
+              id: true,
+              productId: true,
+              variationId: true,
+              warehouseId: true,
+              customId: true,
+              productSnapshot: true,
+              name: true,
+              retailPrice: true,
+              createdAt: true,
+              updatedAt: true,
+              store: {
+                select: {
+                  id: true,
+                  name: true,
+                  shopName: true,
+                  tenant: {
+                    select: {
+                      name: true,
                     },
                   },
                 },
               },
             },
           },
-          orderBy: [{ updatedAt: 'desc' }],
-        }),
-        query.status
-          ? Promise.resolve([] as NonStockableProductRecord[])
-          : this.prisma.posProduct.findMany({
-              where: productCandidateWhere,
-              select: {
-                id: true,
-                productId: true,
-                variationId: true,
-                warehouseId: true,
-                customId: true,
-                productSnapshot: true,
-                name: true,
-                retailPrice: true,
-                createdAt: true,
-                updatedAt: true,
-                store: {
-                  select: {
-                    id: true,
-                    name: true,
-                    shopName: true,
-                    tenant: {
-                      select: {
-                        name: true,
+        },
+        orderBy: [{ updatedAt: 'desc' }],
+      }),
+      query.status
+        ? Promise.resolve([] as NonStockableProductRecord[])
+        : this.prisma.posProduct.findMany({
+            where: productCandidateWhere,
+            select: {
+              id: true,
+              productId: true,
+              variationId: true,
+              warehouseId: true,
+              customId: true,
+              productSnapshot: true,
+              name: true,
+              retailPrice: true,
+              createdAt: true,
+              updatedAt: true,
+              store: {
+                select: {
+                  id: true,
+                  name: true,
+                  shopName: true,
+                  tenant: {
+                    select: {
+                      name: true,
+                    },
+                  },
+                },
+              },
+            },
+            orderBy: [{ updatedAt: 'desc' }],
+          }),
+      activeStoreId
+        ? this.prisma.posProduct.groupBy({
+            by: ['warehouseId'],
+            where: {
+              storeId: activeStoreId,
+            },
+            _count: {
+              _all: true,
+            },
+          })
+        : Promise.resolve([] as Array<{ warehouseId: string | null; _count: { _all: number } }>),
+      this.prisma.wmsLocation.findMany({
+        where: {
+          isActive: true,
+          kind: {
+            in: [...PRODUCT_SECTION_LOCATION_KINDS],
+          },
+        },
+        select: {
+          id: true,
+          code: true,
+          name: true,
+          kind: true,
+          warehouse: {
+            select: {
+              id: true,
+              code: true,
+              name: true,
+            },
+          },
+        },
+        orderBy: [{ warehouse: { code: 'asc' } }, { code: 'asc' }],
+      }),
+      scope.activeTenantId
+        ? this.prisma.wmsProductProfile.findMany({
+            where: {
+              tenantId: scope.activeTenantId,
+              status: {
+                not: WmsProductProfileStatus.ARCHIVED,
+              },
+            },
+            select: {
+              id: true,
+              tenantId: true,
+              storeId: true,
+              productId: true,
+              variationId: true,
+              stockPoolGroupId: true,
+              posProduct: {
+                select: {
+                  productId: true,
+                  variationId: true,
+                  customId: true,
+                  productSnapshot: true,
+                  name: true,
+                  store: {
+                    select: {
+                      id: true,
+                      name: true,
+                      shopName: true,
+                      tenant: {
+                        select: {
+                          name: true,
+                        },
                       },
                     },
                   },
                 },
               },
-              orderBy: [{ updatedAt: 'desc' }],
-            }),
-        activeStoreId
-          ? this.prisma.posProduct.groupBy({
-              by: ['warehouseId'],
-              where: {
-                storeId: activeStoreId,
-              },
-              _count: {
-                _all: true,
-              },
-            })
-          : Promise.resolve([] as Array<{ warehouseId: string | null; _count: { _all: number } }>),
-        this.prisma.wmsLocation.findMany({
-          where: {
-            isActive: true,
-            kind: {
-              in: [...PRODUCT_SECTION_LOCATION_KINDS],
             },
-          },
-          select: {
-            id: true,
-            code: true,
-            name: true,
-            kind: true,
-            warehouse: {
-              select: {
-                id: true,
-                code: true,
-                name: true,
+            orderBy: [{ updatedAt: 'desc' }],
+          })
+        : this.prisma.wmsProductProfile.findMany({
+            where: {
+              stockPoolGroupId: {
+                not: null,
+              },
+              status: {
+                not: WmsProductProfileStatus.ARCHIVED,
               },
             },
-          },
-          orderBy: [{ warehouse: { code: 'asc' } }, { code: 'asc' }],
-        }),
-      ]);
+            select: {
+              id: true,
+              tenantId: true,
+              storeId: true,
+              productId: true,
+              variationId: true,
+              stockPoolGroupId: true,
+              posProduct: {
+                select: {
+                  productId: true,
+                  variationId: true,
+                  customId: true,
+                  productSnapshot: true,
+                  name: true,
+                  store: {
+                    select: {
+                      id: true,
+                      name: true,
+                      shopName: true,
+                      tenant: {
+                        select: {
+                          name: true,
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          }),
+      this.prisma.wmsInventoryUnit?.groupBy
+        ? this.prisma.wmsInventoryUnit.groupBy({
+            by: ['storeId', 'variationId'],
+            where: {
+              ...tenantWhere,
+              status: WmsInventoryUnitStatus.PUTAWAY,
+              OR: [
+                { expirationDate: null },
+                { expirationDate: { gt: now } },
+              ],
+              currentLocationId: {
+                not: null,
+              },
+              currentLocation: {
+                is: {
+                  kind: WmsLocationKind.BIN,
+                  isActive: true,
+                },
+              },
+              pickReservations: {
+                none: {
+                  status: {
+                    in: [WmsPickReservationStatus.RESERVED, WmsPickReservationStatus.PICKED],
+                  },
+                },
+              },
+              basketUnits: {
+                none: {
+                  status: {
+                    in: [WmsBasketUnitStatus.PICKED, WmsBasketUnitStatus.PACKED],
+                  },
+                },
+              },
+            },
+            _count: {
+              _all: true,
+            },
+          })
+        : Promise.resolve([] as Array<{ storeId: string; variationId: string; _count: { _all: number } }>),
+    ]);
 
     const profiles = profileCandidates.filter(
       (profile) =>
@@ -391,8 +545,104 @@ export class WmsProductsService {
         .map((record) => [record.warehouseId as string, record._count._all]),
     );
 
+    const directBinCountByStoreVariation = new Map<string, number>();
+    for (const group of binUnitGroups) {
+      directBinCountByStoreVariation.set(`${group.storeId}::${group.variationId}`, group._count._all);
+    }
+
+    const stockableTenantPoolProfiles = tenantPoolProfilesRaw.filter(
+      (candidate) =>
+        this.isStockableVariation(candidate.posProduct.productId, candidate.posProduct.variationId)
+        && this.isStockableVariation(candidate.productId, candidate.variationId),
+    );
+    const rawPoolGroups = new Map<string, LinkedStockPoolPeerSummary[]>();
+    for (const candidate of stockableTenantPoolProfiles) {
+      if (!candidate.stockPoolGroupId) {
+        continue;
+      }
+      const groupKey = `${candidate.tenantId}::${candidate.stockPoolGroupId}`;
+      const list = rawPoolGroups.get(groupKey) ?? [];
+      const candidateStoreName = candidate.posProduct.store.shopName || candidate.posProduct.store.name;
+      list.push({
+        profileId: candidate.id,
+        storeId: candidate.storeId,
+        storeName: isAllTenantScope
+          ? `${candidate.posProduct.store.tenant.name} · ${candidateStoreName}`
+          : candidateStoreName,
+        name: candidate.posProduct.name,
+        productId: candidate.productId,
+        variationId: candidate.variationId,
+        variationDisplayId: extractVariationDisplayIdFromSnapshot(candidate.posProduct.productSnapshot),
+        productCustomId: candidate.posProduct.customId,
+        directBinUnits:
+          directBinCountByStoreVariation.get(`${candidate.storeId}::${candidate.variationId}`) ?? 0,
+      });
+      rawPoolGroups.set(groupKey, list);
+    }
+
+    const activePoolGroups = new Map<string, LinkedStockPoolPeerSummary[]>();
+    for (const [groupKey, members] of Array.from(rawPoolGroups.entries())) {
+      if (members.length >= 2) {
+        activePoolGroups.set(groupKey, members);
+      }
+    }
+
+    const buildProfilePoolMetadata = (profile: ProductProfileRecord): ProfileStockPoolMetadata => {
+      const directBinUnits =
+        directBinCountByStoreVariation.get(`${profile.storeId}::${profile.variationId}`) ?? 0;
+      const groupKey = profile.stockPoolGroupId
+        ? `${profile.tenantId}::${profile.stockPoolGroupId}`
+        : null;
+      const groupMembers = groupKey ? (activePoolGroups.get(groupKey) ?? []) : [];
+      if (groupMembers.length < 2) {
+        return {
+          stockPoolGroupId: null,
+          directBinUnits,
+          pooledBinUnits: directBinUnits,
+          linkedProfiles: [],
+        };
+      }
+      const pooledBinUnits = groupMembers.reduce((sum, member) => sum + member.directBinUnits, 0);
+      return {
+        stockPoolGroupId: profile.stockPoolGroupId ?? null,
+        directBinUnits,
+        pooledBinUnits,
+        linkedProfiles: groupMembers.filter((member) => member.profileId !== profile.id),
+      };
+    };
+
+    const poolCandidateOptions = scope.activeTenantId
+      ? stockableTenantPoolProfiles.map((candidate) => {
+          const groupKey = candidate.stockPoolGroupId
+            ? `${candidate.tenantId}::${candidate.stockPoolGroupId}`
+            : null;
+          const isPooled = Boolean(groupKey && activePoolGroups.has(groupKey));
+          return {
+            profileId: candidate.id,
+            storeId: candidate.storeId,
+            storeName: candidate.posProduct.store.shopName || candidate.posProduct.store.name,
+            name: candidate.posProduct.name,
+            productId: candidate.productId,
+            variationId: candidate.variationId,
+            variationDisplayId: extractVariationDisplayIdFromSnapshot(candidate.posProduct.productSnapshot),
+            productCustomId: candidate.posProduct.customId,
+            stockPoolGroupId: isPooled ? candidate.stockPoolGroupId : null,
+            directBinUnits:
+              directBinCountByStoreVariation.get(`${candidate.storeId}::${candidate.variationId}`) ?? 0,
+          };
+        })
+      : [];
+
     const products = [
-      ...profiles.map((profile) => this.mapProfile(profile, warehouseMap, locationMap, isAllTenantScope)),
+      ...profiles.map((profile) =>
+        this.mapProfile(
+          profile,
+          warehouseMap,
+          locationMap,
+          isAllTenantScope,
+          buildProfilePoolMetadata(profile),
+        ),
+      ),
       ...nonStockableProducts.map((product) =>
         this.mapNonStockableProduct(product, warehouseMap, isAllTenantScope),
       ),
@@ -439,6 +689,7 @@ export class WmsProductsService {
         label: `${location.warehouse.code} · ${location.code} · ${location.name}`,
         warehouse: location.warehouse,
       })),
+      poolCandidateOptions,
       products,
     };
   }
@@ -783,6 +1034,7 @@ export class WmsProductsService {
     await this.validateLocationReference(preferredLocationId ?? null, PRODUCT_SECTION_LOCATION_KINDS);
 
     let cogsSync: WmsCogsSyncResult | undefined;
+    let poolSyncAffectedScopes: Array<{ storeId: string; variationId: string }> = [];
     const updated = await this.prisma.$transaction(async tx => {
       const prepared = body.inhouseUnitCost !== undefined ? await this.cogsSync.prepare(tx, scope.activeTenantId!, [existing.id]) : null;
       if (prepared) this.cogsSync.assertSourceProfiles(prepared);
@@ -834,12 +1086,41 @@ export class WmsProductsService {
       });
       if (prepared) cogsSync = await this.cogsSync.syncAfter(tx, prepared, { source: 'WMS_PROFILE_EDIT', sourceRef: existing.id,
         actorId: (this.cls.get('userId') as string | undefined) ?? null });
-      // Fallback may have filled a blank/zero inhouse cost in the same transaction.
-      return prepared?.enabled ? tx.wmsProductProfile.findUniqueOrThrow({ where: { id: profile.id, tenantId: scope.activeTenantId!, storeId: existing.storeId, posProductId: existing.posProductId }, include: { posProduct: { select: {
-        id: true, productId: true, variationId: true, warehouseId: true, customId: true, productSnapshot: true, name: true,
-        retailPrice: true, createdAt: true, updatedAt: true, store: { select: { id: true, name: true, shopName: true, tenant: { select: { name: true } } } },
-      } } } }) : profile;
+
+      if (body.linkedProfileIds !== undefined) {
+        const poolSyncResult = await syncProfileStockPoolLinksTx(tx, {
+          tenantId: scope.activeTenantId!,
+          profileId: existing.id,
+          linkedProfileIds: body.linkedProfileIds,
+        });
+        poolSyncAffectedScopes = poolSyncResult.affectedScopes;
+      }
+
+      // Fallback may have filled a blank/zero inhouse cost or updated stockPoolGroupId in the same transaction.
+      return (prepared?.enabled || body.linkedProfileIds !== undefined)
+        ? tx.wmsProductProfile.findUniqueOrThrow({ where: { id: profile.id, tenantId: scope.activeTenantId!, storeId: existing.storeId, posProductId: existing.posProductId }, include: { posProduct: { select: {
+            id: true, productId: true, variationId: true, warehouseId: true, customId: true, productSnapshot: true, name: true,
+            retailPrice: true, createdAt: true, updatedAt: true, store: { select: { id: true, name: true, shopName: true, tenant: { select: { name: true } } } },
+          } } } })
+        : profile;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted, maxWait: 10000, timeout: 30000 });
+
+    if (poolSyncAffectedScopes.length > 0 && this.wmsFulfillmentSyncService) {
+      const variationsByStore = new Map<string, Set<string>>();
+      for (const affected of poolSyncAffectedScopes) {
+        const set = variationsByStore.get(affected.storeId) ?? new Set<string>();
+        set.add(affected.variationId);
+        variationsByStore.set(affected.storeId, set);
+      }
+      for (const [storeId, variationSet] of Array.from(variationsByStore.entries())) {
+        await this.wmsFulfillmentSyncService.refreshDemandQueueForScope({
+          tenantId: scope.activeTenantId,
+          storeId,
+          variationIds: Array.from(variationSet),
+          limit: null,
+        });
+      }
+    }
 
     const locationIds = [updated.preferredLocationId, updated.pickLocationId].filter(Boolean) as string[];
     const locations = locationIds.length
@@ -1107,6 +1388,7 @@ export class WmsProductsService {
       }
     >,
     includeTenantInStoreName = false,
+    poolMetadata?: ProfileStockPoolMetadata,
   ) {
     const posWarehouse = profile.posWarehouseRef ? warehouseMap.get(profile.posWarehouseRef) ?? null : null;
     const snapshot = profile.posProduct.productSnapshot as
@@ -1144,6 +1426,10 @@ export class WmsProductsService {
       retailPrice: profile.posProduct.retailPrice,
       inhouseUnitCost: profile.inhouseUnitCost,
       supplierUnitCost: profile.supplierUnitCost,
+      stockPoolGroupId: poolMetadata?.stockPoolGroupId ?? profile.stockPoolGroupId ?? null,
+      directBinUnits: poolMetadata?.directBinUnits ?? 0,
+      pooledBinUnits: poolMetadata?.pooledBinUnits ?? 0,
+      linkedProfiles: poolMetadata?.linkedProfiles ?? [],
       posWarehouse: posWarehouse
         ? {
             id: posWarehouse.id,
@@ -1212,6 +1498,10 @@ export class WmsProductsService {
       retailPrice: product.retailPrice,
       inhouseUnitCost: null,
       supplierUnitCost: null,
+      stockPoolGroupId: null,
+      directBinUnits: 0,
+      pooledBinUnits: 0,
+      linkedProfiles: [],
       posWarehouse: posWarehouse
         ? {
             id: posWarehouse.id,

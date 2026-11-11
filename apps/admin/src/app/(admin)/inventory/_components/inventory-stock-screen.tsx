@@ -225,6 +225,7 @@ export function InventoryStockScreen() {
         options={inventory.storeTransferOptions}
         targetStoreId={inventory.storeTransferModal.targetStoreId}
         targetProfileId={inventory.storeTransferModal.targetProfileId}
+        shareStockPool={inventory.storeTransferModal.shareStockPool}
         notes={inventory.storeTransferModal.notes}
         preview={inventory.storeTransferPreview}
         isLoadingOptions={inventory.isLoadingStoreTransferOptions}
@@ -234,6 +235,7 @@ export function InventoryStockScreen() {
         errorMessage={inventory.storeTransferModal.errorMessage}
         onTargetStoreChange={inventory.setStoreTransferTargetStoreId}
         onTargetProfileChange={inventory.setStoreTransferTargetProfileId}
+        onShareStockPoolChange={inventory.setStoreTransferShareStockPool}
         onNotesChange={inventory.setStoreTransferNotes}
         onSubmit={inventory.submitStoreTransfer}
         onClose={inventory.closeStoreTransferModal}

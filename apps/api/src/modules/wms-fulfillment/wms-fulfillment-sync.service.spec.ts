@@ -611,4 +611,68 @@ describe('WmsFulfillmentSyncService line extraction & ISSUE recovery', () => {
       }),
     }));
   });
+
+  it('expands refreshDemandFulfillmentQueue across linked shared stock pool stores and variations', async () => {
+    const poolGroupId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const findMany = jest.fn<(...args: any[]) => Promise<any[]>>().mockResolvedValue([]);
+    const prisma = {
+      tenant: {
+        findUnique: jest.fn<() => Promise<any>>().mockResolvedValue({
+          wmsFulfillmentGoLiveAt: null,
+        }),
+      },
+      wmsProductProfile: {
+        findMany: jest.fn<() => Promise<any[]>>().mockResolvedValue([
+          {
+            id: 'prof-old',
+            tenantId: 'tenant-famco',
+            storeId: 'store-main',
+            posProductId: 'pos-old',
+            productId: 'prod-old',
+            variationId: 'var-old',
+            posWarehouseRef: 'pos-wh-main',
+            stockPoolGroupId: poolGroupId,
+            posProduct: { name: 'Famco Old', customId: 'FAM-1', productSnapshot: null },
+            store: { name: 'Famco Main', shopName: 'Famco Main' },
+          },
+          {
+            id: 'prof-new',
+            tenantId: 'tenant-famco',
+            storeId: 'store-sister',
+            posProductId: 'pos-new',
+            productId: 'prod-new',
+            variationId: 'var-new',
+            posWarehouseRef: 'pos-wh-sister',
+            stockPoolGroupId: poolGroupId,
+            posProduct: { name: 'Famco Sister', customId: 'FAM-1', productSnapshot: null },
+            store: { name: 'Famco Sister', shopName: 'Famco Sister' },
+          },
+        ]),
+      },
+      wmsFulfillmentOrder: {
+        findMany,
+      },
+    };
+
+    const service = new WmsFulfillmentSyncService(prisma as any, {} as any, {} as any);
+    await (service as any).refreshDemandFulfillmentQueue({
+      tenantId: 'tenant-famco',
+      storeId: 'store-main',
+      variationIds: ['var-old'],
+    });
+
+    expect(findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        tenantId: 'tenant-famco',
+        AND: [
+          {
+            OR: [
+              expect.objectContaining({ storeId: 'store-main' }),
+              expect.objectContaining({ storeId: 'store-sister' }),
+            ],
+          },
+        ],
+      }),
+    }));
+  });
 });

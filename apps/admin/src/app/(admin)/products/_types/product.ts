@@ -13,6 +13,31 @@ export type WmsProductLocationSummary = {
   };
 };
 
+export type WmsProductLinkedPoolPeer = {
+  profileId: string;
+  storeId: string;
+  storeName: string;
+  name: string;
+  productId: string;
+  variationId: string;
+  variationDisplayId: string | null;
+  productCustomId: string | null;
+  directBinUnits: number;
+};
+
+export type WmsProductPoolCandidateOption = {
+  profileId: string;
+  storeId: string;
+  storeName: string;
+  name: string;
+  productId: string;
+  variationId: string;
+  variationDisplayId: string | null;
+  productCustomId: string | null;
+  stockPoolGroupId: string | null;
+  directBinUnits: number;
+};
+
 export type WmsProductProfileRecord = {
   id: string;
   profileId: string | null;
@@ -31,6 +56,10 @@ export type WmsProductProfileRecord = {
   retailPrice: string | null;
   inhouseUnitCost: string | null;
   supplierUnitCost: string | null;
+  stockPoolGroupId?: string | null;
+  directBinUnits?: number;
+  pooledBinUnits?: number;
+  linkedProfiles?: WmsProductLinkedPoolPeer[];
   posWarehouse: {
     id: string;
     warehouseId: string;
@@ -100,6 +129,7 @@ export type WmsProductsOverviewResponse = {
       name: string;
     };
   }>;
+  poolCandidateOptions?: WmsProductPoolCandidateOption[];
   products: WmsProductProfileRecord[];
 };
 
@@ -132,4 +162,5 @@ export type UpdateWmsProductProfileInput = {
   inhouseUnitCost?: number | null;
   supplierUnitCost?: number | null;
   notes?: string | null;
+  linkedProfileIds?: string[];
 };

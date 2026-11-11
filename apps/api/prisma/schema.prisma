@@ -2711,6 +2711,7 @@ model WmsProductProfile {
   productId              String
   variationId            String
   posWarehouseRef        String?
+  stockPoolGroupId       String?                  @db.Uuid
   status                 WmsProductProfileStatus  @default(DEFAULT)
   isSerialized           Boolean                  @default(true)
   preferredLocationId    String?                  @db.Uuid
@@ -2732,6 +2733,7 @@ model WmsProductProfile {
   @@unique([storeId, variationId])
   @@index([tenantId, storeId])
   @@index([tenantId, status])
+  @@index([tenantId, stockPoolGroupId])
   @@index([storeId, posWarehouseRef])
   @@map("wms_product_profiles")
 }

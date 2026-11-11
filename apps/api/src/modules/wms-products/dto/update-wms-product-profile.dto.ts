@@ -1,6 +1,7 @@
 import { WmsProductProfileStatus } from '@prisma/client';
 import { Type } from 'class-transformer';
 import {
+  IsArray,
   IsBoolean,
   IsEnum,
   IsNumber,
@@ -60,4 +61,9 @@ export class UpdateWmsProductProfileDto {
   @IsString()
   @MaxLength(500)
   notes?: string | null;
+
+  @IsOptional()
+  @IsArray()
+  @IsUUID(undefined, { each: true })
+  linkedProfileIds?: string[];
 }

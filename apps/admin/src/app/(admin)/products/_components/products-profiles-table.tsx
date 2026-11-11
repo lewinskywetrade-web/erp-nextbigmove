@@ -42,6 +42,7 @@ export function ProductsProfilesTable({
               <TableHeader>Variation ID</TableHeader>
               <TableHeader>Product ID</TableHeader>
               <TableHeader>Store</TableHeader>
+              <TableHeader>Bin Stock</TableHeader>
               <TableHeader>Status</TableHeader>
               <TableHeader>Serialized</TableHeader>
               <TableHeader>Action</TableHeader>
@@ -52,7 +53,7 @@ export function ProductsProfilesTable({
             {isLoading ? (
               Array.from({ length: 6 }).map((_, rowIndex) => (
                 <tr key={`loading-${rowIndex}`}>
-                  {Array.from({ length: 7 }).map((__, cellIndex) => (
+                  {Array.from({ length: 8 }).map((__, cellIndex) => (
                     <td key={`loading-${rowIndex}-${cellIndex}`} className="px-4 py-3.5">
                       <div className="h-3.5 animate-pulse rounded-full bg-[#eef2f5]" />
                     </td>
@@ -99,6 +100,24 @@ export function ProductsProfilesTable({
                   </td>
                   <td className="px-4 py-3 text-sm text-primary">
                     <span className="block max-w-[180px] truncate">{profile.store.name}</span>
+                  </td>
+                  <td className="whitespace-nowrap px-4 py-3 text-sm">
+                    {!profile.isStockable ? (
+                      <span className="text-[11px] font-medium text-[#8aa0ae]">N/A</span>
+                    ) : (profile.linkedProfiles?.length ?? 0) > 0 ? (
+                      <div className="space-y-0.5">
+                        <span className="inline-flex items-center rounded-full border border-[#b9decb] bg-[#ecf8f2] px-2.5 py-0.5 text-[11px] font-semibold tabular-nums text-[#235c42]">
+                          Shared Pool · {(profile.pooledBinUnits ?? 0).toLocaleString()} in bins
+                        </span>
+                        <p className="text-[11px] text-[#6d8291]">
+                          {(profile.directBinUnits ?? 0).toLocaleString()} direct · {(profile.linkedProfiles?.length ?? 0) + 1} linked
+                        </p>
+                      </div>
+                    ) : (
+                      <span className="font-medium tabular-nums text-[#4d6677]">
+                        {(profile.directBinUnits ?? 0).toLocaleString()} in bins
+                      </span>
+                    )}
                   </td>
                   <td className="whitespace-nowrap px-4 py-3 text-sm">
                     {profile.isStockable && profile.status ? (
@@ -175,7 +194,7 @@ function TableHeader({
 function StateRow({ title, message }: { title: string; message: string }) {
   return (
     <tr>
-      <td colSpan={7} className="px-4 py-16">
+      <td colSpan={8} className="px-4 py-16">
         <div className="mx-auto flex max-w-md flex-col items-center gap-3 text-center">
           <span className="flex h-12 w-12 items-center justify-center rounded-full border border-[#dce4ea] bg-[#fbfcfc] text-[#5e8196]">
             <PackageSearch className="h-5 w-5" />

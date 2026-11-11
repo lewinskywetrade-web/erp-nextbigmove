@@ -45,6 +45,7 @@ type StoreTransferModalState = {
   open: boolean;
   targetStoreId: string;
   targetProfileId: string;
+  shareStockPool: boolean;
   notes: string;
   errorMessage: string | null;
 };
@@ -107,6 +108,7 @@ export function useInventoryController() {
     open: false,
     targetStoreId: '',
     targetProfileId: '',
+    shareStockPool: false,
     notes: '',
     errorMessage: null,
   });
@@ -369,6 +371,12 @@ export function useInventoryController() {
     ),
   });
   const suggestedTargetProfileId = storeTransferOptionsQuery.data?.suggestion?.profileId ?? null;
+  const suggestedTargetAlreadyPooled = Boolean(
+    suggestedTargetProfileId
+    && storeTransferOptionsQuery.data?.products.find(
+      (product) => product.profileId === suggestedTargetProfileId,
+    )?.alreadyPooled,
+  );
 
   useEffect(() => {
     if (
@@ -386,6 +394,7 @@ export function useInventoryController() {
         : {
             ...current,
             targetProfileId: suggestedTargetProfileId,
+            shareStockPool: suggestedTargetAlreadyPooled,
           }
     ));
   }, [
@@ -393,6 +402,7 @@ export function useInventoryController() {
     storeTransferModal.targetStoreId,
     storeTransferModal.targetProfileId,
     suggestedTargetProfileId,
+    suggestedTargetAlreadyPooled,
   ]);
 
   const createTransferMutation = useMutation({
@@ -430,6 +440,7 @@ export function useInventoryController() {
         open: false,
         targetStoreId: '',
         targetProfileId: '',
+        shareStockPool: false,
         notes: '',
         errorMessage: null,
       });
@@ -439,6 +450,7 @@ export function useInventoryController() {
         queryClient.invalidateQueries({ queryKey: ['wms-inventory-unit-movements'] }),
         queryClient.invalidateQueries({ queryKey: ['wms-inventory-store-transfer-options'] }),
         queryClient.invalidateQueries({ queryKey: ['wms-inventory-transfers'] }),
+        queryClient.invalidateQueries({ queryKey: ['wms-products-overview'] }),
       ]);
     },
   });
@@ -572,6 +584,7 @@ export function useInventoryController() {
       open: true,
       targetStoreId: selectedUnits[0]?.store.id ?? '',
       targetProfileId: '',
+      shareStockPool: false,
       notes: '',
       errorMessage: null,
     });
@@ -582,6 +595,7 @@ export function useInventoryController() {
       open: false,
       targetStoreId: '',
       targetProfileId: '',
+      shareStockPool: false,
       notes: '',
       errorMessage: null,
     });
@@ -602,6 +616,7 @@ export function useInventoryController() {
         unitIds: selectedUnitIds,
         targetStoreId: storeTransferModal.targetStoreId,
         targetProfileId: storeTransferModal.targetProfileId,
+        shareStockPool: storeTransferModal.shareStockPool,
         notes: storeTransferModal.notes.trim() || undefined,
       });
     } catch (error) {
@@ -699,13 +714,24 @@ export function useInventoryController() {
         ...current,
         targetStoreId,
         targetProfileId: '',
+        shareStockPool: false,
         errorMessage: null,
       })),
-    setStoreTransferTargetProfileId: (targetProfileId: string) =>
+    setStoreTransferTargetProfileId: (targetProfileId: string) => {
+      const matchedProduct = storeTransferOptionsQuery.data?.products.find(
+        (product) => product.profileId === targetProfileId,
+      );
       setStoreTransferModal((current) => ({
         ...current,
         targetProfileId,
+        shareStockPool: Boolean(matchedProduct?.alreadyPooled),
         errorMessage: null,
+      }));
+    },
+    setStoreTransferShareStockPool: (shareStockPool: boolean) =>
+      setStoreTransferModal((current) => ({
+        ...current,
+        shareStockPool,
       })),
     setStoreTransferNotes: (notes: string) =>
       setStoreTransferModal((current) => ({

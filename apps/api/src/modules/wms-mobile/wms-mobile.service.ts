@@ -47,6 +47,11 @@ import { OrdersService } from '../orders/orders.service';
 import { WmsFulfillmentOpsService } from '../wms-fulfillment/wms-fulfillment-ops.service';
 import { WmsFulfillmentSyncService } from '../wms-fulfillment/wms-fulfillment-sync.service';
 import {
+  EMPTY_STOCK_POOL_INDEX,
+  loadTenantStockPoolIndex,
+  type TenantStockPoolIndex,
+} from '../wms-fulfillment/wms-stock-pool.util';
+import {
   buildUnexpiredInventoryWhere,
   isExpiredInventoryDate,
 } from '../wms-inventory/wms-inventory-expiration.utils';
@@ -4393,7 +4398,21 @@ export class WmsMobileService {
         line.status !== WmsFulfillmentLineStatus.CANCELED
         && Math.max(line.quantityRequired ?? 0, 0) > 0
       ));
-      const matchingLine = packableLines.find((line: any) => line.variationId === basketUnit.variationId);
+      let poolIndex = EMPTY_STOCK_POOL_INDEX;
+      let matchingLine = packableLines.find((line: any) => line.variationId === basketUnit.variationId);
+      if (!matchingLine) {
+        poolIndex = await loadTenantStockPoolIndex(tx, scopedOrder.tenantId);
+        if (poolIndex.hasAnyPools) {
+          matchingLine = packableLines.find((line: any) => (
+            poolIndex.areStoreVariationsPooled(
+              scopedOrder.storeId,
+              line.variationId,
+              basketUnit.storeId ?? scopedOrder.storeId,
+              basketUnit.variationId,
+            )
+          ));
+        }
+      }
       if (!matchingLine) {
         throw new BadRequestException(`Unit ${scannedUnit.code} is not one of the products required by order ${scopedOrder.posOrderId}`);
       }
@@ -4406,13 +4425,30 @@ export class WmsMobileService {
         throw new BadRequestException(`Order ${scopedOrder.posOrderId} already has all required ${matchingLine.productName} units packed`);
       }
 
+      if (!poolIndex.hasAnyPools) {
+        poolIndex = await loadTenantStockPoolIndex(tx, scopedOrder.tenantId);
+      }
+      const targetPoolMember = poolIndex.getTargetMember(scopedOrder.storeId, matchingLine.variationId);
+      const isCrossVariantPack = Boolean(
+        targetPoolMember
+        && (
+          (basketUnit.storeId ?? scopedOrder.storeId) !== targetPoolMember.storeId
+          || basketUnit.variationId !== targetPoolMember.variationId
+        ),
+      );
+
       const reassignment = await this.reassignDemandPackingUnitIfNeeded(tx, {
         basketId: scopedBasket.id,
         basketCode: scopedBasket.barcode,
         basketUnit,
         targetOrderId: scopedOrder.id,
         targetOrderCode: scopedOrder.posOrderId,
+        targetStoreId: scopedOrder.storeId,
+        targetVariationId: matchingLine.variationId,
         unitCode: scannedUnit.code,
+        actorId: userId,
+        now,
+        poolIndex,
       });
 
       if (basketUnit.status === WmsBasketUnitStatus.PACKED) {
@@ -4428,6 +4464,13 @@ export class WmsMobileService {
           status: WmsBasketUnitStatus.PACKED,
           fulfillmentOrderId: scopedOrder.id,
           fulfillmentLineId: matchingLine.id,
+          ...(isCrossVariantPack && targetPoolMember
+            ? {
+                storeId: targetPoolMember.storeId,
+                productId: targetPoolMember.productId,
+                variationId: targetPoolMember.variationId,
+              }
+            : {}),
           packedById: userId ?? undefined,
           packedAt: now,
         },
@@ -4444,6 +4487,18 @@ export class WmsMobileService {
         },
         data: {
           status: WmsInventoryUnitStatus.PACKED,
+          ...(isCrossVariantPack && targetPoolMember
+            ? {
+                storeId: targetPoolMember.storeId,
+                posProductId: targetPoolMember.posProductId,
+                productProfileId: targetPoolMember.profileId,
+                productId: targetPoolMember.productId,
+                variationId: targetPoolMember.variationId,
+                posWarehouseRef: (basketUnit.storeId ?? scopedOrder.storeId) === targetPoolMember.storeId
+                  ? null
+                  : targetPoolMember.posWarehouseRef ?? null,
+              }
+            : {}),
           updatedById: userId ?? undefined,
         },
       });
@@ -4546,6 +4601,7 @@ export class WmsMobileService {
       basketCode: string;
       basketUnit: {
         id: string;
+        storeId?: string;
         status: WmsBasketUnitStatus;
         fulfillmentOrderId: string | null;
         fulfillmentLineId: string | null;
@@ -4554,7 +4610,12 @@ export class WmsMobileService {
       };
       targetOrderId: string;
       targetOrderCode: string;
+      targetStoreId?: string;
+      targetVariationId?: string;
       unitCode: string;
+      actorId?: string | null;
+      now?: Date;
+      poolIndex?: TenantStockPoolIndex;
     },
   ) {
     const sourceOrderId = params.basketUnit.fulfillmentOrderId;
@@ -4562,18 +4623,30 @@ export class WmsMobileService {
       return null;
     }
 
+    const poolIndex = params.poolIndex ?? EMPTY_STOCK_POOL_INDEX;
+    const poolMembers = params.targetStoreId && params.targetVariationId
+      ? poolIndex.getPoolMembers(params.targetStoreId, params.targetVariationId)
+      : [];
+    const allowedVariationIds = poolMembers.length >= 2
+      ? Array.from(new Set(poolMembers.map((member) => member.variationId)))
+      : [params.basketUnit.variationId];
+
     const sourceOrder = await tx.wmsFulfillmentOrder.findUnique({
       where: { id: sourceOrderId },
       select: {
+        tenantId: true,
+        storeId: true,
         posOrderId: true,
         status: true,
         lines: {
           where: {
-            variationId: params.basketUnit.variationId,
+            variationId: allowedVariationIds.length === 1
+              ? allowedVariationIds[0]!
+              : { in: allowedVariationIds },
             status: { not: WmsFulfillmentLineStatus.CANCELED },
             quantityRequired: { gt: 0 },
           },
-          select: { id: true },
+          select: { id: true, variationId: true },
           take: 1,
         },
       },
@@ -4602,25 +4675,42 @@ export class WmsMobileService {
       );
     }
 
-    const sourceLineId = params.basketUnit.fulfillmentLineId ?? sourceOrder.lines[0]?.id ?? null;
+    const sourceLine = sourceOrder.lines[0] ?? null;
+    const sourceLineId = params.basketUnit.fulfillmentLineId ?? sourceLine?.id ?? null;
     if (!sourceLineId) {
       throw new ConflictException(
         `Unit ${params.unitCode} has no valid order line in basket ${params.basketCode}`,
       );
     }
 
-    const replacementWhere = {
-      basketId: params.basketId,
-      id: { not: params.basketUnit.id },
-      status: WmsBasketUnitStatus.PICKED,
-      variationId: params.basketUnit.variationId,
-      productId: params.basketUnit.productId,
-      inventoryUnit: {
-        is: { status: WmsInventoryUnitStatus.PICKED },
-      },
-    } satisfies Prisma.WmsBasketUnitWhereInput;
+    const replacementWhere: Prisma.WmsBasketUnitWhereInput = poolMembers.length >= 2
+      ? {
+          basketId: params.basketId,
+          id: { not: params.basketUnit.id },
+          status: WmsBasketUnitStatus.PICKED,
+          OR: poolMembers.map((member) => ({
+            storeId: member.storeId,
+            variationId: member.variationId,
+          })),
+          inventoryUnit: {
+            is: { status: WmsInventoryUnitStatus.PICKED },
+          },
+        }
+      : {
+          basketId: params.basketId,
+          id: { not: params.basketUnit.id },
+          status: WmsBasketUnitStatus.PICKED,
+          variationId: params.basketUnit.variationId,
+          productId: params.basketUnit.productId,
+          inventoryUnit: {
+            is: { status: WmsInventoryUnitStatus.PICKED },
+          },
+        };
     const replacementSelect = {
       id: true,
+      storeId: true,
+      variationId: true,
+      inventoryUnitId: true,
       fulfillmentOrderId: true,
     } satisfies Prisma.WmsBasketUnitSelect;
     let replacementUnit = await tx.wmsBasketUnit.findFirst({
@@ -4646,6 +4736,19 @@ export class WmsMobileService {
       );
     }
 
+    const sourceVariationId = sourceLine?.variationId ?? params.basketUnit.variationId;
+    const sourcePoolMember = sourceOrder.storeId
+      ? poolIndex.getTargetMember(sourceOrder.storeId, sourceVariationId)
+      : null;
+    const replacementCrossVariant = Boolean(
+      sourcePoolMember
+      && replacementUnit.inventoryUnitId
+      && (
+        replacementUnit.storeId !== sourcePoolMember.storeId
+        || replacementUnit.variationId !== sourcePoolMember.variationId
+      ),
+    );
+
     const exchangeResult = await tx.wmsBasketUnit.updateMany({
       where: {
         id: replacementUnit.id,
@@ -4655,12 +4758,39 @@ export class WmsMobileService {
       data: {
         fulfillmentOrderId: sourceOrderId,
         fulfillmentLineId: sourceLineId,
+        ...(replacementCrossVariant && sourcePoolMember
+          ? {
+              storeId: sourcePoolMember.storeId,
+              productId: sourcePoolMember.productId,
+              variationId: sourcePoolMember.variationId,
+            }
+          : {}),
       },
     });
     if (exchangeResult.count !== 1) {
       throw new ConflictException(
         `Basket ${params.basketCode} changed while assigning ${params.unitCode}. Scan the unit again.`,
       );
+    }
+
+    if (replacementCrossVariant && sourcePoolMember && replacementUnit.inventoryUnitId) {
+      await tx.wmsInventoryUnit.updateMany({
+        where: {
+          id: replacementUnit.inventoryUnitId,
+          status: WmsInventoryUnitStatus.PICKED,
+        },
+        data: {
+          storeId: sourcePoolMember.storeId,
+          posProductId: sourcePoolMember.posProductId,
+          productProfileId: sourcePoolMember.profileId,
+          productId: sourcePoolMember.productId,
+          variationId: sourcePoolMember.variationId,
+          posWarehouseRef: replacementUnit.storeId === sourcePoolMember.storeId
+            ? null
+            : sourcePoolMember.posWarehouseRef ?? null,
+          updatedById: params.actorId ?? undefined,
+        },
+      });
     }
 
     return {
@@ -4788,6 +4918,7 @@ export class WmsMobileService {
         },
         select: {
           id: true,
+          storeId: true,
           inventoryUnitId: true,
           variationId: true,
           productId: true,
@@ -4804,10 +4935,24 @@ export class WmsMobileService {
         line.status !== WmsFulfillmentLineStatus.CANCELED
         && Math.max(line.quantityRequired, 0) > 0
       ));
-      const matchingLine = packableLines.find((line) => (
+      let poolIndex = EMPTY_STOCK_POOL_INDEX;
+      let matchingLine = packableLines.find((line) => (
         line.id === basketUnit.fulfillmentLineId
         || line.variationId === basketUnit.variationId
       ));
+      if (!matchingLine) {
+        poolIndex = await loadTenantStockPoolIndex(tx, scopedOrder.tenantId);
+        if (poolIndex.hasAnyPools) {
+          matchingLine = packableLines.find((line) => (
+            poolIndex.areStoreVariationsPooled(
+              scopedOrder.storeId,
+              line.variationId,
+              basketUnit.storeId ?? scopedOrder.storeId,
+              basketUnit.variationId,
+            )
+          ));
+        }
+      }
       if (!matchingLine) {
         throw new BadRequestException(`Unit ${scannedUnit.code} is not one of the products required by order ${scopedOrder.posOrderId}`);
       }
@@ -4827,6 +4972,18 @@ export class WmsMobileService {
         );
       }
 
+      if (!poolIndex.hasAnyPools) {
+        poolIndex = await loadTenantStockPoolIndex(tx, scopedOrder.tenantId);
+      }
+      const targetPoolMember = poolIndex.getTargetMember(scopedOrder.storeId, matchingLine.variationId);
+      const isCrossVariantPack = Boolean(
+        targetPoolMember
+        && (
+          (basketUnit.storeId ?? scopedOrder.storeId) !== targetPoolMember.storeId
+          || basketUnit.variationId !== targetPoolMember.variationId
+        ),
+      );
+
       let alreadyProcessed = basketUnit.status === WmsBasketUnitStatus.PACKED;
       let reassignment = alreadyProcessed
         ? null
@@ -4836,7 +4993,12 @@ export class WmsMobileService {
             basketUnit,
             targetOrderId: scopedOrder.id,
             targetOrderCode: scopedOrder.posOrderId,
+            targetStoreId: scopedOrder.storeId,
+            targetVariationId: matchingLine.variationId,
             unitCode: scannedUnit.code,
+            actorId: userId,
+            now,
+            poolIndex,
           });
       if (!alreadyProcessed) {
         const packedForLine = await tx.wmsBasketUnit.count({
@@ -4858,6 +5020,13 @@ export class WmsMobileService {
             status: WmsBasketUnitStatus.PACKED,
             fulfillmentOrderId: scopedOrder.id,
             fulfillmentLineId: matchingLine.id,
+            ...(isCrossVariantPack && targetPoolMember
+              ? {
+                  storeId: targetPoolMember.storeId,
+                  productId: targetPoolMember.productId,
+                  variationId: targetPoolMember.variationId,
+                }
+              : {}),
             packedById: userId ?? undefined,
             packedAt: now,
           },
@@ -4884,6 +5053,18 @@ export class WmsMobileService {
             },
             data: {
               status: WmsInventoryUnitStatus.PACKED,
+              ...(isCrossVariantPack && targetPoolMember
+                ? {
+                    storeId: targetPoolMember.storeId,
+                    posProductId: targetPoolMember.posProductId,
+                    productProfileId: targetPoolMember.profileId,
+                    productId: targetPoolMember.productId,
+                    variationId: targetPoolMember.variationId,
+                    posWarehouseRef: (basketUnit.storeId ?? scopedOrder.storeId) === targetPoolMember.storeId
+                      ? null
+                      : targetPoolMember.posWarehouseRef ?? null,
+                  }
+                : {}),
               updatedById: userId ?? undefined,
             },
           });
@@ -4936,13 +5117,27 @@ export class WmsMobileService {
           _sum: { totalQuantity: true },
         }),
         tx.wmsBasketUnit.count({
-          where: {
-            basketId: scopedBasket.id,
-            variationId: matchingLine.variationId,
-            productId: matchingLine.productId ?? undefined,
-            fulfillmentOrderId: null,
-            status: WmsBasketUnitStatus.PICKED,
-          },
+          where: (() => {
+            const linePoolMembers = poolIndex.getPoolMembers(scopedOrder.storeId, matchingLine.variationId);
+            if (linePoolMembers.length >= 2) {
+              return {
+                basketId: scopedBasket.id,
+                fulfillmentOrderId: null,
+                status: WmsBasketUnitStatus.PICKED,
+                OR: linePoolMembers.map((member) => ({
+                  storeId: member.storeId,
+                  variationId: member.variationId,
+                })),
+              };
+            }
+            return {
+              basketId: scopedBasket.id,
+              variationId: matchingLine.variationId,
+              productId: matchingLine.productId ?? undefined,
+              fulfillmentOrderId: null,
+              status: WmsBasketUnitStatus.PICKED,
+            };
+          })(),
         }),
       ]);
       const orderRequired = Math.max(scopedOrder.totalQuantity, 0);
@@ -6739,6 +6934,21 @@ export class WmsMobileService {
       },
     });
 
+    const uniqueTenantIds = Array.from(
+      new Set(
+        params.orders
+          .map((order) => order.tenantId)
+          .filter((tenantId): tenantId is string => typeof tenantId === 'string' && tenantId.length > 0),
+      ),
+    );
+    const poolIndexEntries = await Promise.all(
+      uniqueTenantIds.map(async (tenantId) => ([
+        tenantId,
+        await loadTenantStockPoolIndex(tx, tenantId),
+      ] as const)),
+    );
+    const poolIndexByTenantId = new Map(poolIndexEntries);
+
     const demandInputs: Array<{
       order: any;
       line: any;
@@ -6788,7 +6998,11 @@ export class WmsMobileService {
     const availabilityEntries = await Promise.all(
       Array.from(availabilityParamsByKey.entries()).map(async ([key, availabilityParams]) => ([
         key,
-        await this.getDemandPickBinAvailability(tx, availabilityParams),
+        await this.getDemandPickBinAvailability(
+          tx,
+          availabilityParams,
+          poolIndexByTenantId.get(availabilityParams.tenantId) ?? EMPTY_STOCK_POOL_INDEX,
+        ),
       ] as const)),
     );
     const availableBinsByKey = new Map(availabilityEntries);
@@ -6797,13 +7011,16 @@ export class WmsMobileService {
     const demandBinRows: Prisma.WmsBasketPickDemandBinCreateManyInput[] = [];
 
     for (const input of demandInputs) {
+      const poolIndex = poolIndexByTenantId.get(input.order.tenantId) ?? EMPTY_STOCK_POOL_INDEX;
       const availableBins = [...(availableBinsByKey.get(input.availabilityKey) ?? [])]
         .map((bin) => {
           const locationKey = [
             input.order.tenantId,
-            input.order.storeId,
-            bin.warehouseId,
-            input.line.variationId,
+            poolIndex.buildWarehouseAllocationKey(
+              bin.warehouseId,
+              input.order.storeId,
+              input.line.variationId,
+            ),
             bin.locationId,
           ].join('::');
           return {
@@ -6831,20 +7048,7 @@ export class WmsMobileService {
         });
       let remaining = input.requiredQuantity;
       const demandId = randomUUID();
-
-      demandRows.push({
-        id: demandId,
-        tenantId: input.order.tenantId,
-        storeId: input.order.storeId,
-        basketId: params.basketId,
-        fulfillmentOrderId: input.order.id,
-        fulfillmentLineId: input.line.id,
-        productId: input.line.productId,
-        variationId: input.line.variationId,
-        productName: input.line.productName,
-        productDisplayId: input.line.productDisplayId,
-        quantityRequired: input.requiredQuantity,
-      });
+      const selectedStockedLabels = new Set<string>();
 
       for (const bin of availableBins) {
         if (remaining <= 0) {
@@ -6854,6 +7058,12 @@ export class WmsMobileService {
         const quantityTarget = Math.min(bin.effectiveAvailableQuantity, remaining);
         if (quantityTarget <= 0) {
           continue;
+        }
+
+        for (const stockedLabel of bin.stockedLabels ?? []) {
+          if (stockedLabel?.trim()) {
+            selectedStockedLabels.add(stockedLabel.trim());
+          }
         }
 
         routeSequence += 1;
@@ -6873,6 +7083,30 @@ export class WmsMobileService {
         );
         remaining -= quantityTarget;
       }
+
+      const baseProductName = typeof input.line.productName === 'string' && input.line.productName.trim().length > 0
+        ? input.line.productName.trim()
+        : null;
+      const alternateLabels = Array.from(selectedStockedLabels).filter(
+        (label) => !baseProductName || label.toLowerCase() !== baseProductName.toLowerCase(),
+      );
+      const demandProductName = baseProductName && alternateLabels.length > 0
+        ? `${baseProductName} · Bin: ${alternateLabels.join(' / ')}`
+        : input.line.productName;
+
+      demandRows.push({
+        id: demandId,
+        tenantId: input.order.tenantId,
+        storeId: input.order.storeId,
+        basketId: params.basketId,
+        fulfillmentOrderId: input.order.id,
+        fulfillmentLineId: input.line.id,
+        productId: input.line.productId,
+        variationId: input.line.variationId,
+        productName: demandProductName,
+        productDisplayId: input.line.productDisplayId,
+        quantityRequired: input.requiredQuantity,
+      });
 
       if (remaining > 0) {
         const availableQuantity = input.requiredQuantity - remaining;
@@ -6899,12 +7133,21 @@ export class WmsMobileService {
       posWarehouseRef: string | null;
       variationId: string;
     },
+    poolIndexParam?: TenantStockPoolIndex,
   ) {
-    const baseWhere: Prisma.WmsInventoryUnitWhereInput = {
-      tenantId: params.tenantId,
+    const poolIndex = poolIndexParam ?? await loadTenantStockPoolIndex(tx, params.tenantId);
+    const poolMembers = poolIndex.getPoolMembers(params.storeId, params.variationId);
+    const isPooled = poolMembers.length >= 2;
+    const unitIdentityWhere = poolIndex.buildPooledUnitIdentityFilter({
       storeId: params.storeId,
-      warehouseId: params.warehouseId,
       variationId: params.variationId,
+      posWarehouseRef: params.posWarehouseRef,
+      applyPosWarehouseFilterWhenUnpooled: true,
+    });
+    const scopedWhere: Prisma.WmsInventoryUnitWhereInput = {
+      tenantId: params.tenantId,
+      warehouseId: params.warehouseId,
+      ...unitIdentityWhere,
       status: {
         in: [...FULFILLABLE_UNIT_STATUSES],
       },
@@ -6929,28 +7172,82 @@ export class WmsMobileService {
         },
       },
     };
-    const scopedWhere = params.posWarehouseRef
-      ? {
-          ...baseWhere,
-          OR: [
-            { posWarehouseRef: params.posWarehouseRef },
-            { posWarehouseRef: null },
-          ],
+
+    type AggregatedUnitGroup = {
+      warehouseId: string;
+      currentLocationId: string;
+      count: number;
+      earliestExpirationDate: Date | null;
+      stockedLabels: Set<string>;
+    };
+    const aggregatedGroups = new Map<string, AggregatedUnitGroup>();
+
+    if (isPooled) {
+      const rawUnitGroups = await tx.wmsInventoryUnit.groupBy({
+        by: ['warehouseId', 'currentLocationId', 'storeId', 'variationId'],
+        where: scopedWhere,
+        _count: {
+          _all: true,
+        },
+        _min: {
+          expirationDate: true,
+        },
+      });
+      for (const group of rawUnitGroups) {
+        if (!group.currentLocationId) {
+          continue;
         }
-      : baseWhere;
-    const unitGroups = await tx.wmsInventoryUnit.groupBy({
-      by: ['warehouseId', 'currentLocationId'],
-      where: scopedWhere,
-      _count: {
-        _all: true,
-      },
-      _min: {
-        expirationDate: true,
-      },
-    });
-    const locationIds = unitGroups
-      .map((group) => group.currentLocationId)
-      .filter((locationId): locationId is string => Boolean(locationId));
+        const aggKey = `${group.warehouseId}::${group.currentLocationId}`;
+        const existing = aggregatedGroups.get(aggKey) ?? {
+          warehouseId: group.warehouseId,
+          currentLocationId: group.currentLocationId,
+          count: 0,
+          earliestExpirationDate: null,
+          stockedLabels: new Set<string>(),
+        };
+        existing.count += group._count._all;
+        const groupMinExp = group._min.expirationDate ?? null;
+        if (
+          groupMinExp
+          && (!existing.earliestExpirationDate || groupMinExp.getTime() < existing.earliestExpirationDate.getTime())
+        ) {
+          existing.earliestExpirationDate = groupMinExp;
+        }
+        if (group.storeId && group.variationId) {
+          const stockedMember = poolIndex.getTargetMember(group.storeId, group.variationId);
+          if (stockedMember?.productName?.trim()) {
+            existing.stockedLabels.add(stockedMember.productName.trim());
+          }
+        }
+        aggregatedGroups.set(aggKey, existing);
+      }
+    } else {
+      const rawUnitGroups = await tx.wmsInventoryUnit.groupBy({
+        by: ['warehouseId', 'currentLocationId'],
+        where: scopedWhere,
+        _count: {
+          _all: true,
+        },
+        _min: {
+          expirationDate: true,
+        },
+      });
+      for (const group of rawUnitGroups) {
+        if (!group.currentLocationId) {
+          continue;
+        }
+        aggregatedGroups.set(`${group.warehouseId}::${group.currentLocationId}`, {
+          warehouseId: group.warehouseId,
+          currentLocationId: group.currentLocationId,
+          count: group._count._all,
+          earliestExpirationDate: group._min.expirationDate ?? null,
+          stockedLabels: new Set<string>(),
+        });
+      }
+    }
+
+    const unitGroups = Array.from(aggregatedGroups.values());
+    const locationIds = unitGroups.map((group) => group.currentLocationId);
 
     if (locationIds.length === 0) {
       return [];
@@ -6970,27 +7267,15 @@ export class WmsMobileService {
         },
       }),
       tx.wmsBasketPickDemandBin.findMany({
-        where: {
+        where: poolIndex.buildPooledDemandBinHoldWhere({
           tenantId: params.tenantId,
+          storeId: params.storeId,
           variationId: params.variationId,
           warehouseId: params.warehouseId,
-          locationId: {
-            in: locationIds,
-          },
-          basket: {
-            status: {
-              in: [...ACTIVE_PICK_BASKET_STATUSES],
-            },
-          },
-          demand: {
-            storeId: params.storeId,
-            fulfillmentOrder: {
-              status: {
-                in: [...ACTIVE_BASKET_ORDER_STATUSES],
-              },
-            },
-          },
-        },
+          locationIds,
+          basketStatuses: ACTIVE_PICK_BASKET_STATUSES,
+          orderStatuses: ACTIVE_BASKET_ORDER_STATUSES,
+        }),
         select: {
           locationId: true,
           quantityTarget: true,
@@ -7010,13 +7295,9 @@ export class WmsMobileService {
     return unitGroups
       .map((group) => {
         const locationId = group.currentLocationId;
-        if (!locationId) {
-          return null;
-        }
-
         const heldQuantity = heldQuantityByLocation.get(locationId) ?? 0;
         const availableQuantity = Math.max(
-          group._count._all - heldQuantity,
+          group.count - heldQuantity,
           0,
         );
         const location = locationById.get(locationId);
@@ -7027,7 +7308,8 @@ export class WmsMobileService {
           locationCode: location?.code ?? '',
           locationSortOrder: location?.sortOrder ?? 0,
           availableQuantity,
-          earliestExpirationDate: group._min.expirationDate,
+          earliestExpirationDate: group.earliestExpirationDate,
+          stockedLabels: Array.from(group.stockedLabels),
         };
       })
       .filter((bin): bin is {
@@ -7037,6 +7319,7 @@ export class WmsMobileService {
         locationSortOrder: number;
         availableQuantity: number;
         earliestExpirationDate: Date | null;
+        stockedLabels: string[];
       } => bin !== null && bin.availableQuantity > 0)
       .sort((a, b) => {
         const aExpiration = a.earliestExpirationDate?.getTime() ?? Number.POSITIVE_INFINITY;
@@ -7348,26 +7631,57 @@ export class WmsMobileService {
         throw new BadRequestException(`Unit ${scannedUnit.code} is expired and cannot be picked`);
       }
 
+      const poolIndex = await loadTenantStockPoolIndex(this.prisma, scannedUnit.tenantId);
       const pendingDemandContexts = this.getBasketDemandPickContexts(basket)
         .filter((context: any) => (
           context.remainingQuantity > 0
           && context.order.tenantId === scannedUnit.tenantId
-          && context.order.storeId === scannedUnit.storeId
-          && context.demand.variationId === scannedUnit.variationId
+          && (
+            (context.order.storeId === scannedUnit.storeId && context.demand.variationId === scannedUnit.variationId)
+            || poolIndex.areStoreVariationsPooled(
+              context.order.storeId,
+              context.demand.variationId,
+              scannedUnit.storeId,
+              scannedUnit.variationId,
+            )
+          )
           && context.bin.location?.id === activeBin.id
         ))
-        .sort((left: any, right: any) => (
-          (left.bin.routeSequence ?? Number.MAX_SAFE_INTEGER) - (right.bin.routeSequence ?? Number.MAX_SAFE_INTEGER)
-          || left.order.posOrderId.localeCompare(right.order.posOrderId)
-        ));
+        .sort((left: any, right: any) => {
+          const seqDiff =
+            (left.bin.routeSequence ?? Number.MAX_SAFE_INTEGER)
+            - (right.bin.routeSequence ?? Number.MAX_SAFE_INTEGER);
+          if (seqDiff !== 0) {
+            return seqDiff;
+          }
+          const leftExact =
+            left.order.storeId === scannedUnit.storeId && left.demand.variationId === scannedUnit.variationId
+              ? 0
+              : 1;
+          const rightExact =
+            right.order.storeId === scannedUnit.storeId && right.demand.variationId === scannedUnit.variationId
+              ? 0
+              : 1;
+          if (leftExact !== rightExact) {
+            return leftExact - rightExact;
+          }
+          return left.order.posOrderId.localeCompare(right.order.posOrderId);
+        });
 
       if (pendingDemandContexts.length === 0) {
         const basketContexts = this.getBasketDemandPickContexts(basket)
           .filter((context: any) => context.remainingQuantity > 0);
         const hasRequiredVariationElsewhere = basketContexts.some((context: any) => (
           context.order.tenantId === scannedUnit.tenantId
-          && context.order.storeId === scannedUnit.storeId
-          && context.demand.variationId === scannedUnit.variationId
+          && (
+            (context.order.storeId === scannedUnit.storeId && context.demand.variationId === scannedUnit.variationId)
+            || poolIndex.areStoreVariationsPooled(
+              context.order.storeId,
+              context.demand.variationId,
+              scannedUnit.storeId,
+              scannedUnit.variationId,
+            )
+          )
         ));
 
         if (hasRequiredVariationElsewhere) {
@@ -7407,22 +7721,44 @@ export class WmsMobileService {
           throw new ConflictException(`Unit ${scannedUnit.code} is already held by another basket`);
         }
 
+        const txPoolIndex = poolIndex.hasAnyPools
+          ? poolIndex
+          : await loadTenantStockPoolIndex(tx, scannedUnit.tenantId);
+        const scopedPoolMembers = txPoolIndex.getPoolMembers(scannedUnit.storeId, scannedUnit.variationId);
+        const demandBinIdentityWhere: Prisma.WmsBasketPickDemandBinWhereInput =
+          scopedPoolMembers.length >= 2
+            ? {
+                OR: scopedPoolMembers.map((member) => ({
+                  variationId: member.variationId,
+                  demand: {
+                    is: {
+                      tenantId: scannedUnit.tenantId,
+                      storeId: member.storeId,
+                    },
+                  },
+                })),
+              }
+            : {
+                variationId: scannedUnit.variationId,
+                demand: {
+                  is: {
+                    tenantId: scannedUnit.tenantId,
+                    storeId: scannedUnit.storeId,
+                  },
+                },
+              };
+
         const scopedDemandBins = await tx.wmsBasketPickDemandBin.findMany({
           where: {
             basketId: basket.id,
             locationId: activeBin.id,
-            variationId: scannedUnit.variationId,
-            demand: {
-              is: {
-                tenantId: scannedUnit.tenantId,
-                storeId: scannedUnit.storeId,
-              },
-            },
+            ...demandBinIdentityWhere,
           },
           include: {
             demand: {
               select: {
                 id: true,
+                storeId: true,
                 fulfillmentOrderId: true,
                 fulfillmentLineId: true,
                 fulfillmentOrder: {
@@ -7441,12 +7777,40 @@ export class WmsMobileService {
         });
         const scopedBin = scopedDemandBins
           .filter((candidate) => candidate.quantityPicked < candidate.quantityTarget)
-          .sort((left, right) => (
-            left.routeSequence - right.routeSequence
-            || left.demand.fulfillmentOrder.posOrderId.localeCompare(right.demand.fulfillmentOrder.posOrderId)
-          ))[0];
+          .sort((left, right) => {
+            if (left.routeSequence !== right.routeSequence) {
+              return left.routeSequence - right.routeSequence;
+            }
+            const leftDemandStoreId = left.demand.storeId ?? scannedUnit.storeId;
+            const rightDemandStoreId = right.demand.storeId ?? scannedUnit.storeId;
+            const leftExact =
+              leftDemandStoreId === scannedUnit.storeId && left.variationId === scannedUnit.variationId
+                ? 0
+                : 1;
+            const rightExact =
+              rightDemandStoreId === scannedUnit.storeId && right.variationId === scannedUnit.variationId
+                ? 0
+                : 1;
+            if (leftExact !== rightExact) {
+              return leftExact - rightExact;
+            }
+            return left.demand.fulfillmentOrder.posOrderId.localeCompare(right.demand.fulfillmentOrder.posOrderId);
+          })[0];
         if (!scopedBin) {
           throw new ConflictException(`Bin ${activeBin.code} no longer needs ${scannedUnit.code}`);
+        }
+
+        const targetDemandStoreId = scopedBin.demand.storeId ?? scannedUnit.storeId;
+        const needsPoolReassignment =
+          scannedUnit.storeId !== targetDemandStoreId
+          || scannedUnit.variationId !== scopedBin.variationId;
+        const targetPoolMember = needsPoolReassignment
+          ? txPoolIndex.getTargetMember(targetDemandStoreId, scopedBin.variationId)
+          : null;
+        if (needsPoolReassignment && !targetPoolMember) {
+          throw new ConflictException(
+            `Shared stock pool target profile was not found for order ${scopedBin.demand.fulfillmentOrder.posOrderId}`,
+          );
         }
 
         const inventoryUpdate = await tx.wmsInventoryUnit.updateMany({
@@ -7473,6 +7837,19 @@ export class WmsMobileService {
             status: WmsInventoryUnitStatus.PICKED,
             currentLocationId: null,
             updatedById: userId || undefined,
+            ...(targetPoolMember
+              ? {
+                  storeId: targetPoolMember.storeId,
+                  posProductId: targetPoolMember.posProductId,
+                  productProfileId: targetPoolMember.profileId,
+                  productId: targetPoolMember.productId,
+                  variationId: targetPoolMember.variationId,
+                  posWarehouseRef:
+                    scannedUnit.storeId === targetPoolMember.storeId
+                      ? null
+                      : (targetPoolMember.posWarehouseRef ?? null),
+                }
+              : {}),
           },
         });
 
@@ -7500,13 +7877,13 @@ export class WmsMobileService {
         await tx.wmsBasketUnit.create({
           data: {
             tenantId: scannedUnit.tenantId,
-            storeId: scannedUnit.storeId,
+            storeId: targetPoolMember?.storeId ?? scannedUnit.storeId,
             basketId: basket.id,
             inventoryUnitId: scannedUnit.id,
             warehouseId: scannedUnit.warehouseId,
             sourceLocationId: activeBin.id,
-            productId: scannedUnit.productId,
-            variationId: scannedUnit.variationId,
+            productId: targetPoolMember?.productId ?? scannedUnit.productId,
+            variationId: targetPoolMember?.variationId ?? scannedUnit.variationId,
             fulfillmentOrderId: scopedBin.demand.fulfillmentOrderId,
             fulfillmentLineId: scopedBin.demand.fulfillmentLineId,
             status: WmsBasketUnitStatus.PICKED,
@@ -7535,6 +7912,27 @@ export class WmsMobileService {
             },
           },
         });
+
+        if (targetPoolMember) {
+          await tx.wmsInventoryMovement.create({
+            data: {
+              tenantId: scannedUnit.tenantId,
+              inventoryUnitId: scannedUnit.id,
+              warehouseId: scannedUnit.warehouseId,
+              fromLocationId: activeBin.id,
+              toLocationId: activeBin.id,
+              fromStatus: scannedUnit.status,
+              toStatus: scannedUnit.status,
+              movementType: WmsInventoryMovementType.ADJUSTMENT,
+              referenceType: 'SHARED_STOCK_POOL',
+              referenceId: scopedBin.demand.fulfillmentOrderId,
+              referenceCode: scopedBin.demand.fulfillmentOrder.posOrderId,
+              notes: `Auto-assigned from shared stock pool on pick (${scannedUnit.variationId} -> ${targetPoolMember.variationId})`,
+              actorId: userId,
+              createdAt: now,
+            },
+          });
+        }
 
         await tx.wmsInventoryMovement.create({
           data: {
@@ -7612,6 +8010,7 @@ export class WmsMobileService {
           taskId: updatedOrder.id,
           lineId: updatedLine?.id ?? scopedBin.demand.fulfillmentLineId,
           demandId: scopedBin.demand.id,
+          effectiveVariationId: targetPoolMember?.variationId ?? scannedUnit.variationId,
           order: {
             required: updatedOrder.totalQuantity,
             allocated: updatedOrder.allocatedQuantity,
@@ -7737,7 +8136,7 @@ export class WmsMobileService {
           id: scannedUnit.id,
           code: scannedUnit.code,
           barcode: scannedUnit.barcode,
-          variationId: scannedUnit.variationId,
+          variationId: transactionResult.effectiveVariationId,
         },
         counters: {
           order: transactionResult.order,
