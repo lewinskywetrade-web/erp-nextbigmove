@@ -201,6 +201,7 @@ const DEFAULT_RTS_PAGE_SIZE = 10;
 const CONFIRMED_POS_ORDER_STATUS = 1;
 const WAITING_FOR_PRINTING_POS_ORDER_STATUS = 12;
 const CANCELED_POS_ORDER_STATUS = 6;
+const SHIPPED_EQUIVALENT_POS_ORDER_STATUSES = [2, 3, 4, 5] as const;
 const PICKING_SYNC_ORDER_LIMIT = 80;
 const BASKET_ASSIGN_TRANSACTION_MAX_WAIT_MS = 5000;
 const BASKET_ASSIGN_TRANSACTION_TIMEOUT_MS = 30000;
@@ -3427,18 +3428,47 @@ export class WmsMobileService {
     }
 
     if (this.integrationService) {
-      if (activeStore) {
-        try {
-          await this.integrationService.syncPancakeOrdersByStoreId(
-            activeStore.id,
-            activeStore.tenantId,
-            { days: 3, repairIssueOrders: true },
-          );
-        } catch (error: any) {
-          this.logger.warn(
-            `Live POS store sync skipped during picking queue resync for store=${activeStore.id}: ${error?.message || 'Unknown error'}`,
-          );
+      let storesToLiveSync = activeStore ? [activeStore] : [];
+      if (!activeStore && stores.length > 0) {
+        if (typeof (this.prisma as any).wmsFulfillmentOrder?.findMany === 'function') {
+          const openPickStoreRows = await this.prisma.wmsFulfillmentOrder.findMany({
+            where: {
+              ...(tenantId ? { tenantId } : {}),
+              storeId: { in: stores.map((store) => store.id) },
+              status: { in: [...ACTIVE_PICKING_ORDER_STATUSES] },
+            },
+            select: { storeId: true },
+            distinct: ['storeId'],
+          });
+          const openStoreIdSet = new Set(openPickStoreRows.map((row) => row.storeId));
+          const prioritized = [
+            ...stores.filter((store) => openStoreIdSet.has(store.id)),
+            ...stores.filter((store) => !openStoreIdSet.has(store.id)),
+          ];
+          storesToLiveSync = prioritized.slice(0, 12);
+        } else {
+          storesToLiveSync = stores.slice(0, 12);
         }
+      }
+
+      const syncBatchSize = 3;
+      for (let idx = 0; idx < storesToLiveSync.length; idx += syncBatchSize) {
+        const batch = storesToLiveSync.slice(idx, idx + syncBatchSize);
+        await Promise.all(
+          batch.map(async (targetStore) => {
+            try {
+              await this.integrationService!.syncPancakeOrdersByStoreId(
+                targetStore.id,
+                targetStore.tenantId,
+                { days: 7, repairIssueOrders: true },
+              );
+            } catch (error: any) {
+              this.logger.warn(
+                `Live POS store sync skipped during picking queue resync for store=${targetStore.id}: ${error?.message || 'Unknown error'}`,
+              );
+            }
+          }),
+        );
       }
 
       try {
@@ -11265,35 +11295,76 @@ export class WmsMobileService {
       order.posOrder?.status === CANCELED_POS_ORDER_STATUS
       || Boolean(order.posOrder?.isVoid)
     ));
+    const shippedPickOrders = orders.filter((order: any) => (
+      !order.posOrder?.isVoid
+      && this.isActivePickOrderStatus(order.status)
+      && (SHIPPED_EQUIVALENT_POS_ORDER_STATUSES as readonly number[]).includes(
+        typeof order.posOrder?.status === 'number' ? order.posOrder.status : -1,
+      )
+    ));
 
-    if (canceledOrders.length === 0) {
+    if (canceledOrders.length === 0 && shippedPickOrders.length === 0) {
       return 0;
     }
 
-    const result = await this.wmsFulfillmentSyncService.reconcileCanceledPickingOrderRefs({
-      actorId,
-      orders: canceledOrders
-        .filter((order: any) => (
-          typeof order.tenantId === 'string'
-          && typeof order.storeId === 'string'
-          && typeof order.shopId === 'string'
-          && typeof order.posOrderId === 'string'
-        ))
-        .map((order: any) => ({
-          tenantId: order.tenantId,
-          storeId: order.storeId,
-          shopId: order.shopId,
-          posOrderId: order.posOrderId,
-        })),
-    });
+    let cleanedCount = 0;
 
-    if (result.cleanedOrders > 0) {
-      this.logger.warn(
-        `Released ${result.cleanedOrders} canceled POS order(s) from basket ${basket.barcode}`,
-      );
+    if (canceledOrders.length > 0) {
+      const result = await this.wmsFulfillmentSyncService.reconcileCanceledPickingOrderRefs({
+        actorId,
+        orders: canceledOrders
+          .filter((order: any) => (
+            typeof order.tenantId === 'string'
+            && typeof order.storeId === 'string'
+            && typeof order.shopId === 'string'
+            && typeof order.posOrderId === 'string'
+          ))
+          .map((order: any) => ({
+            tenantId: order.tenantId,
+            storeId: order.storeId,
+            shopId: order.shopId,
+            posOrderId: order.posOrderId,
+          })),
+      });
+
+      if (result.cleanedOrders > 0) {
+        this.logger.warn(
+          `Released ${result.cleanedOrders} canceled POS order(s) from basket ${basket.barcode}`,
+        );
+        cleanedCount += result.cleanedOrders;
+      }
     }
 
-    return result.cleanedOrders;
+    if (
+      shippedPickOrders.length > 0
+      && typeof (this.wmsFulfillmentSyncService as any).reconcilePosShippedPickingOrderRefs === 'function'
+    ) {
+      const shippedResult = await this.wmsFulfillmentSyncService.reconcilePosShippedPickingOrderRefs({
+        actorId,
+        orders: shippedPickOrders
+          .filter((order: any) => (
+            typeof order.tenantId === 'string'
+            && typeof order.storeId === 'string'
+            && typeof order.shopId === 'string'
+            && typeof order.posOrderId === 'string'
+          ))
+          .map((order: any) => ({
+            tenantId: order.tenantId,
+            storeId: order.storeId,
+            shopId: order.shopId,
+            posOrderId: order.posOrderId,
+          })),
+      });
+
+      if (shippedResult.syncedOrders > 0) {
+        this.logger.warn(
+          `Synced ${shippedResult.syncedOrders} POS-shipped pick order(s) from basket ${basket.barcode}`,
+        );
+        cleanedCount += shippedResult.syncedOrders;
+      }
+    }
+
+    return cleanedCount;
   }
 
   private async findPickingBasketForAction(

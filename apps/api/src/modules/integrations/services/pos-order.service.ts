@@ -1239,6 +1239,7 @@ export class PosOrderService {
     const outcomes: PosOrderUpsertOutcome[] = [];
     const fulfillmentCandidates: Array<{ shopId: string; posOrderId: string }> = [];
     const canceledFulfillmentCandidates: Array<{ shopId: string; posOrderId: string }> = [];
+    const shippedFulfillmentCandidates: Array<{ shopId: string; posOrderId: string }> = [];
     const dispatchCandidates: Array<{ shopId: string; posOrderId: string }> = [];
     const outboundRecordCandidates: Array<{ shopId: string; posOrderId: string }> = [];
 
@@ -1339,7 +1340,7 @@ export class PosOrderService {
             options.allowIncompleteOrderHydration
             && previous
             && !this.hasIdentifiableProductItems(previousSnapshotForVersion?.items)
-            && (hasProduct || order.status === 6 || order.status === 7),
+            && (hasProduct || [2, 3, 4, 5, 6, 7].includes(order.status ?? -1)),
           );
           const versionDecision = await this.evaluateSourceVersionForPersist(
             client,
@@ -1539,6 +1540,21 @@ export class PosOrderService {
           });
         }
         if (
+          !order.isVoid
+          && [2, 3, 4, 5].includes(order.status ?? -1)
+          && order.shopId
+          && order.posOrderId
+          && (
+            !tenant?.wmsFulfillmentGoLiveAt
+            || order.insertedAt >= tenant.wmsFulfillmentGoLiveAt
+          )
+        ) {
+          shippedFulfillmentCandidates.push({
+            shopId: order.shopId,
+            posOrderId: order.posOrderId,
+          });
+        }
+        if (
           (order.status === 2 || order.status === 3)
           && order.shopId
           && order.posOrderId
@@ -1605,7 +1621,7 @@ export class PosOrderService {
 
     const fulfillmentSyncCandidates = Array.from(
       new Map(
-        [...fulfillmentCandidates, ...canceledFulfillmentCandidates]
+        [...fulfillmentCandidates, ...canceledFulfillmentCandidates, ...shippedFulfillmentCandidates]
           .map((ref) => [`${ref.shopId}::${ref.posOrderId}`, ref] as const),
       ).values(),
     );

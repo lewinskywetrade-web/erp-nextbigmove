@@ -313,3 +313,58 @@ describe('WmsMobileService demand packing basket manifest', () => {
     ]);
   });
 });
+
+describe('WmsMobileService basket POS-shipped pick order reconciliation', () => {
+  it('syncs active pick orders in a basket whose POS status moved to shipped/delivered', async () => {
+    const reconcileCanceledPickingOrderRefs = jest.fn<(...args: any[]) => Promise<{ cleanedOrders: number }>>()
+      .mockResolvedValue({ cleanedOrders: 0 });
+    const reconcilePosShippedPickingOrderRefs = jest.fn<(...args: any[]) => Promise<{ syncedOrders: number }>>()
+      .mockResolvedValue({ syncedOrders: 1 });
+
+    const service = Object.assign(Object.create(WmsMobileService.prototype), {
+      logger: { warn: jest.fn() },
+      wmsFulfillmentSyncService: {
+        reconcileCanceledPickingOrderRefs,
+        reconcilePosShippedPickingOrderRefs,
+      },
+    }) as WmsMobileService;
+
+    const count = await (service as unknown as {
+      reconcileCanceledBasketOrders: (basket: unknown, actorId: string | null) => Promise<number>;
+    }).reconcileCanceledBasketOrders({
+      barcode: 'BASKET-009',
+      fulfillmentOrders: [
+        {
+          id: 'order-shipped-in-pos',
+          tenantId: 'tenant-1',
+          storeId: 'store-1',
+          shopId: 'shop-1',
+          posOrderId: '11155',
+          status: WmsFulfillmentOrderStatus.IN_PICKING,
+          posOrder: { status: 2, isVoid: false },
+        },
+        {
+          id: 'order-already-packed',
+          tenantId: 'tenant-1',
+          storeId: 'store-1',
+          shopId: 'shop-1',
+          posOrderId: '11156',
+          status: WmsFulfillmentOrderStatus.PACKED,
+          posOrder: { status: 2, isVoid: false },
+        },
+      ],
+    }, 'actor-1');
+
+    expect(count).toBe(1);
+    expect(reconcileCanceledPickingOrderRefs).not.toHaveBeenCalled();
+    expect(reconcilePosShippedPickingOrderRefs).toHaveBeenCalledWith({
+      actorId: 'actor-1',
+      orders: [{
+        tenantId: 'tenant-1',
+        storeId: 'store-1',
+        shopId: 'shop-1',
+        posOrderId: '11155',
+      }],
+    });
+  });
+});

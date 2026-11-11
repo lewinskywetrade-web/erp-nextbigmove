@@ -792,3 +792,169 @@ describe('WmsFulfillmentSyncService line extraction & ISSUE recovery', () => {
     );
   });
 });
+
+describe('WmsFulfillmentSyncService POS shipped pick-status sync', () => {
+  it('transitions open Pick-status orders whose POS status is Shipped/Delivered/RTS (2..5) to PACKED, releases basket demand holds, and queues refresh', async () => {
+    const orderUpdate = jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({});
+    const lineUpdateMany = jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({ count: 1 });
+    const amendmentUpdateMany = jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({ count: 0 });
+    const staffActivityCreate = jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({});
+    const basketPickDemandDeleteMany = jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({ count: 1 });
+    const basketUpdateMany = jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({ count: 0 });
+
+    const transactionClient = {
+      $queryRaw: jest.fn<(...args: any[]) => Promise<any[]>>().mockResolvedValue([]),
+      wmsFulfillmentOrder: {
+        findMany: jest.fn<() => Promise<any[]>>().mockResolvedValue([
+          {
+            id: 'fo-shipped-1',
+            tenantId: 'tenant-1',
+            storeId: 'store-1',
+            warehouseId: 'wh-1',
+            posOrderDbId: 'pos-db-shipped-1',
+            posOrderId: '11200',
+            assignmentMode: WmsFulfillmentAssignmentMode.BASKET_DEMAND,
+            status: WmsFulfillmentOrderStatus.READY,
+            basketId: 'basket-1',
+            posOrder: {
+              id: 'pos-db-shipped-1',
+              status: 2,
+              isVoid: false,
+              tracking: 'JT999888777',
+            },
+            lines: [
+              {
+                id: 'line-1',
+                variationId: 'var-1',
+                quantityRequired: 2,
+                status: 'READY',
+                reservations: [],
+              },
+            ],
+            basketUnits: [],
+          },
+        ]),
+        findUnique: jest.fn<() => Promise<any>>().mockResolvedValue({
+          status: WmsFulfillmentOrderStatus.READY,
+          basketId: 'basket-1',
+          completedAt: null,
+          posOrder: {
+            status: 2,
+            isVoid: false,
+            tracking: 'JT999888777',
+          },
+        }),
+        update: orderUpdate,
+      },
+      wmsFulfillmentLine: {
+        updateMany: lineUpdateMany,
+        upsert: jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({}),
+      },
+      wmsFulfillmentAmendment: {
+        updateMany: amendmentUpdateMany,
+      },
+      wmsBasketPickDemand: {
+        deleteMany: basketPickDemandDeleteMany,
+      },
+      wmsBasket: {
+        updateMany: basketUpdateMany,
+      },
+      wmsStaffActivity: {
+        create: staffActivityCreate,
+      },
+    };
+
+    const prisma = {
+      posOrder: {
+        findMany: jest.fn<() => Promise<any[]>>().mockResolvedValue([
+          {
+            id: 'pos-db-shipped-1',
+            tenantId: 'tenant-1',
+            shopId: 'shop-1',
+            posOrderId: '11200',
+            status: 2,
+            isVoid: false,
+            tracking: 'JT999888777',
+            orderSnapshot: { items: [] },
+            itemData: [],
+          },
+        ]),
+      },
+      $transaction: jest.fn(async (callback: any) => callback(transactionClient)),
+    };
+    const queue = {
+      add: jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({ id: 'refresh-job-shipped' }),
+    };
+
+    const service = new WmsFulfillmentSyncService(prisma as any, {} as any, queue as any);
+    jest.spyOn(service as any, 'buildTenantGoLiveOrderFilters').mockResolvedValue([{}]);
+    jest.spyOn(service as any, 'extractFulfillmentLinesFromOrderSnapshot').mockResolvedValue([]);
+    const refreshBasketSpy = jest
+      .spyOn(service as any, 'refreshDemandBasketStateTx')
+      .mockResolvedValue(undefined);
+
+    const result = await service.reconcilePosShippedPickingOrderRefs({
+      actorId: 'user-1',
+      orders: [
+        {
+          tenantId: 'tenant-1',
+          storeId: 'store-1',
+          shopId: 'shop-1',
+          posOrderId: '11200',
+        },
+        {
+          tenantId: 'tenant-1',
+          storeId: 'store-1',
+          shopId: 'shop-1',
+          posOrderId: '11200',
+        },
+      ],
+    });
+
+    expect(result).toEqual({ syncedOrders: 1 });
+    expect(basketPickDemandDeleteMany).toHaveBeenCalledWith({
+      where: { fulfillmentOrderId: 'fo-shipped-1' },
+    });
+    expect(lineUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ fulfillmentOrderId: 'fo-shipped-1' }),
+      data: expect.objectContaining({
+        quantityAllocated: 0,
+        quantityPicked: 0,
+        status: 'PICKED',
+        issueReason: null,
+      }),
+    }));
+    expect(orderUpdate).toHaveBeenCalledWith({
+      where: { id: 'fo-shipped-1' },
+      data: expect.objectContaining({
+        status: WmsFulfillmentOrderStatus.PACKED,
+        issueReason: null,
+        allocatedQuantity: 0,
+        pickedQuantity: 0,
+        basketId: null,
+      }),
+    });
+    expect(staffActivityCreate).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        actionType: 'ORDER_DISPATCH_SYNC',
+        resourceId: 'fo-shipped-1',
+        fromStatus: WmsFulfillmentOrderStatus.READY,
+        toStatus: WmsFulfillmentOrderStatus.PACKED,
+        reasonCode: 'POS_STATUS_SYNC',
+      }),
+    });
+    expect(refreshBasketSpy).toHaveBeenCalledWith(
+      transactionClient,
+      'basket-1',
+      expect.any(Date),
+    );
+    expect(queue.add).toHaveBeenCalledWith(
+      WMS_DEMAND_QUEUE_REFRESH_JOB,
+      expect.objectContaining({
+        tenantId: 'tenant-1',
+        storeId: 'store-1',
+      }),
+      expect.any(Object),
+    );
+  });
+});

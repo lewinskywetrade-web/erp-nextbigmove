@@ -5312,6 +5312,93 @@ async function reconcileToniosWmsFulfillmentQueue() {
         });
       }
 
+      // 1b. Sync unpicked pick-status orders whose POS order is already shipped/delivered/RTS (2, 3, 4, 5)
+      const unpickedPosShippedOrders = await prisma.wmsFulfillmentOrder.findMany({
+        where: {
+          tenantId: store.tenantId,
+          storeId: store.id,
+          basketId: null,
+          pickedQuantity: 0,
+          status: {
+            in: [
+              WmsFulfillmentOrderStatus.ISSUE,
+              WmsFulfillmentOrderStatus.RESTOCKING,
+              WmsFulfillmentOrderStatus.PARTIAL,
+              WmsFulfillmentOrderStatus.READY,
+            ],
+          },
+          posOrder: {
+            is: {
+              isVoid: false,
+              status: { in: [2, 3, 4, 5] },
+              ...(effectiveGoLiveAt ? { insertedAt: { gte: effectiveGoLiveAt } } : {}),
+            },
+          },
+        },
+        select: {
+          id: true,
+          warehouseId: true,
+          posOrderId: true,
+          status: true,
+          completedAt: true,
+          posOrder: {
+            select: {
+              status: true,
+              tracking: true,
+            },
+          },
+        },
+      });
+
+      for (const shippedOrder of unpickedPosShippedOrders) {
+        await prisma.wmsFulfillmentLine.updateMany({
+          where: {
+            fulfillmentOrderId: shippedOrder.id,
+            status: { not: WmsFulfillmentLineStatus.CANCELED },
+            quantityRequired: { gt: 0 },
+          },
+          data: {
+            quantityAllocated: 0,
+            quantityPicked: 0,
+            status: WmsFulfillmentLineStatus.PICKED,
+            issueReason: null,
+          },
+        });
+        await prisma.wmsFulfillmentOrder.update({
+          where: { id: shippedOrder.id },
+          data: {
+            status: WmsFulfillmentOrderStatus.PACKED,
+            issueReason: null,
+            allocatedQuantity: 0,
+            pickedQuantity: 0,
+            completedAt: shippedOrder.completedAt ?? now,
+            lastSyncedAt: now,
+          },
+        });
+        await prisma.wmsStaffActivity.create({
+          data: {
+            tenantId: store.tenantId,
+            actorId: null,
+            actionType: shippedOrder.posOrder?.status === 3 ? 'ORDER_DELIVERY_SYNC' : 'ORDER_DISPATCH_SYNC',
+            resourceType: 'WMS_FULFILLMENT_ORDER',
+            resourceId: shippedOrder.id,
+            storeId: store.id,
+            warehouseId: shippedOrder.warehouseId,
+            fromStatus: shippedOrder.status,
+            toStatus: WmsFulfillmentOrderStatus.PACKED,
+            reasonCode: 'POS_STATUS_SYNC',
+            metadata: {
+              mode: 'POS_SYNC',
+              posOrderId: shippedOrder.posOrderId,
+              posStatus: shippedOrder.posOrder?.status ?? null,
+              trackingCode: shippedOrder.posOrder?.tracking ?? null,
+              previousWmsStatus: shippedOrder.status,
+              reason: 'Synced from POS status while order was still in Pick status',
+            },
+          },
+        });
+      }
+
       // 2. Sync all confirmed (status=1, isVoid=false) post-go-live POS orders for this store
       const confirmedPosOrders = await prisma.posOrder.findMany({
         where: {
@@ -5733,6 +5820,7 @@ async function reconcileToniosWmsFulfillmentQueue() {
         wmsFulfillmentGoLiveAt: effectiveGoLiveAt ? effectiveGoLiveAt.toISOString() : null,
         canceledStaleFulfillmentCount: unpickedCanceledOrders.length,
         canceledPreGoLiveCount,
+        syncedPosShippedPickOrdersCount: unpickedPosShippedOrders.length,
         createdFulfillmentCount,
         recoveredIssueCount,
         putawayBinUnitCount: putawayBinUnits.length,

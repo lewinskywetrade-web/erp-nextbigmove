@@ -837,4 +837,32 @@ describe('POS source freshness and recovery', () => {
     expect(blocked.upserted).toBe(0);
     expect(blocked.outcomes[0]).toMatchObject({ upsertStatus: 'SKIPPED', reason: 'SOURCE_DELETED' });
   });
+
+  it('queues WMS fulfillment sync before dispatch sync when a POS order transitions to shipped/delivered (2..5)', async () => {
+    const callOrder: string[] = [];
+    const { service, fulfillment, inventory } = createUpsertHarness(saved(older));
+    fulfillment.syncConfirmedPickingOrders.mockImplementation(async () => {
+      callOrder.push('fulfillment-sync');
+    });
+    inventory.syncPackedUnitsToDispatchedForPosOrders.mockImplementation(async () => {
+      callOrder.push('dispatch-sync');
+    });
+
+    const shipped = await service.upsertPosOrdersWithOutcomes(
+      'tenant-1',
+      'store-1',
+      [{ ...rawOrder, status: 2, items, updated_at: newer }],
+      null,
+    );
+
+    expect(shipped.upserted).toBe(1);
+    expect(fulfillment.syncConfirmedPickingOrders).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tenantId: 'tenant-1',
+        storeId: 'store-1',
+        posOrderRefs: [{ shopId: 'shop-1', posOrderId: 'order-1' }],
+      }),
+    );
+    expect(callOrder).toEqual(['fulfillment-sync', 'dispatch-sync']);
+  });
 });

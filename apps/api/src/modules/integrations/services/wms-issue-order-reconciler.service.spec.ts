@@ -336,4 +336,41 @@ describe('WmsIssueOrderReconcilerService & IntegrationService ISSUE hydration', 
     });
     expect(syncConfirmedPickingOrders).toHaveBeenCalledTimes(1);
   });
+
+  it('periodically syncs active stores that have open Pick Queue orders against live Pancake POS', async () => {
+    process.env.PROCESS_ROLE = 'api';
+    delete process.env.WMS_ISSUE_ORDER_RECONCILE_ENABLED;
+
+    const findMany = jest
+      .fn<(...args: any[]) => Promise<any[]>>()
+      .mockImplementation(async (args: any) => {
+        if (args?.distinct?.includes('storeId')) {
+          return [{ storeId: 'store-tonios', tenantId: 'tenant-tonios' }];
+        }
+        return [];
+      });
+    const syncPancakeOrdersByStoreId = jest
+      .fn<(...args: any[]) => Promise<any>>()
+      .mockResolvedValue({ fetchedCount: 10, upsertedCount: 2, wmsSyncedOrders: 2 });
+
+    const reconciler = new WmsIssueOrderReconcilerService(
+      { wmsFulfillmentOrder: { findMany } } as any,
+      {
+        reconcileOpenWmsIssueOrders: jest.fn(),
+        syncPancakeOrdersByStoreId,
+      } as any,
+    );
+
+    await reconciler.reconcileDueIssueOrders('startup');
+    expect(syncPancakeOrdersByStoreId).toHaveBeenCalledTimes(1);
+    expect(syncPancakeOrdersByStoreId).toHaveBeenCalledWith(
+      'store-tonios',
+      'tenant-tonios',
+      { days: 3, repairIssueOrders: true },
+    );
+
+    // Immediate cron tick within the 2-minute window skips re-syncing the same store
+    await reconciler.reconcileDueIssueOrders('cron');
+    expect(syncPancakeOrdersByStoreId).toHaveBeenCalledTimes(1);
+  });
 });

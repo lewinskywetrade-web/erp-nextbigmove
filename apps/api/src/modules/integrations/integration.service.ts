@@ -6336,7 +6336,13 @@ export class IntegrationService {
               WmsFulfillmentOrderStatus.RESTOCKING,
               WmsFulfillmentOrderStatus.PARTIAL,
               WmsFulfillmentOrderStatus.READY,
+              WmsFulfillmentOrderStatus.IN_PICKING,
             ],
+          },
+          posOrder: {
+            is: {
+              isVoid: false,
+            },
           },
         },
         select: {
@@ -6345,12 +6351,17 @@ export class IntegrationService {
           status: true,
           basketId: true,
           pickedQuantity: true,
+          posOrder: {
+            select: {
+              status: true,
+            },
+          },
         },
         orderBy: [
           { status: 'asc' },
           { createdAt: 'desc' },
         ],
-        take: 80,
+        take: 120,
       });
 
       hasOpenIssueOrders = openFulfillmentOrders.some(
