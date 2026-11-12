@@ -692,6 +692,43 @@ describe('WmsMobileService multi-line shared stock pool packing target resolutio
     });
     expect(resolvedPooledNmgScan?.id).toBe('line-oto-nmg');
 
+    // Even if basketUnit has a stale fulfillmentLineId pointing to line-nour-1490 (whether filled or unfilled),
+    // scanning OTO-NMG (0100099047) MUST match line-oto-nmg and never line-nour-1490
+    const resolvedOtoNmgWithStaleNourioLineFilled = (service as any).resolveDemandPackingTargetLine({
+      packableLines: order4307Lines,
+      orderStoreId: 'store-nourio',
+      basketUnit: {
+        storeId: 'store-nourio',
+        variationId: 'var-oto-nmg',
+        fulfillmentOrderId: 'order-4307',
+        fulfillmentLineId: 'line-nour-1490',
+        status: WmsBasketUnitStatus.PICKED,
+      },
+      targetOrderId: 'order-4307',
+      packedCountByLineId: order4307Packed,
+      poolIndex,
+    });
+    expect(resolvedOtoNmgWithStaleNourioLineFilled?.id).toBe('line-oto-nmg');
+
+    const resolvedOtoNmgWithStaleNourioLineUnfilled = (service as any).resolveDemandPackingTargetLine({
+      packableLines: order4307Lines,
+      orderStoreId: 'store-nourio',
+      basketUnit: {
+        storeId: 'store-nourio',
+        variationId: 'var-oto-nmg',
+        fulfillmentOrderId: 'order-4307',
+        fulfillmentLineId: 'line-nour-1490',
+        status: WmsBasketUnitStatus.PICKED,
+      },
+      targetOrderId: 'order-4307',
+      packedCountByLineId: new Map<string, number>([
+        ['line-nour-1490', 1],
+        ['line-oto-nmg', 0],
+      ]),
+      poolIndex,
+    });
+    expect(resolvedOtoNmgWithStaleNourioLineUnfilled?.id).toBe('line-oto-nmg');
+
     // Conversely, scanning an extra Nourio bottle on Order 4307 does NOT cross-pack into OTO-NMG
     const extraNourioScan = (service as any).resolveDemandPackingTargetLine({
       packableLines: order4307Lines,

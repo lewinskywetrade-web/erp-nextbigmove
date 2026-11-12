@@ -6613,66 +6613,59 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
         return leftGroup === rightGroup;
       };
 
-      // 4B. Heal active PUTAWAY / PICKED units in Famco whose variant was mutated across
-      //     now-unpooled products (e.g. OTO-NMG bottle 0100099047 mutated to Nourio)
-      const activeInventoryUnits = await prisma.wmsInventoryUnit.findMany({
-        where: {
-          tenantId: tenant.id,
-          status: {
-            in: [WmsInventoryUnitStatus.PUTAWAY, WmsInventoryUnitStatus.PICKED],
+      // 4B. Revert any prior automated SHARED_STOCK_POOL_HEAL mutations (once, idempotently)
+      //     and ensure confirmed physical OTO-NMG bottle 0100099047 is mapped to OTO-NMG.
+      const [priorHealMovements, priorRevertMovements] = await Promise.all([
+        prisma.wmsInventoryMovement.findMany({
+          where: {
+            tenantId: tenant.id,
+            referenceType: 'SHARED_STOCK_POOL_HEAL',
           },
-        },
-        select: {
-          id: true,
-          code: true,
-          barcode: true,
-          status: true,
-          warehouseId: true,
-          currentLocationId: true,
-          storeId: true,
-          posProductId: true,
-          productProfileId: true,
-          productId: true,
-          variationId: true,
-          posWarehouseRef: true,
-          receivingSequence: true,
-          receivingBatch: {
-            select: {
-              id: true,
-              code: true,
-              lines: {
-                orderBy: { lineNo: 'asc' },
-                select: {
-                  lineNo: true,
-                  storeId: true,
-                  resolvedProfileId: true,
-                  variationId: true,
-                  receivedQuantity: true,
-                  expectedQuantity: true,
-                },
-              },
-            },
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+          select: {
+            id: true,
+            inventoryUnitId: true,
+            notes: true,
           },
-          storeTransferItems: {
-            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-            take: 1,
-            select: {
-              id: true,
-              toStoreId: true,
-              toProductProfileId: true,
-              toVariationId: true,
-            },
+        }),
+        prisma.wmsInventoryMovement.findMany({
+          where: {
+            tenantId: tenant.id,
+            referenceType: 'SHARED_STOCK_POOL_HEAL_REVERT',
           },
-          movements: {
-            where: { referenceType: 'SHARED_STOCK_POOL' },
-            orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-            select: {
-              id: true,
-              notes: true,
-            },
+          select: {
+            inventoryUnitId: true,
           },
-        },
-      });
+        }),
+      ]);
+
+      const alreadyRevertedUnitIds = new Set(
+        priorRevertMovements.map((m) => m.inventoryUnitId),
+      );
+      const healBoundsByUnitId = new Map<
+        string,
+        { fromVariationId: string; toVariationId: string }
+      >();
+      for (const mov of priorHealMovements) {
+        if (alreadyRevertedUnitIds.has(mov.inventoryUnitId)) {
+          continue;
+        }
+        const match = (mov.notes ?? '').match(/\(([^)\s]+)\s*->\s*([^\s)]+)/);
+        const fromVar = match?.[1]?.trim();
+        const toVar = match?.[2]?.trim();
+        if (!fromVar || !toVar) {
+          continue;
+        }
+        const existing = healBoundsByUnitId.get(mov.inventoryUnitId);
+        if (!existing) {
+          healBoundsByUnitId.set(mov.inventoryUnitId, {
+            fromVariationId: fromVar,
+            toVariationId: toVar,
+          });
+        } else {
+          existing.toVariationId = toVar;
+        }
+      }
 
       const healedUnits: Array<{
         barcode: string;
@@ -6684,136 +6677,179 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
         source: string;
       }> = [];
 
-      for (const unit of activeInventoryUnits) {
-        let originProfile: (typeof profiles)[number] | undefined;
-        let originSource = '';
-
-        if (unit.storeTransferItems.length > 0) {
-          const latestTransfer = unit.storeTransferItems[0]!;
-          originProfile =
-            profileById.get(latestTransfer.toProductProfileId)
-            ?? profileByStoreVariation.get(`${latestTransfer.toStoreId}::${latestTransfer.toVariationId}`);
-          originSource = 'STORE_TRANSFER';
-        } else if (unit.receivingBatch && unit.receivingBatch.lines.length > 0) {
-          const lines = unit.receivingBatch.lines;
-          let matchedLine = lines.length === 1 ? lines[0] : undefined;
-          if (!matchedLine && typeof unit.receivingSequence === 'number' && unit.receivingSequence > 0) {
-            let cumulative = 0;
-            for (const line of lines) {
-              const qty = Math.max(
-                (line.receivedQuantity ?? 0) > 0 ? line.receivedQuantity : (line.expectedQuantity ?? 0),
-                0,
-              );
-              if (qty <= 0) continue;
-              if (unit.receivingSequence > cumulative && unit.receivingSequence <= cumulative + qty) {
-                matchedLine = line;
-                break;
-              }
-              cumulative += qty;
-            }
-          }
-          if (!matchedLine) {
-            const uniqueLineProfileKeys = Array.from(
-              new Set(
-                lines.map(
-                  (line) => line.resolvedProfileId ?? `${line.storeId}::${line.variationId ?? ''}`,
-                ),
-              ),
-            );
-            if (uniqueLineProfileKeys.length === 1) {
-              matchedLine = lines[0];
-            }
-          }
-          if (matchedLine) {
-            originProfile =
-              (matchedLine.resolvedProfileId ? profileById.get(matchedLine.resolvedProfileId) : undefined)
-              ?? (matchedLine.variationId
-                ? profileByStoreVariation.get(`${matchedLine.storeId}::${matchedLine.variationId}`)
-                : undefined);
-            originSource = 'RECEIVING_BATCH';
-          }
-        } else if (unit.movements.length > 0) {
-          const firstNote = unit.movements[0]?.notes ?? '';
-          const match = firstNote.match(/\(([^)\s]+)\s*->\s*([^)\s]+)\)/);
-          const originalVariationId = match?.[1]?.trim();
-          if (originalVariationId) {
-            originProfile =
-              profileByStoreVariation.get(`${unit.storeId}::${originalVariationId}`)
-              ?? profiles.find((p) => p.variationId === originalVariationId);
-            originSource = 'SHARED_STOCK_POOL_MOVEMENT';
-          }
-        }
-
-        if (!originProfile) {
-          continue;
-        }
-
-        if (
-          areStoreVariationsNowPooledOrSame(
-            unit.storeId,
-            unit.variationId,
-            originProfile.storeId,
-            originProfile.variationId,
-          )
-        ) {
-          continue;
-        }
-
-        await prisma.wmsInventoryUnit.update({
-          where: { id: unit.id },
-          data: {
-            storeId: originProfile.storeId,
-            posProductId: originProfile.posProductId,
-            productProfileId: originProfile.id,
-            productId: originProfile.productId,
-            variationId: originProfile.variationId,
-            posWarehouseRef:
-              originSource === 'STORE_TRANSFER' && unit.storeId === originProfile.storeId
-                ? null
-                : originProfile.posWarehouseRef ?? null,
+      const unitIdsToRevert = Array.from(healBoundsByUnitId.keys());
+      if (unitIdsToRevert.length > 0) {
+        const unitsToInspect = await prisma.wmsInventoryUnit.findMany({
+          where: {
+            tenantId: tenant.id,
+            id: { in: unitIdsToRevert },
+            status: {
+              in: [WmsInventoryUnitStatus.PUTAWAY, WmsInventoryUnitStatus.PICKED],
+            },
+          },
+          select: {
+            id: true,
+            code: true,
+            barcode: true,
+            status: true,
+            warehouseId: true,
+            currentLocationId: true,
+            storeId: true,
+            variationId: true,
           },
         });
 
-        if (unit.status === WmsInventoryUnitStatus.PICKED) {
-          await prisma.wmsBasketUnit.updateMany({
-            where: {
-              inventoryUnitId: unit.id,
-              status: WmsBasketUnitStatus.PICKED,
-            },
+        for (const unit of unitsToInspect) {
+          const bounds = healBoundsByUnitId.get(unit.id);
+          if (!bounds || unit.variationId !== bounds.toVariationId) {
+            continue;
+          }
+          const restoreProfile =
+            profileByStoreVariation.get(`${unit.storeId}::${bounds.fromVariationId}`)
+            ?? profiles.find((p) => p.variationId === bounds.fromVariationId);
+          if (!restoreProfile) {
+            continue;
+          }
+
+          await prisma.wmsInventoryUnit.update({
+            where: { id: unit.id },
             data: {
-              storeId: originProfile.storeId,
-              productId: originProfile.productId,
-              variationId: originProfile.variationId,
+              storeId: restoreProfile.storeId,
+              posProductId: restoreProfile.posProductId,
+              productProfileId: restoreProfile.id,
+              productId: restoreProfile.productId,
+              variationId: restoreProfile.variationId,
+              posWarehouseRef:
+                unit.storeId === restoreProfile.storeId
+                  ? null
+                  : restoreProfile.posWarehouseRef ?? null,
             },
           });
-        }
 
-        await prisma.wmsInventoryMovement.create({
-          data: {
+          if (unit.status === WmsInventoryUnitStatus.PICKED) {
+            await prisma.wmsBasketUnit.updateMany({
+              where: {
+                inventoryUnitId: unit.id,
+                status: WmsBasketUnitStatus.PICKED,
+              },
+              data: {
+                storeId: restoreProfile.storeId,
+                productId: restoreProfile.productId,
+                variationId: restoreProfile.variationId,
+              },
+            });
+          }
+
+          await prisma.wmsInventoryMovement.create({
+            data: {
+              tenantId: tenant.id,
+              inventoryUnitId: unit.id,
+              warehouseId: unit.warehouseId,
+              fromLocationId: unit.currentLocationId,
+              toLocationId: unit.currentLocationId,
+              fromStatus: unit.status,
+              toStatus: unit.status,
+              movementType: WmsInventoryMovementType.ADJUSTMENT,
+              referenceType: 'SHARED_STOCK_POOL_HEAL_REVERT',
+              referenceCode: unit.barcode,
+              notes: `Reverted automated transfer-history variant heal (${unit.variationId} -> ${restoreProfile.variationId})`,
+              createdAt: now,
+            },
+          });
+
+          healedUnits.push({
+            barcode: unit.barcode,
+            code: unit.code,
+            status: unit.status,
+            fromVariationId: unit.variationId,
+            toVariationId: restoreProfile.variationId,
+            toProductName: restoreProfile.posProduct.name,
+            source: 'SHARED_STOCK_POOL_HEAL_REVERT',
+          });
+        }
+      }
+
+      // Ensure confirmed physical OTO-NMG bottle 0100099047 is mapped to OTO-NMG if still unpacked
+      const otoNmgProfile = profiles.find(
+        (p) =>
+          (p.posProduct.customId ?? '').trim().toUpperCase() === 'OTO-NMG'
+          || extractSeedVariationDisplayId(p.posProduct.productSnapshot)?.trim().toUpperCase() === 'OTO-NMG',
+      );
+      if (otoNmgProfile) {
+        const unit0100099047 = await prisma.wmsInventoryUnit.findFirst({
+          where: {
             tenantId: tenant.id,
-            inventoryUnitId: unit.id,
-            warehouseId: unit.warehouseId,
-            fromLocationId: unit.currentLocationId,
-            toLocationId: unit.currentLocationId,
-            fromStatus: unit.status,
-            toStatus: unit.status,
-            movementType: WmsInventoryMovementType.ADJUSTMENT,
-            referenceType: 'SHARED_STOCK_POOL_HEAL',
-            referenceCode: unit.barcode,
-            notes: `Restored physical product variant after separating cross-product stock pool (${unit.variationId} -> ${originProfile.variationId} via ${originSource})`,
-            createdAt: now,
+            OR: [{ barcode: '0100099047' }, { code: '0100099047' }, { code: 'FAM0100099047' }],
+            status: {
+              in: [WmsInventoryUnitStatus.PUTAWAY, WmsInventoryUnitStatus.PICKED],
+            },
+          },
+          select: {
+            id: true,
+            code: true,
+            barcode: true,
+            status: true,
+            warehouseId: true,
+            currentLocationId: true,
+            storeId: true,
+            variationId: true,
           },
         });
 
-        healedUnits.push({
-          barcode: unit.barcode,
-          code: unit.code,
-          status: unit.status,
-          fromVariationId: unit.variationId,
-          toVariationId: originProfile.variationId,
-          toProductName: originProfile.posProduct.name,
-          source: originSource,
-        });
+        if (unit0100099047 && unit0100099047.variationId !== otoNmgProfile.variationId) {
+          await prisma.wmsInventoryUnit.update({
+            where: { id: unit0100099047.id },
+            data: {
+              storeId: otoNmgProfile.storeId,
+              posProductId: otoNmgProfile.posProductId,
+              productProfileId: otoNmgProfile.id,
+              productId: otoNmgProfile.productId,
+              variationId: otoNmgProfile.variationId,
+              posWarehouseRef:
+                unit0100099047.storeId === otoNmgProfile.storeId
+                  ? null
+                  : otoNmgProfile.posWarehouseRef ?? null,
+            },
+          });
+          if (unit0100099047.status === WmsInventoryUnitStatus.PICKED) {
+            await prisma.wmsBasketUnit.updateMany({
+              where: {
+                inventoryUnitId: unit0100099047.id,
+                status: WmsBasketUnitStatus.PICKED,
+              },
+              data: {
+                storeId: otoNmgProfile.storeId,
+                productId: otoNmgProfile.productId,
+                variationId: otoNmgProfile.variationId,
+              },
+            });
+          }
+          await prisma.wmsInventoryMovement.create({
+            data: {
+              tenantId: tenant.id,
+              inventoryUnitId: unit0100099047.id,
+              warehouseId: unit0100099047.warehouseId,
+              fromLocationId: unit0100099047.currentLocationId,
+              toLocationId: unit0100099047.currentLocationId,
+              fromStatus: unit0100099047.status,
+              toStatus: unit0100099047.status,
+              movementType: WmsInventoryMovementType.ADJUSTMENT,
+              referenceType: 'PHYSICAL_BARCODE_VERIFY',
+              referenceCode: unit0100099047.barcode,
+              notes: `Aligned physical OTO-NMG bottle 0100099047 (${unit0100099047.variationId} -> ${otoNmgProfile.variationId})`,
+              createdAt: now,
+            },
+          });
+          healedUnits.push({
+            barcode: unit0100099047.barcode,
+            code: unit0100099047.code,
+            status: unit0100099047.status,
+            fromVariationId: unit0100099047.variationId,
+            toVariationId: otoNmgProfile.variationId,
+            toProductName: otoNmgProfile.posProduct.name,
+            source: 'PHYSICAL_BARCODE_VERIFY',
+          });
+        }
       }
 
       if (healedUnits.length > 0) {

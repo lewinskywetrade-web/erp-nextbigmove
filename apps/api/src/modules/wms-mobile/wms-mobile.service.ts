@@ -4712,29 +4712,29 @@ export class WmsMobileService {
 
     for (let index = 0; index < params.packableLines.length; index += 1) {
       const line = params.packableLines[index]!;
-      let rank: number | null = null;
-      if (
-        params.basketUnit.fulfillmentOrderId === params.targetOrderId
-        && line.id === params.basketUnit.fulfillmentLineId
-      ) {
-        rank = 0;
-      } else if (line.variationId === params.basketUnit.variationId) {
-        rank = 1;
-      } else if (
-        params.poolIndex.hasAnyPools
+      const isExact = line.variationId === params.basketUnit.variationId;
+      const isPooled = !isExact
+        && params.poolIndex.hasAnyPools
         && params.poolIndex.areStoreVariationsPooled(
           params.orderStoreId,
           line.variationId,
           unitStoreId,
           params.basketUnit.variationId,
-        )
-      ) {
-        rank = 2;
-      }
-
-      if (rank === null) {
+        );
+      if (!isExact && !isPooled) {
         continue;
       }
+
+      const isAssigned =
+        params.basketUnit.fulfillmentOrderId === params.targetOrderId
+        && line.id === params.basketUnit.fulfillmentLineId;
+      const rank = isAssigned && isExact
+        ? 0
+        : isExact
+          ? 1
+          : isAssigned
+            ? 2
+            : 3;
 
       const required = Math.max(line.quantityRequired ?? 0, 0);
       const packed = params.packedCountByLineId.get(line.id) ?? 0;
