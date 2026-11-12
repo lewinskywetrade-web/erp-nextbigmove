@@ -4461,42 +4461,61 @@ export class WmsMobileService {
         line.status !== WmsFulfillmentLineStatus.CANCELED
         && Math.max(line.quantityRequired ?? 0, 0) > 0
       ));
-      let poolIndex = EMPTY_STOCK_POOL_INDEX;
-      let matchingLine = packableLines.find((line: any) => line.variationId === basketUnit.variationId);
-      if (!matchingLine) {
-        poolIndex = await loadTenantStockPoolIndex(tx, scopedOrder.tenantId);
-        if (poolIndex.hasAnyPools) {
-          matchingLine = packableLines.find((line: any) => (
-            poolIndex.areStoreVariationsPooled(
-              scopedOrder.storeId,
-              line.variationId,
-              basketUnit.storeId ?? scopedOrder.storeId,
-              basketUnit.variationId,
-            )
-          ));
+      const packedCountByLineId = new Map<string, number>();
+      for (const candidate of scopedOrder.basketUnits ?? []) {
+        if (candidate.status !== WmsBasketUnitStatus.PACKED || !candidate.fulfillmentLineId) {
+          continue;
         }
+        packedCountByLineId.set(
+          candidate.fulfillmentLineId,
+          (packedCountByLineId.get(candidate.fulfillmentLineId) ?? 0) + 1,
+        );
       }
+      const poolIndex = await loadTenantStockPoolIndex(tx, scopedOrder.tenantId);
+      const matchingLine = this.resolveDemandPackingTargetLine({
+        packableLines,
+        orderStoreId: scopedOrder.storeId,
+        basketUnit,
+        targetOrderId: scopedOrder.id,
+        packedCountByLineId,
+        poolIndex,
+      });
       if (!matchingLine) {
         throw new BadRequestException(`Unit ${scannedUnit.code} is not one of the products required by order ${scopedOrder.posOrderId}`);
       }
 
-      const packedForLine = (scopedOrder.basketUnits ?? []).filter((candidate: any) => (
-        candidate.status === WmsBasketUnitStatus.PACKED
-        && candidate.fulfillmentLineId === matchingLine.id
-      )).length;
-      if (packedForLine >= Math.max(matchingLine.quantityRequired ?? 0, 0)) {
-        throw new BadRequestException(`Order ${scopedOrder.posOrderId} already has all required ${matchingLine.productName} units packed`);
+      if (
+        basketUnit.status === WmsBasketUnitStatus.PACKED
+        && basketUnit.fulfillmentOrderId === scopedOrder.id
+      ) {
+        throw new ConflictException(`Unit ${scannedUnit.code} was already packed`);
       }
 
-      if (!poolIndex.hasAnyPools) {
-        poolIndex = await loadTenantStockPoolIndex(tx, scopedOrder.tenantId);
+      const packedForLine = packedCountByLineId.get(matchingLine.id) ?? 0;
+      if (packedForLine >= Math.max(matchingLine.quantityRequired ?? 0, 0)) {
+        const unpackedBasketUnits = (scopedBasket.basketUnits ?? []).filter(
+          (candidate: any) => candidate.status === WmsBasketUnitStatus.PICKED,
+        );
+        throw new BadRequestException(
+          this.formatDemandPackingLineFullMessage(
+            scopedOrder.posOrderId,
+            matchingLine,
+            packableLines,
+            packedCountByLineId,
+            scopedOrder.storeId,
+            unpackedBasketUnits,
+            poolIndex,
+          ),
+        );
       }
+
       const targetPoolMember = poolIndex.getTargetMember(scopedOrder.storeId, matchingLine.variationId);
       const isCrossVariantPack = Boolean(
         targetPoolMember
         && (
           (basketUnit.storeId ?? scopedOrder.storeId) !== targetPoolMember.storeId
           || basketUnit.variationId !== targetPoolMember.variationId
+          || (basketUnit.inventoryUnit?.variationId && basketUnit.inventoryUnit.variationId !== targetPoolMember.variationId)
         ),
       );
 
@@ -4506,6 +4525,7 @@ export class WmsMobileService {
         basketUnit,
         targetOrderId: scopedOrder.id,
         targetOrderCode: scopedOrder.posOrderId,
+        targetLineId: matchingLine.id,
         targetStoreId: scopedOrder.storeId,
         targetVariationId: matchingLine.variationId,
         unitCode: scannedUnit.code,
@@ -4513,10 +4533,6 @@ export class WmsMobileService {
         now,
         poolIndex,
       });
-
-      if (basketUnit.status === WmsBasketUnitStatus.PACKED) {
-        throw new ConflictException(`Unit ${scannedUnit.code} was already packed`);
-      }
 
       const updateBasketUnitResult = await tx.wmsBasketUnit.updateMany({
         where: {
@@ -4657,6 +4673,157 @@ export class WmsMobileService {
     };
   }
 
+  private resolveDemandPackingTargetLine<
+    TLine extends {
+      id: string;
+      variationId: string;
+      productName: string;
+      quantityRequired: number | null;
+    },
+  >(params: {
+    packableLines: TLine[];
+    orderStoreId: string;
+    basketUnit: {
+      storeId?: string | null;
+      variationId: string;
+      fulfillmentOrderId: string | null;
+      fulfillmentLineId: string | null;
+      status: WmsBasketUnitStatus;
+    };
+    targetOrderId: string;
+    packedCountByLineId: ReadonlyMap<string, number>;
+    poolIndex: TenantStockPoolIndex;
+  }): TLine | null {
+    if (
+      params.basketUnit.status === WmsBasketUnitStatus.PACKED
+      && params.basketUnit.fulfillmentOrderId === params.targetOrderId
+      && params.basketUnit.fulfillmentLineId
+    ) {
+      const idempotentLine = params.packableLines.find(
+        (line) => line.id === params.basketUnit.fulfillmentLineId,
+      );
+      if (idempotentLine) {
+        return idempotentLine;
+      }
+    }
+
+    const unitStoreId = params.basketUnit.storeId ?? params.orderStoreId;
+    const compatible: Array<{ line: TLine; index: number; rank: number; remaining: number }> = [];
+
+    for (let index = 0; index < params.packableLines.length; index += 1) {
+      const line = params.packableLines[index]!;
+      let rank: number | null = null;
+      if (
+        params.basketUnit.fulfillmentOrderId === params.targetOrderId
+        && line.id === params.basketUnit.fulfillmentLineId
+      ) {
+        rank = 0;
+      } else if (line.variationId === params.basketUnit.variationId) {
+        rank = 1;
+      } else if (
+        params.poolIndex.hasAnyPools
+        && params.poolIndex.areStoreVariationsPooled(
+          params.orderStoreId,
+          line.variationId,
+          unitStoreId,
+          params.basketUnit.variationId,
+        )
+      ) {
+        rank = 2;
+      }
+
+      if (rank === null) {
+        continue;
+      }
+
+      const required = Math.max(line.quantityRequired ?? 0, 0);
+      const packed = params.packedCountByLineId.get(line.id) ?? 0;
+      compatible.push({
+        line,
+        index,
+        rank,
+        remaining: required - packed,
+      });
+    }
+
+    if (compatible.length === 0) {
+      return null;
+    }
+
+    const sortBySpecificity = (
+      left: { rank: number; index: number },
+      right: { rank: number; index: number },
+    ) => (left.rank - right.rank) || (left.index - right.index);
+
+    const unfilled = compatible.filter((entry) => entry.remaining > 0).sort(sortBySpecificity);
+    if (unfilled.length > 0) {
+      return unfilled[0]!.line;
+    }
+
+    compatible.sort(sortBySpecificity);
+    return compatible[0]!.line;
+  }
+
+  private formatDemandPackingLineFullMessage<
+    TLine extends {
+      id: string;
+      variationId: string;
+      productName: string;
+      quantityRequired: number | null;
+    },
+  >(
+    posOrderId: string,
+    matchingLine: TLine,
+    packableLines: TLine[],
+    packedCountByLineId: ReadonlyMap<string, number>,
+    orderStoreId?: string,
+    unpackedBasketUnits?: Array<{
+      storeId?: string | null;
+      variationId: string;
+      inventoryUnit?: { barcode?: string | null; code?: string | null } | null;
+    }>,
+    poolIndex: TenantStockPoolIndex = EMPTY_STOCK_POOL_INDEX,
+  ): string {
+    const baseMessage = `Order ${posOrderId} already has all required ${matchingLine.productName} units packed`;
+    const otherUnfilled = packableLines
+      .filter((line) => line.id !== matchingLine.id)
+      .map((line) => {
+        const remaining = Math.max(line.quantityRequired ?? 0, 0) - (packedCountByLineId.get(line.id) ?? 0);
+        const candidateLabels = (unpackedBasketUnits ?? [])
+          .filter((unit) => (
+            unit.variationId === line.variationId
+            || (
+              Boolean(orderStoreId)
+              && poolIndex.hasAnyPools
+              && poolIndex.areStoreVariationsPooled(
+                orderStoreId!,
+                line.variationId,
+                unit.storeId ?? orderStoreId!,
+                unit.variationId,
+              )
+            )
+          ))
+          .map((unit) => unit.inventoryUnit?.barcode || unit.inventoryUnit?.code || null)
+          .filter((code): code is string => Boolean(code));
+        return {
+          productName: line.productName,
+          remaining,
+          sampleBarcode: candidateLabels[0] ?? null,
+        };
+      })
+      .filter((entry) => entry.remaining > 0);
+    if (otherUnfilled.length === 0) {
+      return baseMessage;
+    }
+    return `${baseMessage} — scan remaining: ${otherUnfilled
+      .map((entry) => (
+        entry.sampleBarcode
+          ? `${entry.productName} (${entry.remaining} left, barcode ${entry.sampleBarcode})`
+          : `${entry.productName} (${entry.remaining} left)`
+      ))
+      .join(', ')}`;
+  }
+
   private async reassignDemandPackingUnitIfNeeded(
     tx: Prisma.TransactionClient,
     params: {
@@ -4673,6 +4840,7 @@ export class WmsMobileService {
       };
       targetOrderId: string;
       targetOrderCode: string;
+      targetLineId?: string;
       targetStoreId?: string;
       targetVariationId?: string;
       unitCode: string;
@@ -4710,7 +4878,6 @@ export class WmsMobileService {
             quantityRequired: { gt: 0 },
           },
           select: { id: true, variationId: true },
-          take: 1,
         },
       },
     });
@@ -4738,8 +4905,12 @@ export class WmsMobileService {
       );
     }
 
-    const sourceLine = sourceOrder.lines[0] ?? null;
-    const sourceLineId = params.basketUnit.fulfillmentLineId ?? sourceLine?.id ?? null;
+    const sourceLine =
+      sourceOrder.lines.find((line) => line.id === params.basketUnit.fulfillmentLineId)
+      ?? sourceOrder.lines.find((line) => line.variationId === params.basketUnit.variationId)
+      ?? sourceOrder.lines[0]
+      ?? null;
+    const sourceLineId = sourceLine?.id ?? params.basketUnit.fulfillmentLineId ?? null;
     if (!sourceLineId) {
       throw new ConflictException(
         `Unit ${params.unitCode} has no valid order line in basket ${params.basketCode}`,
@@ -4772,11 +4943,24 @@ export class WmsMobileService {
     const replacementSelect = {
       id: true,
       storeId: true,
+      warehouseId: true,
+      sourceLocationId: true,
       variationId: true,
       inventoryUnitId: true,
       fulfillmentOrderId: true,
     } satisfies Prisma.WmsBasketUnitSelect;
-    let replacementUnit = await tx.wmsBasketUnit.findFirst({
+    let replacementUnit = params.targetLineId
+      ? await tx.wmsBasketUnit.findFirst({
+          where: {
+            ...replacementWhere,
+            fulfillmentOrderId: params.targetOrderId,
+            fulfillmentLineId: params.targetLineId,
+          },
+          select: replacementSelect,
+          orderBy: [{ pickedAt: 'asc' }, { createdAt: 'asc' }],
+        })
+      : null;
+    replacementUnit ??= await tx.wmsBasketUnit.findFirst({
       where: {
         ...replacementWhere,
         fulfillmentOrderId: params.targetOrderId,
@@ -4854,6 +5038,26 @@ export class WmsMobileService {
           updatedById: params.actorId ?? undefined,
         },
       });
+      if (tx.wmsInventoryMovement?.create && replacementUnit.warehouseId && sourceOrder.tenantId) {
+        await tx.wmsInventoryMovement.create({
+          data: {
+            tenantId: sourceOrder.tenantId,
+            inventoryUnitId: replacementUnit.inventoryUnitId,
+            warehouseId: replacementUnit.warehouseId,
+            fromLocationId: replacementUnit.sourceLocationId ?? null,
+            toLocationId: replacementUnit.sourceLocationId ?? null,
+            fromStatus: WmsInventoryUnitStatus.PICKED,
+            toStatus: WmsInventoryUnitStatus.PICKED,
+            movementType: WmsInventoryMovementType.ADJUSTMENT,
+            referenceType: 'SHARED_STOCK_POOL',
+            referenceId: sourcePoolMember.stockPoolGroupId,
+            referenceCode: params.basketCode,
+            notes: `Auto-assigned from shared stock pool on packing swap (${replacementUnit.variationId} -> ${sourcePoolMember.variationId})`,
+            actorId: params.actorId ?? null,
+            createdAt: params.now ?? new Date(),
+          },
+        });
+      }
     }
 
     return {
@@ -4961,6 +5165,7 @@ export class WmsMobileService {
         },
         select: {
           id: true,
+          storeId: true,
           code: true,
           barcode: true,
           status: true,
@@ -4994,32 +5199,6 @@ export class WmsMobileService {
         throw new BadRequestException(`Unit ${scannedUnit.code} is not in basket ${scopedBasket.barcode}`);
       }
 
-      const packableLines = scopedOrder.lines.filter((line) => (
-        line.status !== WmsFulfillmentLineStatus.CANCELED
-        && Math.max(line.quantityRequired, 0) > 0
-      ));
-      let poolIndex = EMPTY_STOCK_POOL_INDEX;
-      let matchingLine = packableLines.find((line) => (
-        line.id === basketUnit.fulfillmentLineId
-        || line.variationId === basketUnit.variationId
-      ));
-      if (!matchingLine) {
-        poolIndex = await loadTenantStockPoolIndex(tx, scopedOrder.tenantId);
-        if (poolIndex.hasAnyPools) {
-          matchingLine = packableLines.find((line) => (
-            poolIndex.areStoreVariationsPooled(
-              scopedOrder.storeId,
-              line.variationId,
-              basketUnit.storeId ?? scopedOrder.storeId,
-              basketUnit.variationId,
-            )
-          ));
-        }
-      }
-      if (!matchingLine) {
-        throw new BadRequestException(`Unit ${scannedUnit.code} is not one of the products required by order ${scopedOrder.posOrderId}`);
-      }
-
       if (
         basketUnit.status === WmsBasketUnitStatus.PACKED
         && basketUnit.fulfillmentOrderId !== scopedOrder.id
@@ -5035,19 +5214,89 @@ export class WmsMobileService {
         );
       }
 
-      if (!poolIndex.hasAnyPools) {
-        poolIndex = await loadTenantStockPoolIndex(tx, scopedOrder.tenantId);
+      const packableLines = scopedOrder.lines.filter((line) => (
+        line.status !== WmsFulfillmentLineStatus.CANCELED
+        && Math.max(line.quantityRequired, 0) > 0
+      ));
+      const [packedUnitsForOrder, poolIndex] = await Promise.all([
+        tx.wmsBasketUnit.findMany({
+          where: {
+            fulfillmentOrderId: scopedOrder.id,
+            status: WmsBasketUnitStatus.PACKED,
+          },
+          select: {
+            fulfillmentLineId: true,
+          },
+        }),
+        loadTenantStockPoolIndex(tx, scopedOrder.tenantId),
+      ]);
+      const packedCountByLineId = new Map<string, number>();
+      for (const packedUnit of packedUnitsForOrder) {
+        if (!packedUnit.fulfillmentLineId) {
+          continue;
+        }
+        packedCountByLineId.set(
+          packedUnit.fulfillmentLineId,
+          (packedCountByLineId.get(packedUnit.fulfillmentLineId) ?? 0) + 1,
+        );
       }
+
+      const matchingLine = this.resolveDemandPackingTargetLine({
+        packableLines,
+        orderStoreId: scopedOrder.storeId,
+        basketUnit,
+        targetOrderId: scopedOrder.id,
+        packedCountByLineId,
+        poolIndex,
+      });
+      if (!matchingLine) {
+        throw new BadRequestException(`Unit ${scannedUnit.code} is not one of the products required by order ${scopedOrder.posOrderId}`);
+      }
+
       const targetPoolMember = poolIndex.getTargetMember(scopedOrder.storeId, matchingLine.variationId);
       const isCrossVariantPack = Boolean(
         targetPoolMember
         && (
-          (basketUnit.storeId ?? scopedOrder.storeId) !== targetPoolMember.storeId
+          (basketUnit.storeId ?? scannedUnit.storeId ?? scopedOrder.storeId) !== targetPoolMember.storeId
           || basketUnit.variationId !== targetPoolMember.variationId
+          || scannedUnit.variationId !== targetPoolMember.variationId
         ),
       );
 
       let alreadyProcessed = basketUnit.status === WmsBasketUnitStatus.PACKED;
+      if (!alreadyProcessed) {
+        const packedForLine = packedCountByLineId.get(matchingLine.id) ?? 0;
+        if (packedForLine >= Math.max(matchingLine.quantityRequired, 0)) {
+          const unpackedBasketUnits = await tx.wmsBasketUnit.findMany({
+            where: {
+              basketId: scopedBasket.id,
+              status: WmsBasketUnitStatus.PICKED,
+            },
+            select: {
+              storeId: true,
+              variationId: true,
+              inventoryUnit: {
+                select: {
+                  barcode: true,
+                  code: true,
+                },
+              },
+            },
+          });
+          throw new BadRequestException(
+            this.formatDemandPackingLineFullMessage(
+              scopedOrder.posOrderId,
+              matchingLine,
+              packableLines,
+              packedCountByLineId,
+              scopedOrder.storeId,
+              unpackedBasketUnits,
+              poolIndex,
+            ),
+          );
+        }
+      }
+
       let reassignment = alreadyProcessed
         ? null
         : await this.reassignDemandPackingUnitIfNeeded(tx, {
@@ -5056,6 +5305,7 @@ export class WmsMobileService {
             basketUnit,
             targetOrderId: scopedOrder.id,
             targetOrderCode: scopedOrder.posOrderId,
+            targetLineId: matchingLine.id,
             targetStoreId: scopedOrder.storeId,
             targetVariationId: matchingLine.variationId,
             unitCode: scannedUnit.code,
@@ -5064,15 +5314,6 @@ export class WmsMobileService {
             poolIndex,
           });
       if (!alreadyProcessed) {
-        const packedForLine = await tx.wmsBasketUnit.count({
-          where: {
-            fulfillmentLineId: matchingLine.id,
-            status: WmsBasketUnitStatus.PACKED,
-          },
-        });
-        if (packedForLine >= Math.max(matchingLine.quantityRequired, 0)) {
-          throw new BadRequestException(`Order ${scopedOrder.posOrderId} already has all required ${matchingLine.productName} units packed`);
-        }
 
         const updateBasketUnitResult = await tx.wmsBasketUnit.updateMany({
           where: {

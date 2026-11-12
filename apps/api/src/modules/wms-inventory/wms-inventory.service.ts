@@ -23,7 +23,10 @@ import { ClsService } from 'nestjs-cls';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { WmsStaffActivityService } from '../../common/services/wms-staff-activity.service';
 import { WmsFulfillmentSyncService } from '../wms-fulfillment/wms-fulfillment-sync.service';
-import { linkProfilesIntoSharedStockPoolTx } from '../wms-fulfillment/wms-stock-pool.util';
+import {
+  areProfilesCompatibleForStockPool,
+  linkProfilesIntoSharedStockPoolTx,
+} from '../wms-fulfillment/wms-stock-pool.util';
 import { CreateWmsInventoryAdjustmentDto } from './dto/create-wms-inventory-adjustment.dto';
 import { CreateWmsInventoryStoreTransferDto } from './dto/create-wms-inventory-store-transfer.dto';
 import { CreateWmsInventoryTransferDto } from './dto/create-wms-inventory-transfer.dto';
@@ -1237,6 +1240,7 @@ export class WmsInventoryService {
             forwardTransferCount: stats?.forwardTransferIds.size ?? 0,
             reverseTransferCount: stats?.reverseTransferIds.size ?? 0,
           },
+          sourceProfile,
         );
       });
     const suggestion = this.resolveStoreTransferSuggestion({
@@ -3785,6 +3789,13 @@ export class WmsInventoryService {
       forwardTransferCount: number;
       reverseTransferCount: number;
     },
+    sourceProfile?: {
+      posProduct: {
+        customId: string | null;
+        productSnapshot: Prisma.JsonValue | null;
+        name: string;
+      };
+    } | null,
   ) {
     const alreadyPooled = Boolean(
       sourceStockPoolGroupId
@@ -3794,18 +3805,34 @@ export class WmsInventoryService {
     const forwardCount = transferHistory?.forwardTransferCount ?? 0;
     const reverseCount = transferHistory?.reverseTransferCount ?? 0;
     const priorTransferBatches = forwardCount + reverseCount;
+    const variationDisplayId = this.resolveVariationDisplayId(profile.posProduct.productSnapshot);
+    const compatibleForAutoPool = sourceProfile
+      ? areProfilesCompatibleForStockPool(
+          {
+            name: sourceProfile.posProduct.name,
+            customId: sourceProfile.posProduct.customId,
+            variationDisplayId: this.resolveVariationDisplayId(sourceProfile.posProduct.productSnapshot),
+          },
+          {
+            name: profile.posProduct.name,
+            customId: profile.posProduct.customId,
+            variationDisplayId,
+          },
+        )
+      : false;
     return {
       id: profile.id,
       profileId: profile.id,
       posProductId: profile.posProductId,
       productId: profile.productId,
       variationId: profile.variationId,
-      variationDisplayId: this.resolveVariationDisplayId(profile.posProduct.productSnapshot),
+      variationDisplayId,
       productCustomId: profile.posProduct.customId,
       name: profile.posProduct.name,
       label: profile.posProduct.name,
       alreadyPooled,
-      recommendShareStockPool: !alreadyPooled && priorTransferBatches > 0,
+      compatibleForAutoPool,
+      recommendShareStockPool: !alreadyPooled && reverseCount > 0 && compatibleForAutoPool,
       priorTransferBatches,
       bidirectionalTransferHistory: reverseCount > 0,
     };
@@ -3879,7 +3906,7 @@ export class WmsInventoryService {
     }
 
     const priorTransferredProduct = [...params.products]
-      .filter((product) => (product.priorTransferBatches ?? 0) > 0)
+      .filter((product) => (product.priorTransferBatches ?? 0) > 0 && product.compatibleForAutoPool !== false)
       .sort((left, right) => {
         const biDiff = Number(Boolean(right.bidirectionalTransferHistory)) - Number(Boolean(left.bidirectionalTransferHistory));
         if (biDiff !== 0) return biDiff;

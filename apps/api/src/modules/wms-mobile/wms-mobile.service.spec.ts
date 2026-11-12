@@ -9,6 +9,10 @@ import {
   WmsFulfillmentLineStatus,
   WmsFulfillmentOrderStatus,
 } from '@prisma/client';
+import {
+  EMPTY_STOCK_POOL_INDEX,
+  TenantStockPoolIndex,
+} from '../wms-fulfillment/wms-stock-pool.util';
 import { WmsMobileService } from './wms-mobile.service';
 
 describe('WmsMobileService packing POS item guard', () => {
@@ -522,5 +526,239 @@ describe('WmsMobileService basket POS-shipped pick order reconciliation', () => 
     );
     expect(mappedLineIssue.lines).toHaveLength(1);
     expect(mappedLineIssue.lines[0].status).toBe('ISSUE');
+  });
+});
+
+describe('WmsMobileService multi-line shared stock pool packing target resolution', () => {
+  const service = Object.create(WmsMobileService.prototype) as WmsMobileService;
+
+  const poolIndex = new TenantStockPoolIndex([
+    {
+      profileId: 'prof-nour-1490',
+      tenantId: 'tenant-famco',
+      storeId: 'store-nourio',
+      posProductId: 'pos-prod-nour',
+      productId: 'prod-nour',
+      variationId: 'var-nour-1490',
+      posWarehouseRef: null,
+      stockPoolGroupId: 'pool-nourio',
+      productName: 'Nourio - 1 bottle 1490',
+      productCustomId: 'NOUR',
+      variationDisplayId: 'NOUR',
+      storeName: 'Nourio',
+    },
+    {
+      profileId: 'prof-oto-nour',
+      tenantId: 'tenant-famco',
+      storeId: 'store-nourio',
+      posProductId: 'pos-prod-oto-nour',
+      productId: 'prod-oto-nour',
+      variationId: 'var-oto-nour',
+      posWarehouseRef: null,
+      stockPoolGroupId: 'pool-nourio',
+      productName: 'OTO - Nourio',
+      productCustomId: 'OTO-NOUR',
+      variationDisplayId: 'OTO-NOUR',
+      storeName: 'Nourio',
+    },
+    {
+      profileId: 'prof-nmg',
+      tenantId: 'tenant-famco',
+      storeId: 'store-nourio',
+      posProductId: 'pos-prod-nmg',
+      productId: 'prod-nmg',
+      variationId: 'var-nmg',
+      posWarehouseRef: null,
+      stockPoolGroupId: 'pool-magnesium',
+      productName: 'Nourio Magnesium - 1 bottle',
+      productCustomId: 'NMG',
+      variationDisplayId: 'NMG',
+      storeName: 'Nourio',
+    },
+    {
+      profileId: 'prof-oto-nmg',
+      tenantId: 'tenant-famco',
+      storeId: 'store-nourio',
+      posProductId: 'pos-prod-oto-nmg',
+      productId: 'prod-oto-nmg',
+      variationId: 'var-oto-nmg',
+      posWarehouseRef: null,
+      stockPoolGroupId: 'pool-magnesium',
+      productName: 'OTO-NMG',
+      productCustomId: 'OTO-NMG',
+      variationDisplayId: 'OTO-NMG',
+      storeName: 'Nourio',
+    },
+  ]);
+
+  const packableLines = [
+    {
+      id: 'line-nour-1490',
+      variationId: 'var-nour-1490',
+      productName: 'Nourio - 1 bottle 1490',
+      quantityRequired: 2,
+    },
+    {
+      id: 'line-oto-nour',
+      variationId: 'var-oto-nour',
+      productName: 'OTO - Nourio',
+      quantityRequired: 1,
+    },
+  ];
+
+  it('routes a same-family pooled scan to the unfilled OTO-Nourio line while keeping OTO-NMG strictly separate from Nourio', () => {
+    const packedCountByLineId = new Map<string, number>([
+      ['line-nour-1490', 2],
+      ['line-oto-nour', 0],
+    ]);
+
+    const resolvedFromSiblingOrder = (service as any).resolveDemandPackingTargetLine({
+      packableLines,
+      orderStoreId: 'store-nourio',
+      basketUnit: {
+        storeId: 'store-nourio',
+        variationId: 'var-nour-1490',
+        fulfillmentOrderId: 'order-4309',
+        fulfillmentLineId: 'line-4309-1',
+        status: WmsBasketUnitStatus.PICKED,
+      },
+      targetOrderId: 'order-4307',
+      packedCountByLineId,
+      poolIndex,
+    });
+    expect(resolvedFromSiblingOrder?.id).toBe('line-oto-nour');
+
+    const resolvedFromSameOrderLine1 = (service as any).resolveDemandPackingTargetLine({
+      packableLines,
+      orderStoreId: 'store-nourio',
+      basketUnit: {
+        storeId: 'store-nourio',
+        variationId: 'var-nour-1490',
+        fulfillmentOrderId: 'order-4307',
+        fulfillmentLineId: 'line-nour-1490',
+        status: WmsBasketUnitStatus.PICKED,
+      },
+      targetOrderId: 'order-4307',
+      packedCountByLineId,
+      poolIndex,
+    });
+    expect(resolvedFromSameOrderLine1?.id).toBe('line-oto-nour');
+
+    // Order 4307 real-world lines: 2x Nourio (2/2 packed) + 1x OTO-NMG (0/1 packed)
+    const order4307Lines = [
+      packableLines[0]!,
+      {
+        id: 'line-oto-nmg',
+        variationId: 'var-oto-nmg',
+        productName: 'OTO-NMG',
+        quantityRequired: 1,
+      },
+    ];
+    const order4307Packed = new Map<string, number>([
+      ['line-nour-1490', 2],
+      ['line-oto-nmg', 0],
+    ]);
+
+    // Barcode 0100099047 (OTO-NMG or NMG) resolves directly to line-oto-nmg
+    const resolvedOtoNmgScan = (service as any).resolveDemandPackingTargetLine({
+      packableLines: order4307Lines,
+      orderStoreId: 'store-nourio',
+      basketUnit: {
+        storeId: 'store-nourio',
+        variationId: 'var-oto-nmg',
+        fulfillmentOrderId: 'order-4307',
+        fulfillmentLineId: 'line-oto-nmg',
+        status: WmsBasketUnitStatus.PICKED,
+      },
+      targetOrderId: 'order-4307',
+      packedCountByLineId: order4307Packed,
+      poolIndex,
+    });
+    expect(resolvedOtoNmgScan?.id).toBe('line-oto-nmg');
+
+    const resolvedPooledNmgScan = (service as any).resolveDemandPackingTargetLine({
+      packableLines: order4307Lines,
+      orderStoreId: 'store-nourio',
+      basketUnit: {
+        storeId: 'store-nourio',
+        variationId: 'var-nmg',
+        fulfillmentOrderId: 'order-4309',
+        fulfillmentLineId: 'line-4309-nmg',
+        status: WmsBasketUnitStatus.PICKED,
+      },
+      targetOrderId: 'order-4307',
+      packedCountByLineId: order4307Packed,
+      poolIndex,
+    });
+    expect(resolvedPooledNmgScan?.id).toBe('line-oto-nmg');
+
+    // Conversely, scanning an extra Nourio bottle on Order 4307 does NOT cross-pack into OTO-NMG
+    const extraNourioScan = (service as any).resolveDemandPackingTargetLine({
+      packableLines: order4307Lines,
+      orderStoreId: 'store-nourio',
+      basketUnit: {
+        storeId: 'store-nourio',
+        variationId: 'var-nour-1490',
+        fulfillmentOrderId: 'order-4309',
+        fulfillmentLineId: 'line-4309-1',
+        status: WmsBasketUnitStatus.PICKED,
+      },
+      targetOrderId: 'order-4307',
+      packedCountByLineId: order4307Packed,
+      poolIndex,
+    });
+    expect(extraNourioScan?.id).toBe('line-nour-1490');
+
+    const idempotentReplay = (service as any).resolveDemandPackingTargetLine({
+      packableLines,
+      orderStoreId: 'store-nourio',
+      basketUnit: {
+        storeId: 'store-nourio',
+        variationId: 'var-nour-1490',
+        fulfillmentOrderId: 'order-4307',
+        fulfillmentLineId: 'line-nour-1490',
+        status: WmsBasketUnitStatus.PACKED,
+      },
+      targetOrderId: 'order-4307',
+      packedCountByLineId,
+      poolIndex,
+    });
+    expect(idempotentReplay?.id).toBe('line-nour-1490');
+  });
+
+  it('surfaces the exact remaining unpooled item and sample basket barcode when scanning an extra unit of a filled line', () => {
+    const packedCountByLineId = new Map<string, number>([
+      ['line-nour-1490', 2],
+      ['line-unpooled-mg', 0],
+    ]);
+    const unpooledLines = [
+      packableLines[0]!,
+      {
+        id: 'line-unpooled-mg',
+        variationId: 'var-unpooled-mg',
+        productName: 'Nourio Magnesium',
+        quantityRequired: 1,
+      },
+    ];
+
+    const message = (service as any).formatDemandPackingLineFullMessage(
+      '4307',
+      packableLines[0]!,
+      unpooledLines,
+      packedCountByLineId,
+      'store-nourio',
+      [
+        {
+          storeId: 'store-nourio',
+          variationId: 'var-unpooled-mg',
+          inventoryUnit: { barcode: '0100099999', code: 'UNIT-MG-1' },
+        },
+      ],
+      EMPTY_STOCK_POOL_INDEX,
+    );
+
+    expect(message).toBe(
+      'Order 4307 already has all required Nourio - 1 bottle 1490 units packed — scan remaining: Nourio Magnesium (1 left, barcode 0100099999)',
+    );
   });
 });

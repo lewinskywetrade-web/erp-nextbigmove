@@ -130,4 +130,89 @@ describe('WmsInventoryService same-store Change variant suggestions & shared sto
     expect(target?.recommendShareStockPool).toBe(true);
     expect(target?.bidirectionalTransferHistory).toBe(true);
   });
+
+  it('never recommends shared stock pool between distinct products like Nourio and OTO-NMG even with transfer history', async () => {
+    const prisma = {
+      posStore: {
+        findMany: (jest.fn() as any).mockResolvedValue([
+          { id: 'store-nourio', name: 'Nourio', shopName: 'Nourio' },
+        ]),
+      },
+      wmsProductProfile: {
+        findMany: (jest.fn() as any).mockResolvedValue([
+          {
+            id: 'profile-nour',
+            storeId: 'store-nourio',
+            posProductId: 'pos-nour',
+            productId: 'prod-nour',
+            variationId: 'var-nour',
+            stockPoolGroupId: null,
+            posProduct: {
+              id: 'pos-nour',
+              productId: 'prod-nour',
+              variationId: 'var-nour',
+              customId: 'NOUR',
+              productSnapshot: null,
+              name: 'Nourio - 1 bottle 1490',
+            },
+          },
+          {
+            id: 'profile-oto-nmg',
+            storeId: 'store-nourio',
+            posProductId: 'pos-oto-nmg',
+            productId: 'prod-oto-nmg',
+            variationId: 'var-oto-nmg',
+            stockPoolGroupId: null,
+            posProduct: {
+              id: 'pos-oto-nmg',
+              productId: 'prod-oto-nmg',
+              variationId: 'var-oto-nmg',
+              customId: 'OTO-NMG',
+              productSnapshot: null,
+              name: 'OTO-NMG',
+            },
+          },
+        ]),
+        findFirst: (jest.fn() as any).mockResolvedValue({
+          id: 'profile-nour',
+          storeId: 'store-nourio',
+          productId: 'prod-nour',
+          variationId: 'var-nour',
+          stockPoolGroupId: null,
+          posProduct: {
+            id: 'pos-nour',
+            productId: 'prod-nour',
+            variationId: 'var-nour',
+            customId: 'NOUR',
+            productSnapshot: null,
+            name: 'Nourio - 1 bottle 1490',
+          },
+        }),
+      },
+      wmsProductProfileEquivalence: {
+        findFirst: (jest.fn() as any).mockResolvedValue(null),
+      },
+      wmsInventoryStoreTransferItem: {
+        findMany: (jest.fn() as any).mockResolvedValue([
+          { transferId: 't-1', fromProductProfileId: 'profile-nour', toProductProfileId: 'profile-oto-nmg' },
+          { transferId: 't-2', fromProductProfileId: 'profile-oto-nmg', toProductProfileId: 'profile-nour' },
+        ]),
+      },
+    };
+    const cls = { get: (jest.fn() as any).mockReturnValue('tenant-famco') };
+    const service = new WmsInventoryService(prisma as any, cls as any, {} as any, {} as any, {} as any, {} as any);
+    jest.spyOn(service as any, 'resolveTenantScope').mockResolvedValue({
+      activeTenantId: 'tenant-famco',
+      canAccessAllTenants: false,
+    });
+
+    const res = await service.getStoreTransferOptions({
+      targetStoreId: 'store-nourio',
+      sourceProfileId: 'profile-nour',
+    });
+
+    const otoTarget = res.products.find((p) => p.profileId === 'profile-oto-nmg');
+    expect(otoTarget?.recommendShareStockPool).toBe(false);
+    expect(res.suggestion).toBeNull();
+  });
 });

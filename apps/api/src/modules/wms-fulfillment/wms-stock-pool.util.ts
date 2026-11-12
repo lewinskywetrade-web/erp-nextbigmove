@@ -636,3 +636,202 @@ export async function syncProfileStockPoolLinksTx(
     affectedScopes: Array.from(affectedByKey.values()),
   };
 }
+
+const STOCK_POOL_NOISE_WORDS = new Set([
+  'oto',
+  'upsell',
+  'promo',
+  'bundle',
+  'freebie',
+  'free',
+  'gift',
+  'cod',
+  'b1t1',
+  'new',
+  'old',
+  'v1',
+  'v2',
+  'bottle',
+  'bottles',
+  'btl',
+  'btls',
+  'pc',
+  'pcs',
+  'piece',
+  'pieces',
+  'pack',
+  'packs',
+  'box',
+  'boxes',
+  'sachet',
+  'sachets',
+  'pouch',
+  'pouches',
+  'tub',
+  'tubs',
+  'jar',
+  'jars',
+  'ml',
+  'mg',
+  'kg',
+  'oz',
+  'g',
+  'l',
+  'caps',
+  'capsule',
+  'capsules',
+  'tablet',
+  'tablets',
+  'softgel',
+  'softgels',
+  'php',
+  'only',
+  'buy',
+  'take',
+  'save',
+  'off',
+  'with',
+  'the',
+  'and',
+  'for',
+]);
+
+const STOCK_POOL_BRAND_TOKENS = new Set([
+  'nourio',
+  'nour',
+  'tonio',
+  'tonios',
+  'famco',
+  'cristobal',
+]);
+
+const STOCK_POOL_TOKEN_SYNONYMS: Record<string, string> = {
+  nmg: 'magnesium',
+  nour: 'nourio',
+  tonios: 'tonio',
+};
+
+function tokenizeStockPoolIdentityText(value: string | null | undefined): string[] {
+  if (!value || typeof value !== 'string') {
+    return [];
+  }
+  const normalized = value
+    .toLowerCase()
+    .replace(/['’]s\b/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+  if (!normalized) {
+    return [];
+  }
+  const tokens: string[] = [];
+  for (const rawToken of normalized.split(/\s+/)) {
+    if (!rawToken) continue;
+    if (/^\d+$/.test(rawToken)) continue;
+    if (/^\d+(ml|g|mg|kg|oz|l|pc|pcs|btl|btls|pack|packs|caps)$/.test(rawToken)) continue;
+    const mapped = STOCK_POOL_TOKEN_SYNONYMS[rawToken] ?? rawToken;
+    if (STOCK_POOL_NOISE_WORDS.has(mapped)) continue;
+    tokens.push(mapped);
+  }
+  return tokens;
+}
+
+export type StockPoolIdentityDescriptor = {
+  name?: string | null;
+  customId?: string | null;
+  variationDisplayId?: string | null;
+  mapping?: string | null;
+  storeName?: string | null;
+};
+
+export function extractStockPoolBaseSku(input: StockPoolIdentityDescriptor): string | null {
+  const candidates = [input.customId, input.variationDisplayId];
+  for (const raw of candidates) {
+    if (!raw || typeof raw !== 'string') continue;
+    const trimmed = raw.trim();
+    if (!trimmed || /^\d+$/.test(trimmed)) continue;
+    const tokens = tokenizeStockPoolIdentityText(trimmed);
+    if (tokens.length > 0) {
+      return Array.from(new Set(tokens)).sort().join('-');
+    }
+  }
+  return null;
+}
+
+export function resolveStockPoolProductFamilyKey(
+  input: StockPoolIdentityDescriptor,
+): string | null {
+  const nameTokens = tokenizeStockPoolIdentityText(input.name);
+  const skuTokens = [
+    ...tokenizeStockPoolIdentityText(input.customId),
+    ...tokenizeStockPoolIdentityText(input.variationDisplayId),
+  ];
+  const storeBrandTokens = new Set(tokenizeStockPoolIdentityText(input.storeName));
+
+  const allTokens = Array.from(new Set([...nameTokens, ...skuTokens]));
+  if (allTokens.includes('magnesium')) {
+    return 'product:magnesium';
+  }
+
+  const nonBrandNameTokens = Array.from(
+    new Set(
+      nameTokens.filter(
+        (token) => !STOCK_POOL_BRAND_TOKENS.has(token) && !storeBrandTokens.has(token),
+      ),
+    ),
+  ).sort();
+
+  if (nonBrandNameTokens.length > 0) {
+    return `product:${nonBrandNameTokens.join('-')}`;
+  }
+
+  const nonBrandSkuTokens = Array.from(
+    new Set(
+      skuTokens.filter(
+        (token) => !STOCK_POOL_BRAND_TOKENS.has(token) && !storeBrandTokens.has(token),
+      ),
+    ),
+  ).sort();
+
+  const brandTokensInItem = Array.from(
+    new Set(
+      allTokens.filter(
+        (token) => STOCK_POOL_BRAND_TOKENS.has(token) || storeBrandTokens.has(token),
+      ),
+    ),
+  ).sort();
+
+  if (nonBrandSkuTokens.length > 0) {
+    return `sku:${nonBrandSkuTokens.join('-')}`;
+  }
+
+  if (brandTokensInItem.length > 0) {
+    return `brand:${brandTokensInItem.join('-')}`;
+  }
+
+  return null;
+}
+
+export function areProfilesCompatibleForStockPool(
+  left: StockPoolIdentityDescriptor,
+  right: StockPoolIdentityDescriptor,
+): boolean {
+  const leftFamily = resolveStockPoolProductFamilyKey(left);
+  const rightFamily = resolveStockPoolProductFamilyKey(right);
+
+  if (leftFamily === 'product:magnesium' || rightFamily === 'product:magnesium') {
+    return leftFamily === rightFamily;
+  }
+
+  if (leftFamily && rightFamily && leftFamily === rightFamily) {
+    return true;
+  }
+
+  const leftSku = extractStockPoolBaseSku(left);
+  const rightSku = extractStockPoolBaseSku(right);
+  if (leftSku && rightSku && leftSku === rightSku) {
+    return true;
+  }
+
+  return false;
+}
+

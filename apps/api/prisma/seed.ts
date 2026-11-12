@@ -6,11 +6,14 @@ import {
   PrismaClient,
   RbacWorkspace,
   RoleScope,
+  WmsBasketStatus,
+  WmsBasketUnitStatus,
   WmsFulfillmentAmendmentStatus,
   WmsFulfillmentAssignmentMode,
   WmsFulfillmentChangeState,
   WmsFulfillmentLineStatus,
   WmsFulfillmentOrderStatus,
+  WmsInventoryMovementType,
   WmsInventoryUnitStatus,
   WmsLocationKind,
   WmsProductProfileStatus,
@@ -5883,6 +5886,349 @@ async function reconcileToniosWmsFulfillmentQueue() {
   }
 }
 
+const SEED_STOCK_POOL_NOISE_WORDS = new Set<string>([
+  'oto',
+  'upsell',
+  'promo',
+  'bundle',
+  'freebie',
+  'free',
+  'gift',
+  'cod',
+  'b1t1',
+  'new',
+  'old',
+  'v1',
+  'v2',
+  'bottle',
+  'bottles',
+  'btl',
+  'btls',
+  'pc',
+  'pcs',
+  'piece',
+  'pieces',
+  'pack',
+  'packs',
+  'box',
+  'boxes',
+  'sachet',
+  'sachets',
+  'pouch',
+  'pouches',
+  'tub',
+  'tubs',
+  'jar',
+  'jars',
+  'ml',
+  'mg',
+  'kg',
+  'oz',
+  'g',
+  'l',
+  'caps',
+  'capsule',
+  'capsules',
+  'tablet',
+  'tablets',
+  'softgel',
+  'softgels',
+  'php',
+  'only',
+  'buy',
+  'take',
+  'save',
+  'off',
+  'with',
+  'the',
+  'and',
+  'for',
+]);
+
+const SEED_STOCK_POOL_BRAND_TOKENS = new Set<string>([
+  'nourio',
+  'nour',
+  'tonio',
+  'tonios',
+  'famco',
+  'cristobal',
+]);
+
+const SEED_STOCK_POOL_SYNONYMS: Record<string, string> = {
+  nmg: 'magnesium',
+  nour: 'nourio',
+  tonios: 'tonio',
+};
+
+function extractSeedVariationDisplayId(snapshot: Prisma.JsonValue | null | undefined): string | null {
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+    return null;
+  }
+  const record = snapshot as Record<string, unknown>;
+  if (typeof record.display_id === 'string' && record.display_id.trim().length > 0) {
+    return record.display_id.trim();
+  }
+  const product = record.product;
+  if (product && typeof product === 'object' && !Array.isArray(product)) {
+    const productRecord = product as Record<string, unknown>;
+    if (typeof productRecord.display_id === 'string' && productRecord.display_id.trim().length > 0) {
+      return productRecord.display_id.trim();
+    }
+  }
+  return null;
+}
+
+function tokenizeSeedStockPoolText(value: string | null | undefined): string[] {
+  if (!value || typeof value !== 'string') {
+    return [];
+  }
+  const normalized = value
+    .toLowerCase()
+    .replace(/['’]s\b/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+  if (!normalized) {
+    return [];
+  }
+  const tokens: string[] = [];
+  for (const rawToken of normalized.split(/\s+/)) {
+    if (!rawToken) continue;
+    if (/^\d+$/.test(rawToken)) continue;
+    if (/^\d+(ml|g|mg|kg|oz|l|pc|pcs|btl|btls|pack|packs|caps)$/.test(rawToken)) continue;
+    const mapped = SEED_STOCK_POOL_SYNONYMS[rawToken] ?? rawToken;
+    if (SEED_STOCK_POOL_NOISE_WORDS.has(mapped)) continue;
+    tokens.push(mapped);
+  }
+  return tokens;
+}
+
+type SeedStockPoolDescriptor = {
+  name?: string | null;
+  customId?: string | null;
+  variationDisplayId?: string | null;
+  storeName?: string | null;
+};
+
+function extractSeedStockPoolBaseSku(input: SeedStockPoolDescriptor): string | null {
+  const candidates = [input.customId, input.variationDisplayId];
+  for (const raw of candidates) {
+    if (!raw || typeof raw !== 'string') continue;
+    const trimmed = raw.trim();
+    if (!trimmed || /^\d+$/.test(trimmed)) continue;
+    const tokens = tokenizeSeedStockPoolText(trimmed);
+    if (tokens.length > 0) {
+      return Array.from(new Set(tokens)).sort().join('-');
+    }
+  }
+  return null;
+}
+
+function resolveSeedStockPoolProductFamilyKey(input: SeedStockPoolDescriptor): string | null {
+  const nameTokens = tokenizeSeedStockPoolText(input.name);
+  const skuTokens = tokenizeSeedStockPoolText(input.customId).concat(
+    tokenizeSeedStockPoolText(input.variationDisplayId),
+  );
+  const storeBrandTokens = new Set<string>(tokenizeSeedStockPoolText(input.storeName));
+  const allTokens = Array.from(new Set(nameTokens.concat(skuTokens)));
+
+  if (allTokens.includes('magnesium')) {
+    return 'product:magnesium';
+  }
+
+  const nonBrandNameTokens = Array.from(
+    new Set(
+      nameTokens.filter(
+        (token) => !SEED_STOCK_POOL_BRAND_TOKENS.has(token) && !storeBrandTokens.has(token),
+      ),
+    ),
+  ).sort();
+  if (nonBrandNameTokens.length > 0) {
+    return `product:${nonBrandNameTokens.join('-')}`;
+  }
+
+  const nonBrandSkuTokens = Array.from(
+    new Set(
+      skuTokens.filter(
+        (token) => !SEED_STOCK_POOL_BRAND_TOKENS.has(token) && !storeBrandTokens.has(token),
+      ),
+    ),
+  ).sort();
+  if (nonBrandSkuTokens.length > 0) {
+    return `sku:${nonBrandSkuTokens.join('-')}`;
+  }
+
+  const brandTokensInItem = Array.from(
+    new Set(
+      allTokens.filter(
+        (token) => SEED_STOCK_POOL_BRAND_TOKENS.has(token) || storeBrandTokens.has(token),
+      ),
+    ),
+  ).sort();
+  if (brandTokensInItem.length > 0) {
+    return `brand:${brandTokensInItem.join('-')}`;
+  }
+
+  return null;
+}
+
+function areSeedProfilesCompatibleForStockPool(
+  left: SeedStockPoolDescriptor,
+  right: SeedStockPoolDescriptor,
+): boolean {
+  const leftFamily = resolveSeedStockPoolProductFamilyKey(left);
+  const rightFamily = resolveSeedStockPoolProductFamilyKey(right);
+  if (leftFamily === 'product:magnesium' || rightFamily === 'product:magnesium') {
+    return leftFamily === rightFamily;
+  }
+  if (leftFamily && rightFamily && leftFamily === rightFamily) {
+    return true;
+  }
+  const leftSku = extractSeedStockPoolBaseSku(left);
+  const rightSku = extractSeedStockPoolBaseSku(right);
+  if (leftSku && rightSku && leftSku === rightSku) {
+    return true;
+  }
+  return false;
+}
+
+async function logFamcoTargetUnitAndBasketDiag(tag: string) {
+  try {
+    const [targetUnit, targetBasket] = await Promise.all([
+      prisma.wmsInventoryUnit.findFirst({
+        where: {
+          OR: [
+            { barcode: '0100099047' },
+            { code: { contains: '0100099047' } },
+          ],
+        },
+        select: {
+          id: true,
+          code: true,
+          barcode: true,
+          status: true,
+          storeId: true,
+          productProfileId: true,
+          posProductId: true,
+          productId: true,
+          variationId: true,
+          receivingSequence: true,
+          posProduct: {
+            select: {
+              name: true,
+              customId: true,
+              productSnapshot: true,
+            },
+          },
+          receivingBatch: {
+            select: {
+              code: true,
+              lines: {
+                orderBy: { lineNo: 'asc' },
+                select: {
+                  lineNo: true,
+                  variationId: true,
+                  resolvedProfileId: true,
+                  receivedQuantity: true,
+                  requestedProductName: true,
+                },
+              },
+            },
+          },
+          storeTransferItems: {
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            take: 3,
+            select: {
+              fromVariationId: true,
+              toVariationId: true,
+              toProductProfileId: true,
+              createdAt: true,
+            },
+          },
+          basketUnits: {
+            select: {
+              id: true,
+              status: true,
+              variationId: true,
+              fulfillmentOrderId: true,
+              fulfillmentLineId: true,
+              basket: { select: { barcode: true, status: true } },
+            },
+          },
+        },
+      }),
+      prisma.wmsBasket.findFirst({
+        where: { barcode: 'BASKET-CAV-01-016' },
+        select: {
+          id: true,
+          barcode: true,
+          status: true,
+          fulfillmentOrders: {
+            select: {
+              id: true,
+              posOrderId: true,
+              status: true,
+              lines: {
+                select: {
+                  id: true,
+                  variationId: true,
+                  productName: true,
+                  productDisplayId: true,
+                  quantityRequired: true,
+                  status: true,
+                },
+              },
+            },
+          },
+          basketUnits: {
+            where: { status: { in: [WmsBasketUnitStatus.PICKED, WmsBasketUnitStatus.PACKED] } },
+            select: {
+              id: true,
+              status: true,
+              variationId: true,
+              fulfillmentOrderId: true,
+              fulfillmentLineId: true,
+              inventoryUnit: {
+                select: {
+                  barcode: true,
+                  code: true,
+                  variationId: true,
+                  posProduct: { select: { name: true, customId: true } },
+                },
+              },
+            },
+          },
+        },
+      }),
+    ]);
+
+    console.log(
+      tag,
+      JSON.stringify({
+        unit0100099047: targetUnit
+          ? {
+              id: targetUnit.id,
+              code: targetUnit.code,
+              barcode: targetUnit.barcode,
+              status: targetUnit.status,
+              variationId: targetUnit.variationId,
+              productProfileId: targetUnit.productProfileId,
+              productName: targetUnit.posProduct.name,
+              customId: targetUnit.posProduct.customId,
+              displayId: extractSeedVariationDisplayId(targetUnit.posProduct.productSnapshot),
+              receivingSequence: targetUnit.receivingSequence,
+              receivingBatch: targetUnit.receivingBatch,
+              storeTransfers: targetUnit.storeTransferItems,
+              basketUnits: targetUnit.basketUnits,
+            }
+          : null,
+        basketCav01016: targetBasket,
+      }),
+    );
+  } catch (diagErr: any) {
+    console.error(`Warning during ${tag}:`, diagErr?.message || diagErr);
+  }
+}
+
 async function reconcileFamcoSharedStockPoolsAndQueue() {
   try {
     const famcoTenants = await prisma.tenant.findMany({
@@ -5972,6 +6318,8 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
         }
       }
 
+      await logFamcoTargetUnitAndBasketDiag('[FAMCO_TARGET_DIAG_BEFORE]');
+
       // 2. Load non-archived stockable profiles for Famco
       const rawProfiles = await prisma.wmsProductProfile.findMany({
         where: {
@@ -5981,14 +6329,26 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
         select: {
           id: true,
           storeId: true,
+          posProductId: true,
           productId: true,
           variationId: true,
           posWarehouseRef: true,
           stockPoolGroupId: true,
+          store: {
+            select: {
+              name: true,
+              shopName: true,
+            },
+          },
           posProduct: {
             select: {
+              id: true,
               productId: true,
               variationId: true,
+              name: true,
+              customId: true,
+              mapping: true,
+              productSnapshot: true,
             },
           },
         },
@@ -6003,18 +6363,29 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
 
       const profileById = new Map<string, (typeof profiles)[number]>();
       const profileByStoreVariation = new Map<string, (typeof profiles)[number]>();
+      const oldGroupIdByProfileId = new Map<string, string | null>();
       for (const profile of profiles) {
         profileById.set(profile.id, profile);
         profileByStoreVariation.set(`${profile.storeId}::${profile.variationId}`, profile);
+        oldGroupIdByProfileId.set(profile.id, profile.stockPoolGroupId ?? null);
       }
+
+      const toDescriptor = (profile: (typeof profiles)[number]): SeedStockPoolDescriptor => ({
+        name: profile.posProduct.name,
+        customId: profile.posProduct.customId,
+        variationDisplayId: extractSeedVariationDisplayId(profile.posProduct.productSnapshot),
+        storeName: profile.store?.shopName || profile.store?.name || null,
+      });
 
       const existingPooledProfileCount = profiles.filter((p) => Boolean(p.stockPoolGroupId)).length;
       let equivalenceRowCount = 0;
       let storeTransferItemCount = 0;
       let backfilledPoolGroupCount = 0;
+      let sanitizedUnpooledSingletonCount = 0;
 
-      // 3. Auto-backfill Famco's verified Change Variant history on initial rollout
-      if (existingPooledProfileCount === 0 && profiles.length > 0) {
+      // 3. Reconcile & sanitize Famco shared stock pools so distinct product families
+      //    (e.g. OTO-NMG / Magnesium vs Nourio) never contaminate a single pool group
+      if (profiles.length > 0) {
         const [equivalences, transferItems] = await Promise.all([
           prisma.wmsProductProfileEquivalence.findMany({
             where: { tenantId: tenant.id },
@@ -6047,6 +6418,9 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
         storeTransferItemCount = transferItems.length;
 
         const parentById = new Map<string, string>();
+        for (const profile of profiles) {
+          parentById.set(profile.id, profile.id);
+        }
         const findRoot = (id: string): string => {
           let current = id;
           while (parentById.has(current) && parentById.get(current) !== current) {
@@ -6063,11 +6437,16 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
           }
           return current;
         };
-        const unionProfiles = (leftId: string | undefined, rightId: string | undefined) => {
+        const unionCompatibleProfiles = (leftId: string | undefined, rightId: string | undefined) => {
           if (!leftId || !rightId || leftId === rightId) {
             return;
           }
-          if (!profileById.has(leftId) || !profileById.has(rightId)) {
+          const leftProfile = profileById.get(leftId);
+          const rightProfile = profileById.get(rightId);
+          if (!leftProfile || !rightProfile) {
+            return;
+          }
+          if (!areSeedProfilesCompatibleForStockPool(toDescriptor(leftProfile), toDescriptor(rightProfile))) {
             return;
           }
           const leftRoot = findRoot(leftId);
@@ -6077,6 +6456,22 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
           }
         };
 
+        // Preserve existing group links ONLY between compatible product families
+        const existingGroupMembers = new Map<string, string[]>();
+        for (const profile of profiles) {
+          if (!profile.stockPoolGroupId) continue;
+          const list = existingGroupMembers.get(profile.stockPoolGroupId) ?? [];
+          list.push(profile.id);
+          existingGroupMembers.set(profile.stockPoolGroupId, list);
+        }
+        for (const memberIds of Array.from(existingGroupMembers.values())) {
+          for (let i = 0; i < memberIds.length; i += 1) {
+            for (let j = i + 1; j < memberIds.length; j += 1) {
+              unionCompatibleProfiles(memberIds[i], memberIds[j]);
+            }
+          }
+        }
+
         for (const eq of equivalences) {
           const src =
             profileById.get(eq.sourceProfileId)
@@ -6084,7 +6479,7 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
           const dst =
             profileById.get(eq.targetProfileId)
             ?? profileByStoreVariation.get(`${eq.targetStoreId}::${eq.targetVariationId}`);
-          unionProfiles(src?.id, dst?.id);
+          unionCompatibleProfiles(src?.id, dst?.id);
         }
 
         for (const item of transferItems) {
@@ -6094,7 +6489,7 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
           const dst =
             profileById.get(item.toProductProfileId)
             ?? profileByStoreVariation.get(`${item.toStoreId}::${item.toVariationId}`);
-          unionProfiles(src?.id, dst?.id);
+          unionCompatibleProfiles(src?.id, dst?.id);
         }
 
         const componentsByRoot = new Map<string, string[]>();
@@ -6105,31 +6500,78 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
           componentsByRoot.set(root, list);
         }
 
-        for (const memberIds of Array.from(componentsByRoot.values())) {
+        const sortedComponents = Array.from(componentsByRoot.values()).sort(
+          (a, b) => b.length - a.length,
+        );
+        const claimedGroupIds = new Set<string>();
+
+        for (const memberIds of sortedComponents) {
           if (memberIds.length < 2) {
+            const soloId = memberIds[0];
+            const soloProfile = soloId ? profileById.get(soloId) : undefined;
+            if (soloProfile && soloProfile.stockPoolGroupId) {
+              await prisma.wmsProductProfile.update({
+                where: { id: soloProfile.id },
+                data: { stockPoolGroupId: null },
+              });
+              soloProfile.stockPoolGroupId = null;
+              sanitizedUnpooledSingletonCount += 1;
+            }
             continue;
           }
-          const groupId = randomUUID();
-          await prisma.wmsProductProfile.updateMany({
-            where: {
-              tenantId: tenant.id,
-              id: { in: memberIds },
-            },
-            data: {
-              stockPoolGroupId: groupId,
-            },
-          });
+
+          const candidateExistingGroupIds = Array.from(
+            new Set(
+              memberIds
+                .map((id) => profileById.get(id)?.stockPoolGroupId)
+                .filter((gid): gid is string => Boolean(gid) && !claimedGroupIds.has(gid!)),
+            ),
+          ).sort();
+
+          const groupId = candidateExistingGroupIds[0] ?? randomUUID();
+          claimedGroupIds.add(groupId);
+
+          const needsGroupUpdate = memberIds.some(
+            (id) => profileById.get(id)?.stockPoolGroupId !== groupId,
+          );
+          if (needsGroupUpdate) {
+            await prisma.wmsProductProfile.updateMany({
+              where: {
+                tenantId: tenant.id,
+                id: { in: memberIds },
+              },
+              data: {
+                stockPoolGroupId: groupId,
+              },
+            });
+            backfilledPoolGroupCount += 1;
+          }
           for (const memberId of memberIds) {
             const p = profileById.get(memberId);
             if (p) {
               p.stockPoolGroupId = groupId;
             }
           }
-          backfilledPoolGroupCount += 1;
         }
+
+        console.log(
+          '[FAMCO_POOL_PROFILES_DIAG]',
+          JSON.stringify(
+            profiles.map((p) => ({
+              id: p.id,
+              variationId: p.variationId,
+              name: p.posProduct.name,
+              customId: p.posProduct.customId,
+              displayId: extractSeedVariationDisplayId(p.posProduct.productSnapshot),
+              familyKey: resolveSeedStockPoolProductFamilyKey(toDescriptor(p)),
+              oldGroupId: oldGroupIdByProfileId.get(p.id) ?? null,
+              newGroupId: p.stockPoolGroupId ?? null,
+            })),
+          ),
+        );
       }
 
-      // 4. Build active pool index (>= 2 members per group) for live Famco queue refresh
+      // 4. Build active pool index (>= 2 members per group) for live Famco queue & unit healing
       const rawMembersByGroup = new Map<string, Array<(typeof profiles)[number]>>();
       for (const profile of profiles) {
         if (!profile.stockPoolGroupId) {
@@ -6153,6 +6595,548 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
           groupIdByStoreVariation.set(`${member.storeId}::${member.variationId}`, groupId);
         }
       }
+
+      const areStoreVariationsNowPooledOrSame = (
+        leftStoreId: string,
+        leftVariationId: string,
+        rightStoreId: string,
+        rightVariationId: string,
+      ): boolean => {
+        if (leftStoreId === rightStoreId && leftVariationId === rightVariationId) {
+          return true;
+        }
+        const leftGroup = groupIdByStoreVariation.get(`${leftStoreId}::${leftVariationId}`);
+        if (!leftGroup) {
+          return false;
+        }
+        const rightGroup = groupIdByStoreVariation.get(`${rightStoreId}::${rightVariationId}`);
+        return leftGroup === rightGroup;
+      };
+
+      // 4B. Heal active PUTAWAY / PICKED units in Famco whose variant was mutated across
+      //     now-unpooled products (e.g. OTO-NMG bottle 0100099047 mutated to Nourio)
+      const activeInventoryUnits = await prisma.wmsInventoryUnit.findMany({
+        where: {
+          tenantId: tenant.id,
+          status: {
+            in: [WmsInventoryUnitStatus.PUTAWAY, WmsInventoryUnitStatus.PICKED],
+          },
+        },
+        select: {
+          id: true,
+          code: true,
+          barcode: true,
+          status: true,
+          warehouseId: true,
+          currentLocationId: true,
+          storeId: true,
+          posProductId: true,
+          productProfileId: true,
+          productId: true,
+          variationId: true,
+          posWarehouseRef: true,
+          receivingSequence: true,
+          receivingBatch: {
+            select: {
+              id: true,
+              code: true,
+              lines: {
+                orderBy: { lineNo: 'asc' },
+                select: {
+                  lineNo: true,
+                  storeId: true,
+                  resolvedProfileId: true,
+                  variationId: true,
+                  receivedQuantity: true,
+                  expectedQuantity: true,
+                },
+              },
+            },
+          },
+          storeTransferItems: {
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            take: 1,
+            select: {
+              id: true,
+              toStoreId: true,
+              toProductProfileId: true,
+              toVariationId: true,
+            },
+          },
+          movements: {
+            where: { referenceType: 'SHARED_STOCK_POOL' },
+            orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+            select: {
+              id: true,
+              notes: true,
+            },
+          },
+        },
+      });
+
+      const healedUnits: Array<{
+        barcode: string;
+        code: string;
+        status: string;
+        fromVariationId: string;
+        toVariationId: string;
+        toProductName: string;
+        source: string;
+      }> = [];
+
+      for (const unit of activeInventoryUnits) {
+        let originProfile: (typeof profiles)[number] | undefined;
+        let originSource = '';
+
+        if (unit.storeTransferItems.length > 0) {
+          const latestTransfer = unit.storeTransferItems[0]!;
+          originProfile =
+            profileById.get(latestTransfer.toProductProfileId)
+            ?? profileByStoreVariation.get(`${latestTransfer.toStoreId}::${latestTransfer.toVariationId}`);
+          originSource = 'STORE_TRANSFER';
+        } else if (unit.receivingBatch && unit.receivingBatch.lines.length > 0) {
+          const lines = unit.receivingBatch.lines;
+          let matchedLine = lines.length === 1 ? lines[0] : undefined;
+          if (!matchedLine && typeof unit.receivingSequence === 'number' && unit.receivingSequence > 0) {
+            let cumulative = 0;
+            for (const line of lines) {
+              const qty = Math.max(
+                (line.receivedQuantity ?? 0) > 0 ? line.receivedQuantity : (line.expectedQuantity ?? 0),
+                0,
+              );
+              if (qty <= 0) continue;
+              if (unit.receivingSequence > cumulative && unit.receivingSequence <= cumulative + qty) {
+                matchedLine = line;
+                break;
+              }
+              cumulative += qty;
+            }
+          }
+          if (!matchedLine) {
+            const uniqueLineProfileKeys = Array.from(
+              new Set(
+                lines.map(
+                  (line) => line.resolvedProfileId ?? `${line.storeId}::${line.variationId ?? ''}`,
+                ),
+              ),
+            );
+            if (uniqueLineProfileKeys.length === 1) {
+              matchedLine = lines[0];
+            }
+          }
+          if (matchedLine) {
+            originProfile =
+              (matchedLine.resolvedProfileId ? profileById.get(matchedLine.resolvedProfileId) : undefined)
+              ?? (matchedLine.variationId
+                ? profileByStoreVariation.get(`${matchedLine.storeId}::${matchedLine.variationId}`)
+                : undefined);
+            originSource = 'RECEIVING_BATCH';
+          }
+        } else if (unit.movements.length > 0) {
+          const firstNote = unit.movements[0]?.notes ?? '';
+          const match = firstNote.match(/\(([^)\s]+)\s*->\s*([^)\s]+)\)/);
+          const originalVariationId = match?.[1]?.trim();
+          if (originalVariationId) {
+            originProfile =
+              profileByStoreVariation.get(`${unit.storeId}::${originalVariationId}`)
+              ?? profiles.find((p) => p.variationId === originalVariationId);
+            originSource = 'SHARED_STOCK_POOL_MOVEMENT';
+          }
+        }
+
+        if (!originProfile) {
+          continue;
+        }
+
+        if (
+          areStoreVariationsNowPooledOrSame(
+            unit.storeId,
+            unit.variationId,
+            originProfile.storeId,
+            originProfile.variationId,
+          )
+        ) {
+          continue;
+        }
+
+        await prisma.wmsInventoryUnit.update({
+          where: { id: unit.id },
+          data: {
+            storeId: originProfile.storeId,
+            posProductId: originProfile.posProductId,
+            productProfileId: originProfile.id,
+            productId: originProfile.productId,
+            variationId: originProfile.variationId,
+            posWarehouseRef:
+              originSource === 'STORE_TRANSFER' && unit.storeId === originProfile.storeId
+                ? null
+                : originProfile.posWarehouseRef ?? null,
+          },
+        });
+
+        if (unit.status === WmsInventoryUnitStatus.PICKED) {
+          await prisma.wmsBasketUnit.updateMany({
+            where: {
+              inventoryUnitId: unit.id,
+              status: WmsBasketUnitStatus.PICKED,
+            },
+            data: {
+              storeId: originProfile.storeId,
+              productId: originProfile.productId,
+              variationId: originProfile.variationId,
+            },
+          });
+        }
+
+        await prisma.wmsInventoryMovement.create({
+          data: {
+            tenantId: tenant.id,
+            inventoryUnitId: unit.id,
+            warehouseId: unit.warehouseId,
+            fromLocationId: unit.currentLocationId,
+            toLocationId: unit.currentLocationId,
+            fromStatus: unit.status,
+            toStatus: unit.status,
+            movementType: WmsInventoryMovementType.ADJUSTMENT,
+            referenceType: 'SHARED_STOCK_POOL_HEAL',
+            referenceCode: unit.barcode,
+            notes: `Restored physical product variant after separating cross-product stock pool (${unit.variationId} -> ${originProfile.variationId} via ${originSource})`,
+            createdAt: now,
+          },
+        });
+
+        healedUnits.push({
+          barcode: unit.barcode,
+          code: unit.code,
+          status: unit.status,
+          fromVariationId: unit.variationId,
+          toVariationId: originProfile.variationId,
+          toProductName: originProfile.posProduct.name,
+          source: originSource,
+        });
+      }
+
+      if (healedUnits.length > 0) {
+        console.log('[FAMCO_UNIT_HEAL]', JSON.stringify({ count: healedUnits.length, units: healedUnits }));
+      }
+
+      // 4C. Realign active demand baskets in Famco (e.g. BASKET-CAV-01-016) so unpacked PICKED
+      //     basket units point to compatible unfilled order lines after pool separation
+      const activeDemandBaskets = await prisma.wmsBasket.findMany({
+        where: {
+          tenantId: tenant.id,
+          status: {
+            in: [
+              WmsBasketStatus.IN_PICKING,
+              WmsBasketStatus.FULL_HELD,
+              WmsBasketStatus.PACKING,
+            ],
+          },
+        },
+        select: {
+          id: true,
+          barcode: true,
+          status: true,
+          fulfillmentOrders: {
+            where: {
+              assignmentMode: WmsFulfillmentAssignmentMode.BASKET_DEMAND,
+              status: {
+                in: [
+                  WmsFulfillmentOrderStatus.IN_PICKING,
+                  WmsFulfillmentOrderStatus.READY_FOR_PACK,
+                  WmsFulfillmentOrderStatus.PICKED,
+                  WmsFulfillmentOrderStatus.PACKING,
+                ],
+              },
+            },
+            select: {
+              id: true,
+              posOrderId: true,
+              storeId: true,
+              status: true,
+              lines: {
+                where: {
+                  status: { not: WmsFulfillmentLineStatus.CANCELED },
+                  quantityRequired: { gt: 0 },
+                },
+                select: {
+                  id: true,
+                  variationId: true,
+                  productName: true,
+                  quantityRequired: true,
+                },
+              },
+            },
+          },
+          basketUnits: {
+            where: {
+              status: {
+                in: [WmsBasketUnitStatus.PICKED, WmsBasketUnitStatus.PACKED],
+              },
+            },
+            orderBy: [{ pickedAt: 'asc' }, { createdAt: 'asc' }],
+            select: {
+              id: true,
+              status: true,
+              storeId: true,
+              productId: true,
+              variationId: true,
+              fulfillmentOrderId: true,
+              fulfillmentLineId: true,
+              inventoryUnit: {
+                select: {
+                  barcode: true,
+                  code: true,
+                },
+              },
+            },
+          },
+        },
+      });
+
+      const realignedBasketSummaries: Array<Record<string, unknown>> = [];
+
+      for (const basket of activeDemandBaskets) {
+        const packedCountByLineId = new Map<string, number>();
+        for (const bu of basket.basketUnits) {
+          if (bu.status === WmsBasketUnitStatus.PACKED && bu.fulfillmentLineId) {
+            packedCountByLineId.set(
+              bu.fulfillmentLineId,
+              (packedCountByLineId.get(bu.fulfillmentLineId) ?? 0) + 1,
+            );
+          }
+        }
+
+        type OpenLineSlot = {
+          orderId: string;
+          posOrderId: string;
+          orderStoreId: string;
+          lineId: string;
+          variationId: string;
+          productName: string;
+          quantityRequired: number;
+          packedCount: number;
+          remainingOpen: number;
+        };
+
+        const openLines: OpenLineSlot[] = [];
+        const openLineById = new Map<string, OpenLineSlot>();
+        for (const order of basket.fulfillmentOrders) {
+          for (const line of order.lines) {
+            const packedCount = packedCountByLineId.get(line.id) ?? 0;
+            const remainingOpen = Math.max(line.quantityRequired - packedCount, 0);
+            const slot: OpenLineSlot = {
+              orderId: order.id,
+              posOrderId: order.posOrderId,
+              orderStoreId: order.storeId,
+              lineId: line.id,
+              variationId: line.variationId,
+              productName: line.productName,
+              quantityRequired: line.quantityRequired,
+              packedCount,
+              remainingOpen,
+            };
+            openLines.push(slot);
+            openLineById.set(line.id, slot);
+          }
+        }
+
+        const pickedUnits = basket.basketUnits.filter(
+          (bu) => bu.status === WmsBasketUnitStatus.PICKED,
+        );
+        if (pickedUnits.length === 0 || openLines.length === 0) {
+          continue;
+        }
+
+        const assignedPickedCountByLineId = new Map<string, number>();
+        let basketHasInvalidPickedAssignment = false;
+        for (const bu of pickedUnits) {
+          const currentLine = bu.fulfillmentLineId ? openLineById.get(bu.fulfillmentLineId) : undefined;
+          if (
+            !currentLine
+            || currentLine.orderId !== bu.fulfillmentOrderId
+            || !areStoreVariationsNowPooledOrSame(
+              currentLine.orderStoreId,
+              currentLine.variationId,
+              bu.storeId,
+              bu.variationId,
+            )
+          ) {
+            basketHasInvalidPickedAssignment = true;
+            break;
+          }
+          const nextCount = (assignedPickedCountByLineId.get(currentLine.lineId) ?? 0) + 1;
+          assignedPickedCountByLineId.set(currentLine.lineId, nextCount);
+          if (nextCount > currentLine.remainingOpen) {
+            basketHasInvalidPickedAssignment = true;
+            break;
+          }
+        }
+
+        if (!basketHasInvalidPickedAssignment) {
+          continue;
+        }
+
+        const slotsLeftByLineId = new Map<string, number>();
+        for (const slot of openLines) {
+          slotsLeftByLineId.set(slot.lineId, slot.remainingOpen);
+        }
+        const targetByBasketUnitId = new Map<string, OpenLineSlot>();
+
+        // Pass 1: Keep already-assigned exact matches within remainingOpen
+        for (const bu of pickedUnits) {
+          const slot = bu.fulfillmentLineId ? openLineById.get(bu.fulfillmentLineId) : undefined;
+          if (!slot || slot.orderId !== bu.fulfillmentOrderId) continue;
+          const left = slotsLeftByLineId.get(slot.lineId) ?? 0;
+          if (left > 0 && slot.orderStoreId === bu.storeId && slot.variationId === bu.variationId) {
+            targetByBasketUnitId.set(bu.id, slot);
+            slotsLeftByLineId.set(slot.lineId, left - 1);
+          }
+        }
+
+        // Pass 2: Keep already-assigned post-split pooled matches within remainingOpen
+        for (const bu of pickedUnits) {
+          if (targetByBasketUnitId.has(bu.id)) continue;
+          const slot = bu.fulfillmentLineId ? openLineById.get(bu.fulfillmentLineId) : undefined;
+          if (!slot || slot.orderId !== bu.fulfillmentOrderId) continue;
+          const left = slotsLeftByLineId.get(slot.lineId) ?? 0;
+          if (
+            left > 0
+            && areStoreVariationsNowPooledOrSame(
+              slot.orderStoreId,
+              slot.variationId,
+              bu.storeId,
+              bu.variationId,
+            )
+          ) {
+            targetByBasketUnitId.set(bu.id, slot);
+            slotsLeftByLineId.set(slot.lineId, left - 1);
+          }
+        }
+
+        // Pass 3: Reassign unmatched units by exact (storeId, variationId) match
+        for (const bu of pickedUnits) {
+          if (targetByBasketUnitId.has(bu.id)) continue;
+          const exactCandidates = openLines.filter(
+            (slot) =>
+              (slotsLeftByLineId.get(slot.lineId) ?? 0) > 0
+              && slot.orderStoreId === bu.storeId
+              && slot.variationId === bu.variationId,
+          );
+          const chosen =
+            exactCandidates.find((slot) => slot.orderId === bu.fulfillmentOrderId)
+            ?? exactCandidates[0];
+          if (chosen) {
+            targetByBasketUnitId.set(bu.id, chosen);
+            slotsLeftByLineId.set(chosen.lineId, (slotsLeftByLineId.get(chosen.lineId) ?? 1) - 1);
+          }
+        }
+
+        // Pass 4: Reassign any remaining unmatched units by post-split shared stock pool
+        for (const bu of pickedUnits) {
+          if (targetByBasketUnitId.has(bu.id)) continue;
+          const pooledCandidates = openLines.filter(
+            (slot) =>
+              (slotsLeftByLineId.get(slot.lineId) ?? 0) > 0
+              && areStoreVariationsNowPooledOrSame(
+                slot.orderStoreId,
+                slot.variationId,
+                bu.storeId,
+                bu.variationId,
+              ),
+          );
+          const chosen =
+            pooledCandidates.find((slot) => slot.orderId === bu.fulfillmentOrderId)
+            ?? pooledCandidates[0];
+          if (chosen) {
+            targetByBasketUnitId.set(bu.id, chosen);
+            slotsLeftByLineId.set(chosen.lineId, (slotsLeftByLineId.get(chosen.lineId) ?? 1) - 1);
+          }
+        }
+
+        const changes: Array<Record<string, unknown>> = [];
+        for (const bu of pickedUnits) {
+          const target = targetByBasketUnitId.get(bu.id);
+          if (!target) continue;
+          if (bu.fulfillmentOrderId !== target.orderId || bu.fulfillmentLineId !== target.lineId) {
+            await prisma.wmsBasketUnit.updateMany({
+              where: {
+                id: bu.id,
+                status: WmsBasketUnitStatus.PICKED,
+              },
+              data: {
+                fulfillmentOrderId: target.orderId,
+                fulfillmentLineId: target.lineId,
+              },
+            });
+            changes.push({
+              basketUnitId: bu.id,
+              barcode: bu.inventoryUnit.barcode,
+              variationId: bu.variationId,
+              fromOrderId: bu.fulfillmentOrderId,
+              fromLineId: bu.fulfillmentLineId,
+              toOrderId: target.orderId,
+              toPosOrderId: target.posOrderId,
+              toLineId: target.lineId,
+              toProductName: target.productName,
+            });
+          }
+        }
+
+        if (changes.length > 0) {
+          // Sync WmsBasketPickDemand counts per line so basket summary stays consistent
+          const postRealignUnits = await prisma.wmsBasketUnit.findMany({
+            where: {
+              basketId: basket.id,
+              status: { in: [WmsBasketUnitStatus.PICKED, WmsBasketUnitStatus.PACKED] },
+            },
+            select: {
+              status: true,
+              fulfillmentLineId: true,
+            },
+          });
+          const pickedPlusPackedByLine = new Map<string, number>();
+          const packedOnlyByLine = new Map<string, number>();
+          for (const u of postRealignUnits) {
+            if (!u.fulfillmentLineId) continue;
+            pickedPlusPackedByLine.set(
+              u.fulfillmentLineId,
+              (pickedPlusPackedByLine.get(u.fulfillmentLineId) ?? 0) + 1,
+            );
+            if (u.status === WmsBasketUnitStatus.PACKED) {
+              packedOnlyByLine.set(
+                u.fulfillmentLineId,
+                (packedOnlyByLine.get(u.fulfillmentLineId) ?? 0) + 1,
+              );
+            }
+          }
+          for (const slot of openLines) {
+            await prisma.wmsBasketPickDemand.updateMany({
+              where: {
+                basketId: basket.id,
+                fulfillmentLineId: slot.lineId,
+              },
+              data: {
+                quantityPicked: pickedPlusPackedByLine.get(slot.lineId) ?? 0,
+                quantityPacked: packedOnlyByLine.get(slot.lineId) ?? 0,
+              },
+            });
+          }
+
+          realignedBasketSummaries.push({
+            basketBarcode: basket.barcode,
+            basketStatus: basket.status,
+            realignedCount: changes.length,
+            changes,
+          });
+        }
+      }
+
+      if (realignedBasketSummaries.length > 0) {
+        console.log('[FAMCO_BASKET_HEAL]', JSON.stringify(realignedBasketSummaries));
+      }
+
+      await logFamcoTargetUnitAndBasketDiag('[FAMCO_TARGET_DIAG_AFTER]');
 
       const queueStatsBefore = await prisma.wmsFulfillmentOrder.groupBy({
         by: ['status'],
@@ -6555,6 +7539,9 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
           equivalenceRowCount,
           storeTransferItemCount,
           backfilledPoolGroupCount,
+          sanitizedUnpooledSingletonCount,
+          healedUnitCount: healedUnits.length,
+          realignedBasketCount: realignedBasketSummaries.length,
           activePoolGroupCount: activeMembersByGroup.size,
           pooledProfileCount,
           putawayBinUnitCount: putawayBinUnits.length,
@@ -6820,10 +7807,19 @@ async function reconcileToniosSharedStockPoolsAndQueue() {
           productId: true,
           variationId: true,
           stockPoolGroupId: true,
+          store: {
+            select: {
+              name: true,
+              shopName: true,
+            },
+          },
           posProduct: {
             select: {
               productId: true,
               variationId: true,
+              name: true,
+              customId: true,
+              productSnapshot: true,
             },
           },
         },
@@ -6839,6 +7835,12 @@ async function reconcileToniosSharedStockPoolsAndQueue() {
       const profileByStoreVariation = new Map(
         profiles.map((p) => [`${p.storeId}::${p.variationId}`, p]),
       );
+      const toToniosDescriptor = (p: (typeof profiles)[number]): SeedStockPoolDescriptor => ({
+        name: p.posProduct.name,
+        customId: p.posProduct.customId,
+        variationDisplayId: extractSeedVariationDisplayId(p.posProduct.productSnapshot),
+        storeName: p.store?.shopName || p.store?.name || null,
+      });
 
       const transferItems = await prisma.wmsInventoryStoreTransferItem.findMany({
         where: {
@@ -6862,7 +7864,12 @@ async function reconcileToniosSharedStockPoolsAndQueue() {
         const dst =
           (item.toProductProfileId ? profileById.get(item.toProductProfileId) : undefined)
           ?? profileByStoreVariation.get(`${item.toStoreId}::${item.toVariationId}`);
-        if (src && dst && src.id !== dst.id) {
+        if (
+          src
+          && dst
+          && src.id !== dst.id
+          && areSeedProfilesCompatibleForStockPool(toToniosDescriptor(src), toToniosDescriptor(dst))
+        ) {
           directedEdges.add(`${src.id}::${dst.id}`);
         }
       }

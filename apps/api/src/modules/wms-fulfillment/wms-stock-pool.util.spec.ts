@@ -2,8 +2,10 @@ import { describe, expect, it, jest } from '@jest/globals';
 import { WmsBasketStatus, WmsFulfillmentOrderStatus } from '@prisma/client';
 import {
   TenantStockPoolIndex,
+  areProfilesCompatibleForStockPool,
   linkProfilesIntoSharedStockPoolTx,
   loadTenantStockPoolIndex,
+  resolveStockPoolProductFamilyKey,
   syncProfileStockPoolLinksTx,
 } from './wms-stock-pool.util';
 
@@ -249,6 +251,67 @@ describe('wms-stock-pool.util', () => {
         { storeId: 'store-1', variationId: 'var-1' },
         { storeId: 'store-2', variationId: 'var-2' },
       ]);
+    });
+  });
+
+  describe('resolveStockPoolProductFamilyKey & areProfilesCompatibleForStockPool', () => {
+    it('keeps OTO-NMG / Magnesium strictly separate from Nourio while allowing same-product OTO variants to pool', () => {
+      const nourioBase = {
+        name: 'Nourio - 1 bottle 1490',
+        customId: 'NOUR',
+        variationDisplayId: 'NOUR',
+        storeName: 'Nourio',
+      };
+      const nourioOto = {
+        name: 'OTO - Nourio 1 bottle',
+        customId: 'OTO-NOUR',
+        variationDisplayId: 'OTO-NOUR',
+        storeName: 'Nourio',
+      };
+      const otoNmg = {
+        name: 'OTO-NMG',
+        customId: 'OTO-NMG',
+        variationDisplayId: 'OTO-NMG',
+        storeName: 'Nourio',
+      };
+      const regularNmg = {
+        name: 'Nourio Magnesium - 1 bottle',
+        customId: 'NMG',
+        variationDisplayId: 'NMG',
+        storeName: 'Nourio',
+      };
+
+      expect(resolveStockPoolProductFamilyKey(nourioBase)).toBe('brand:nourio');
+      expect(resolveStockPoolProductFamilyKey(nourioOto)).toBe('brand:nourio');
+      expect(resolveStockPoolProductFamilyKey(otoNmg)).toBe('product:magnesium');
+      expect(resolveStockPoolProductFamilyKey(regularNmg)).toBe('product:magnesium');
+
+      expect(areProfilesCompatibleForStockPool(nourioBase, nourioOto)).toBe(true);
+      expect(areProfilesCompatibleForStockPool(otoNmg, regularNmg)).toBe(true);
+      expect(areProfilesCompatibleForStockPool(nourioBase, otoNmg)).toBe(false);
+      expect(areProfilesCompatibleForStockPool(nourioBase, regularNmg)).toBe(false);
+      expect(areProfilesCompatibleForStockPool(nourioOto, otoNmg)).toBe(false);
+    });
+
+    it('matches Tonios same-product Body Wash variants while rejecting unrelated products', () => {
+      const oldBodyWash = {
+        name: '1 BOTTLE DEEP CURRENT BODY WASH',
+        customId: null,
+        storeName: 'Tonios',
+      };
+      const newBodyWash = {
+        name: "TONIO'S DEEP CURRENT BODY WASH",
+        customId: null,
+        storeName: 'Tonios',
+      };
+      const hairPomade = {
+        name: "TONIO'S HAIR POMADE",
+        customId: null,
+        storeName: 'Tonios',
+      };
+
+      expect(areProfilesCompatibleForStockPool(oldBodyWash, newBodyWash)).toBe(true);
+      expect(areProfilesCompatibleForStockPool(newBodyWash, hairPomade)).toBe(false);
     });
   });
 });
