@@ -5590,7 +5590,7 @@ async function reconcileToniosWmsFulfillmentQueue() {
       }
       const groupIdByStoreVar = new Map<string, string>();
       const poolMembersByGroup = new Map<string, Array<{ storeId: string; variationId: string }>>();
-      for (const [gid, members] of rawPoolByGroup.entries()) {
+      for (const [gid, members] of Array.from(rawPoolByGroup.entries())) {
         if (members.length < 2) continue;
         poolMembersByGroup.set(gid, members);
         for (const m of members) {
@@ -6894,14 +6894,14 @@ async function reconcileToniosSharedStockPoolsAndQueue() {
         list.push(p.id);
         byExistingGroup.set(p.stockPoolGroupId, list);
       }
-      for (const ids of byExistingGroup.values()) {
+      for (const ids of Array.from(byExistingGroup.values())) {
         for (let i = 1; i < ids.length; i += 1) {
           union(ids[0], ids[i]);
         }
       }
 
       // Link any bidirectional Change Variant pair (transferred A -> B and B -> A)
-      for (const edge of directedEdges) {
+      for (const edge of Array.from(directedEdges)) {
         const [leftId, rightId] = edge.split('::');
         if (leftId && rightId && directedEdges.has(`${rightId}::${leftId}`)) {
           union(leftId, rightId);
@@ -6909,7 +6909,7 @@ async function reconcileToniosSharedStockPoolsAndQueue() {
       }
 
       const components = new Map<string, string[]>();
-      for (const profileId of parentById.keys()) {
+      for (const profileId of Array.from(parentById.keys())) {
         const root = findRoot(profileId);
         const list = components.get(root) ?? [];
         list.push(profileId);
@@ -6917,7 +6917,7 @@ async function reconcileToniosSharedStockPoolsAndQueue() {
       }
 
       let newlyLinkedGroups = 0;
-      for (const memberIds of components.values()) {
+      for (const memberIds of Array.from(components.values())) {
         if (memberIds.length < 2) continue;
         const existingGroupIds = Array.from(
           new Set(
@@ -7056,7 +7056,7 @@ async function reconcileAllWmsIssueOrdersOnStartup() {
       }
       const groupByStoreVar = new Map<string, string>();
       const membersByGroup = new Map<string, Array<{ storeId: string; variationId: string }>>();
-      for (const [gid, members] of rawByGroup.entries()) {
+      for (const [gid, members] of Array.from(rawByGroup.entries())) {
         if (members.length < 2) continue;
         membersByGroup.set(gid, members);
         for (const m of members) {
