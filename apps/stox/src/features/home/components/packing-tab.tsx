@@ -686,7 +686,7 @@ function DemandPackExecutionCard({
   const selectedOrderId = selectedOrder?.id ?? null;
   const changedTask = tasks.find((task) => (
     task.id === selectedOrderId && task.itemChange
-  )) ?? tasks.find((task) => task.itemChange?.hasChanged) ?? null;
+  )) ?? tasks.find((task) => Boolean(task.itemChange)) ?? null;
   const basketLabel = basket?.barcode ?? plan.basketCode;
   const remainingOrders = plan.orderProgress.remaining;
   const availableUnitCount = plan.availableUnits.reduce((total, unit) => total + unit.unitCount, 0);

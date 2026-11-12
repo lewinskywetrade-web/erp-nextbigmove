@@ -47,6 +47,9 @@ export function OrderChangeNotice({
           />
         </View>
         <View style={styles.titleCopy}>
+          <Text style={styles.eyebrow}>
+            {change.requiresAction ? 'ORDER CHANGE NOTE · REWORK REQUIRED' : 'ORDER CHANGE NOTE · AUTOMATIC REVISION'}
+          </Text>
           <Text style={styles.title}>{change.title}</Text>
           <Text style={styles.message}>{change.message}</Text>
         </View>
@@ -235,6 +238,7 @@ const styles = StyleSheet.create({
     width: 34,
   },
   titleCopy: { flex: 1, gap: 3 },
+  eyebrow: { color: tokens.colors.panel, fontSize: 10, fontWeight: '800', letterSpacing: 0.8 },
   title: { color: tokens.colors.ink, fontSize: 15, fontWeight: '800' },
   message: { color: tokens.colors.inkMuted, fontSize: 13, lineHeight: 19 },
   metricsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: tokens.spacing.xs },

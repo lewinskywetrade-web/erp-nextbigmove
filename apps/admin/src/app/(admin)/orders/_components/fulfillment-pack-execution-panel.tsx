@@ -392,6 +392,20 @@ export function FulfillmentPackExecutionPanel({
         </div>
 
         <div className="mt-5 space-y-5">
+          {task.itemChange ? (
+            <div className={`rounded-[16px] border px-4 py-3 ${task.itemChange.requiresAction ? 'border-[#ffd8cc] bg-[#fff4f1]' : 'border-sky-200 bg-sky-50'}`}>
+              <p className={`text-[11px] font-semibold uppercase tracking-[0.18em] ${task.itemChange.requiresAction ? 'text-[#c2410c]' : 'text-sky-700'}`}>
+                {task.itemChange.requiresAction ? 'Order change note · Rework required' : 'Order change note · Automatic revision'}
+              </p>
+              <p className={`mt-1 text-[13px] font-semibold ${task.itemChange.requiresAction ? 'text-[#9a3412]' : 'text-sky-950'}`}>
+                {task.itemChange.title}
+              </p>
+              <p className={`mt-1 text-[12px] ${task.itemChange.requiresAction ? 'text-[#9a3412]' : 'text-sky-900'}`}>
+                {task.itemChange.message}
+              </p>
+            </div>
+          ) : null}
+
           <div className="flex flex-col gap-3 md:flex-row">
             <div className="md:flex-1">
               <MetricTile label="Packed" value={`${task.totals.packed}/${task.totals.required}`} note="Units verified" />
@@ -959,6 +973,30 @@ function DemandBasketPackExecutionPanel({
               ) : null}
             </WmsInlineNotice>
           ) : null}
+
+          {(() => {
+            const changedBasketTasks = selectedOrderTask?.itemChange
+              ? [selectedOrderTask]
+              : Array.from(orderTaskMap.values()).filter((basketTask) => Boolean(basketTask.itemChange));
+            return changedBasketTasks.map((basketTask) => (
+              basketTask.itemChange ? (
+                <div
+                  key={`pack-top-change-${basketTask.id}`}
+                  className={`rounded-[16px] border px-4 py-3 ${basketTask.itemChange.requiresAction ? 'border-[#ffd8cc] bg-[#fff4f1]' : 'border-sky-200 bg-sky-50'}`}
+                >
+                  <p className={`text-[11px] font-semibold uppercase tracking-[0.18em] ${basketTask.itemChange.requiresAction ? 'text-[#c2410c]' : 'text-sky-700'}`}>
+                    {basketTask.itemChange.requiresAction ? 'Order change note · Rework required' : 'Order change note · Automatic revision'}
+                  </p>
+                  <p className={`mt-1 text-[13px] font-semibold ${basketTask.itemChange.requiresAction ? 'text-[#9a3412]' : 'text-sky-950'}`}>
+                    #{basketTask.posOrderId} · {basketTask.itemChange.title}
+                  </p>
+                  <p className={`mt-1 text-[12px] ${basketTask.itemChange.requiresAction ? 'text-[#9a3412]' : 'text-sky-900'}`}>
+                    {basketTask.itemChange.message}
+                  </p>
+                </div>
+              ) : null
+            ));
+          })()}
 
           <div className="flex flex-col gap-3 md:flex-row">
             <div className="md:flex-1">

@@ -66,8 +66,16 @@ type FulfillmentAmendmentPlan = {
 };
 
 const CONFIRMED_POS_ORDER_STATUS = 1;
+const PACKING_POS_ORDER_STATUS = 8;
 const WAITING_FOR_PICKUP_POS_ORDER_STATUS = 9;
 const WAITING_FOR_PRINTING_POS_ORDER_STATUS = 12;
+const PRINTED_POS_ORDER_STATUS = 13;
+const AMENDABLE_POST_CONFIRM_POS_ORDER_STATUSES = [
+  PACKING_POS_ORDER_STATUS,
+  WAITING_FOR_PICKUP_POS_ORDER_STATUS,
+  WAITING_FOR_PRINTING_POS_ORDER_STATUS,
+  PRINTED_POS_ORDER_STATUS,
+] as const;
 const CANCELED_POS_ORDER_STATUS = 6;
 const SHIPPED_EQUIVALENT_POS_ORDER_STATUSES = [2, 3, 4, 5] as const;
 const ACTIVE_PICKING_ORDER_STATUSES = [
@@ -325,10 +333,7 @@ export class WmsFulfillmentSyncService {
               { status: CONFIRMED_POS_ORDER_STATUS },
               {
                 status: {
-                  in: [
-                    WAITING_FOR_PRINTING_POS_ORDER_STATUS,
-                    WAITING_FOR_PICKUP_POS_ORDER_STATUS,
-                  ],
+                  in: [...AMENDABLE_POST_CONFIRM_POS_ORDER_STATUSES],
                 },
                 wmsFulfillmentOrders: {
                   some: {
@@ -341,8 +346,9 @@ export class WmsFulfillmentSyncService {
             ],
           },
         ],
-        // Targeted webhook updates must also reconcile orders already being
-        // picked or packed. Broad/background syncs keep the old bounded scope.
+        // Targeted webhook updates reconcile all eligible orders including PACKED.
+        // Broad/background syncs also include active in-flight Pick/Pack orders so
+        // missed webhooks still trigger automatic POS revisions immediately.
         ...(refs.length > 0
           ? {}
           : {
@@ -352,6 +358,20 @@ export class WmsFulfillmentSyncService {
                     none: {
                       status: {
                         in: [...FINALIZED_FULFILLMENT_ORDER_STATUSES],
+                      },
+                    },
+                  },
+                },
+                {
+                  wmsFulfillmentOrders: {
+                    some: {
+                      status: {
+                        in: [
+                          WmsFulfillmentOrderStatus.IN_PICKING,
+                          WmsFulfillmentOrderStatus.READY_FOR_PACK,
+                          WmsFulfillmentOrderStatus.PICKED,
+                          WmsFulfillmentOrderStatus.PACKING,
+                        ],
                       },
                     },
                   },
@@ -632,15 +652,32 @@ export class WmsFulfillmentSyncService {
             : existing;
         }
 
-        const amendment = this.buildFulfillmentAmendmentPlan(existing, demandDiff);
-        const nextRevision = hasNewSourceRevision
-          ? lockedRevision.sourceRevision + 1
-          : Math.max(lockedRevision.sourceRevision, 1);
+        const isInitialEmptyIssueHydration =
+          shouldRecoverUnbasketedIssueOrder
+          && previousDemand.length === 0
+          && lockedRevision.sourceRevision <= 1
+          && existing.pickedQuantity === 0
+          && !existing.changeDetectedAt;
+        const amendment = this.buildFulfillmentAmendmentPlan(existing, demandDiff, lines.length);
+        const nextRevision = isInitialEmptyIssueHydration
+          ? 1
+          : hasNewSourceRevision
+            ? lockedRevision.sourceRevision + 1
+            : Math.max(lockedRevision.sourceRevision, 1);
+        const shouldReopenSerialPickingForRework =
+          existing.assignmentMode === WmsFulfillmentAssignmentMode.SERIAL_RESERVED
+          && amendment.changeState === WmsFulfillmentChangeState.PICK_REWORK_REQUIRED
+          && (
+            existing.status === WmsFulfillmentOrderStatus.READY_FOR_PACK
+            || existing.status === WmsFulfillmentOrderStatus.PICKED
+          );
         const nextSyncedOrderStatus = shouldRecoverTransientCancellation || shouldRecoverUnbasketedIssueOrder
           ? WmsFulfillmentOrderStatus.RESTOCKING
           : shouldMarkUnbasketedEmptyOrderIssue
             ? WmsFulfillmentOrderStatus.ISSUE
-            : existing.status;
+            : shouldReopenSerialPickingForRework
+              ? WmsFulfillmentOrderStatus.IN_PICKING
+              : existing.status;
 
         await tx.wmsFulfillmentOrder.update({
           where: { id: existing.id },
@@ -655,9 +692,18 @@ export class WmsFulfillmentSyncService {
             totalQuantity,
             sourceItemsHash,
             sourceRevision: nextRevision,
-            changeState: amendment.changeState,
-            changeDetectedAt: new Date(),
-            changeSummary: amendment.summary as Prisma.InputJsonValue,
+            changeState: isInitialEmptyIssueHydration
+              ? WmsFulfillmentChangeState.NONE
+              : amendment.changeState,
+            ...(isInitialEmptyIssueHydration
+              ? {
+                  changeDetectedAt: null,
+                  changeSummary: Prisma.DbNull,
+                }
+              : {
+                  changeDetectedAt: new Date(),
+                  changeSummary: amendment.summary as Prisma.InputJsonValue,
+                }),
             issueReason:
               nextSyncedOrderStatus === WmsFulfillmentOrderStatus.ISSUE
                 ? (
@@ -686,7 +732,13 @@ export class WmsFulfillmentSyncService {
                       status: WmsFulfillmentOrderStatus.ISSUE,
                       allocatedQuantity: 0,
                     }
-                  : {}),
+                  : shouldReopenSerialPickingForRework
+                    ? {
+                        status: WmsFulfillmentOrderStatus.IN_PICKING,
+                        packedById: null,
+                        completedAt: null,
+                      }
+                    : {}),
             lastSyncedAt: new Date(),
           },
         });
@@ -740,6 +792,8 @@ export class WmsFulfillmentSyncService {
             status: WmsFulfillmentLineStatus.CANCELED,
             sourceQuantityRequired: 0,
             quantityRequired: 0,
+            quantityAllocated: 0,
+            issueReason: null,
           },
         });
 
@@ -768,7 +822,7 @@ export class WmsFulfillmentSyncService {
           });
         }
 
-        if (hasNewSourceRevision) {
+        if (hasNewSourceRevision && !isInitialEmptyIssueHydration) {
           await tx.wmsFulfillmentAmendment.updateMany({
             where: {
               fulfillmentOrderId: existing.id,
@@ -823,7 +877,9 @@ export class WmsFulfillmentSyncService {
           ? { ...existing, status: WmsFulfillmentOrderStatus.RESTOCKING }
           : shouldMarkUnbasketedEmptyOrderIssue
             ? { ...existing, status: WmsFulfillmentOrderStatus.ISSUE }
-            : existing;
+            : shouldReopenSerialPickingForRework
+              ? { ...existing, status: WmsFulfillmentOrderStatus.IN_PICKING }
+              : existing;
       });
 
       if (!fulfillmentOrder) {
@@ -832,12 +888,15 @@ export class WmsFulfillmentSyncService {
 
       syncedOrders += 1;
 
-      if (!(FINALIZED_FULFILLMENT_ORDER_STATUSES as readonly WmsFulfillmentOrderStatus[]).includes(fulfillmentOrder.status)) {
-        if (fulfillmentOrder.assignmentMode === WmsFulfillmentAssignmentMode.BASKET_DEMAND) {
+      if (fulfillmentOrder.assignmentMode === WmsFulfillmentAssignmentMode.BASKET_DEMAND) {
+        if (!(FINALIZED_FULFILLMENT_ORDER_STATUSES as readonly WmsFulfillmentOrderStatus[]).includes(fulfillmentOrder.status)) {
           demandQueueScopeKeys.add(`${posOrder.tenantId}::${store.id}`);
-        } else {
-          await this.allocateFulfillmentOrder(fulfillmentOrder.id, params.actorId);
         }
+      } else if (
+        !(FINALIZED_FULFILLMENT_ORDER_STATUSES as readonly WmsFulfillmentOrderStatus[]).includes(fulfillmentOrder.status)
+        || fulfillmentOrder.status === WmsFulfillmentOrderStatus.IN_PICKING
+      ) {
+        await this.allocateFulfillmentOrder(fulfillmentOrder.id, params.actorId);
       }
     }
 
@@ -3122,6 +3181,7 @@ export class WmsFulfillmentSyncService {
   private buildFulfillmentAmendmentPlan(
     order: any,
     diff: ReturnType<typeof diffFulfillmentDemand>,
+    nextLineCount?: number,
   ): FulfillmentAmendmentPlan {
     const summarized = summarizeFulfillmentDemandDiff(diff);
     const pickedByVariation = new Map<string, number>();
@@ -3185,6 +3245,12 @@ export class WmsFulfillmentSyncService {
     const physicalPickedTotal = Array.from(pickedByVariation.values())
       .reduce((sum, quantity) => sum + quantity, 0);
     const hasPhysicalWork = returnActions.length > 0 || pickActions.length > 0;
+    const isInActivePickOrBasket =
+      Boolean(order.basketId)
+      || order.status === WmsFulfillmentOrderStatus.IN_PICKING
+      || order.status === WmsFulfillmentOrderStatus.READY_FOR_PACK
+      || order.status === WmsFulfillmentOrderStatus.PICKED;
+    const allItemsRemovedDuringPick = isInActivePickOrBasket && nextLineCount === 0;
     let stage: WmsFulfillmentAmendmentStage = WmsFulfillmentAmendmentStage.PRE_PICK;
     let changeState: WmsFulfillmentChangeState = WmsFulfillmentChangeState.NONE;
     if (order.status === WmsFulfillmentOrderStatus.PACKED) {
@@ -3193,17 +3259,15 @@ export class WmsFulfillmentSyncService {
     } else if (order.status === WmsFulfillmentOrderStatus.PACKING) {
       stage = WmsFulfillmentAmendmentStage.PACKING;
       changeState = WmsFulfillmentChangeState.PACK_REWORK_REQUIRED;
-    } else if (
-      order.status === WmsFulfillmentOrderStatus.IN_PICKING
-      || order.status === WmsFulfillmentOrderStatus.READY_FOR_PACK
-      || order.status === WmsFulfillmentOrderStatus.PICKED
-    ) {
+    } else if (isInActivePickOrBasket) {
       stage = WmsFulfillmentAmendmentStage.PICKING;
-      changeState = order.status === WmsFulfillmentOrderStatus.IN_PICKING && physicalPickedTotal === 0
-        ? WmsFulfillmentChangeState.NONE
-        : hasPhysicalWork
-          ? WmsFulfillmentChangeState.PICK_REWORK_REQUIRED
-          : WmsFulfillmentChangeState.NONE;
+      changeState = allItemsRemovedDuringPick
+        ? WmsFulfillmentChangeState.PICK_REWORK_REQUIRED
+        : order.status === WmsFulfillmentOrderStatus.IN_PICKING && physicalPickedTotal === 0
+          ? WmsFulfillmentChangeState.NONE
+          : hasPhysicalWork
+            ? WmsFulfillmentChangeState.PICK_REWORK_REQUIRED
+            : WmsFulfillmentChangeState.NONE;
     }
 
     return {
@@ -3211,16 +3275,23 @@ export class WmsFulfillmentSyncService {
       changeState,
       summary: {
         ...summarized,
+        ...(allItemsRemovedDuringPick
+          ? {
+              message: 'All pickable items were removed from this order in POS. Return any picked units or detach this order from the basket.',
+            }
+          : {}),
         autoRebuilt: true,
         requiresAction: changeState !== WmsFulfillmentChangeState.NONE,
         detectedStage: stage,
-        notificationTitle: changeState === WmsFulfillmentChangeState.NONE
-          ? 'Order updated — pick list refreshed'
-          : stage === WmsFulfillmentAmendmentStage.PACKED
-            ? 'Packed order changed — rework required'
-            : stage === WmsFulfillmentAmendmentStage.PACKING
-              ? 'Order changed during packing'
-              : 'Order changed during picking',
+        notificationTitle: allItemsRemovedDuringPick
+          ? 'Order changed during picking — all items removed'
+          : changeState === WmsFulfillmentChangeState.NONE
+            ? 'Order updated — pick list refreshed'
+            : stage === WmsFulfillmentAmendmentStage.PACKED
+              ? 'Packed order changed — rework required'
+              : stage === WmsFulfillmentAmendmentStage.PACKING
+                ? 'Order changed during packing'
+                : 'Order changed during picking',
         returnUnitsRemaining: returnActions.reduce((sum, action) => sum + action.quantity, 0),
         pickUnitsRequired: pickActions.reduce((sum, action) => sum + action.quantity, 0),
       },
@@ -3438,19 +3509,13 @@ export class WmsFulfillmentSyncService {
       });
     }
 
-    const nextBasketDemandStatus =
-      params.lines.length === 0 && params.amendment.changeState === WmsFulfillmentChangeState.NONE
-        ? WmsFulfillmentOrderStatus.ISSUE
-        : WmsFulfillmentOrderStatus.IN_PICKING;
+    // Never put an order into ISSUE status while it is actively being picked in a basket.
+    // Keep it IN_PICKING so the picker sees the automatic revision / rework note above.
     await tx.wmsFulfillmentOrder.update({
       where: { id: params.order.id },
       data: {
-        status: nextBasketDemandStatus,
-        ...(nextBasketDemandStatus === WmsFulfillmentOrderStatus.ISSUE
-          ? {
-              issueReason: 'All pickable items were removed from this order in Pancake POS — void basket or cancel in WMS.',
-            }
-          : {}),
+        status: WmsFulfillmentOrderStatus.IN_PICKING,
+        issueReason: null,
         allocatedQuantity: Math.min(totalAllocated, params.lines.reduce((sum, line) => sum + line.quantityRequired, 0)),
         pickedQuantity: Math.min(totalPicked, params.lines.reduce((sum, line) => sum + line.quantityRequired, 0)),
         packedById: null,
@@ -3728,6 +3793,11 @@ export class WmsFulfillmentSyncService {
       if (pendingReturns > 0 || !pickComplete) {
         return false;
       }
+      const isAttachedToActivePick = Boolean(order.basketId || order.claimedById);
+      if (order.totalQuantity === 0 && isAttachedToActivePick) {
+        // Keep the order in IN_PICKING with its amendment note until detached or voided from the basket.
+        return false;
+      }
       await tx.wmsFulfillmentAmendment.update({
         where: { id: amendment.id },
         data: { status: WmsFulfillmentAmendmentStatus.RESOLVED, resolvedAt: new Date() },
@@ -3779,6 +3849,11 @@ export class WmsFulfillmentSyncService {
         },
       });
 
+      const isEligiblePreShipPosStatus =
+        existingOrder?.posOrder.status === CONFIRMED_POS_ORDER_STATUS
+        || (AMENDABLE_POST_CONFIRM_POS_ORDER_STATUSES as readonly number[]).includes(
+          existingOrder?.posOrder.status ?? -1,
+        );
       if (
         !existingOrder
         || existingOrder.status === WmsFulfillmentOrderStatus.READY_FOR_PACK
@@ -3786,7 +3861,7 @@ export class WmsFulfillmentSyncService {
         || existingOrder.status === WmsFulfillmentOrderStatus.PACKING
         || existingOrder.status === WmsFulfillmentOrderStatus.PACKED
         || existingOrder.status === WmsFulfillmentOrderStatus.CANCELED
-        || existingOrder.posOrder.status !== CONFIRMED_POS_ORDER_STATUS
+        || !isEligiblePreShipPosStatus
         || existingOrder.posOrder.isVoid
       ) {
         return;
@@ -4524,6 +4599,7 @@ export class WmsFulfillmentSyncService {
     const nextOrderStatus = this.resolveFulfillmentOrderStatus({
       currentStatus: order.status,
       claimedById: order.claimedById,
+      basketId: order.basketId,
       totalQuantity,
       allocatedQuantity,
       pickedQuantity,
@@ -4675,6 +4751,11 @@ export class WmsFulfillmentSyncService {
       },
     });
 
+    const isEligiblePreShipPosStatus =
+      order?.posOrder.status === CONFIRMED_POS_ORDER_STATUS
+      || (AMENDABLE_POST_CONFIRM_POS_ORDER_STATUSES as readonly number[]).includes(
+        order?.posOrder.status ?? -1,
+      );
     if (
       !order
       || order.assignmentMode !== WmsFulfillmentAssignmentMode.BASKET_DEMAND
@@ -4684,7 +4765,7 @@ export class WmsFulfillmentSyncService {
       || order.status === WmsFulfillmentOrderStatus.PACKED
       || order.status === WmsFulfillmentOrderStatus.CANCELED
       || Boolean(order.basketId)
-      || order.posOrder.status !== CONFIRMED_POS_ORDER_STATUS
+      || !isEligiblePreShipPosStatus
       || order.posOrder.isVoid
     ) {
       return;
@@ -4909,6 +4990,7 @@ export class WmsFulfillmentSyncService {
     const nextOrderStatus = this.resolveFulfillmentOrderStatus({
       currentStatus: order.status,
       claimedById: order.claimedById,
+      basketId: order.basketId,
       totalQuantity,
       allocatedQuantity,
       pickedQuantity,
@@ -5214,6 +5296,7 @@ export class WmsFulfillmentSyncService {
   private resolveFulfillmentOrderStatus(params: {
     currentStatus: WmsFulfillmentOrderStatus;
     claimedById: string | null;
+    basketId?: string | null;
     totalQuantity: number;
     allocatedQuantity: number;
     pickedQuantity: number;
@@ -5231,16 +5314,31 @@ export class WmsFulfillmentSyncService {
       return WmsFulfillmentOrderStatus.PACKING;
     }
 
+    if (params.currentStatus === WmsFulfillmentOrderStatus.PICKED) {
+      return WmsFulfillmentOrderStatus.PICKED;
+    }
+
+    const isActivelyBeingPicked =
+      (params.currentStatus === WmsFulfillmentOrderStatus.IN_PICKING && Boolean(params.claimedById || params.basketId))
+      || params.currentStatus === WmsFulfillmentOrderStatus.READY_FOR_PACK;
+    if (isActivelyBeingPicked) {
+      if (params.totalQuantity <= 0 || params.hasIssue) {
+        return WmsFulfillmentOrderStatus.IN_PICKING;
+      }
+
+      if (params.pickedQuantity >= params.totalQuantity) {
+        return WmsFulfillmentOrderStatus.READY_FOR_PACK;
+      }
+
+      return WmsFulfillmentOrderStatus.IN_PICKING;
+    }
+
     if (params.totalQuantity <= 0 || params.hasIssue) {
       return WmsFulfillmentOrderStatus.ISSUE;
     }
 
     if (params.pickedQuantity >= params.totalQuantity) {
       return WmsFulfillmentOrderStatus.READY_FOR_PACK;
-    }
-
-    if (params.currentStatus === WmsFulfillmentOrderStatus.IN_PICKING && params.claimedById) {
-      return WmsFulfillmentOrderStatus.IN_PICKING;
     }
 
     if (params.allocatedQuantity >= params.totalQuantity) {

@@ -1407,6 +1407,20 @@ function PickTaskCard({
           </View>
         </View>
 
+        {task.itemChange ? (
+          <View style={[
+            styles.compactOrderChangeBadge,
+            task.itemChange.requiresAction ? styles.compactOrderChangeBadgeWarning : styles.compactOrderChangeBadgeInfo,
+          ]}>
+            <Text numberOfLines={2} style={[
+              styles.compactOrderChangeText,
+              task.itemChange.requiresAction ? styles.compactOrderChangeTextWarning : styles.compactOrderChangeTextInfo,
+            ]}>
+              {task.itemChange.requiresAction ? 'Order changed · Rework required' : 'Order changed · Automatic revision'} — {task.itemChange.message}
+            </Text>
+          </View>
+        ) : null}
+
         <Text numberOfLines={1} style={styles.compactOrderTitle}>{task.posOrderId}</Text>
 
         <Text numberOfLines={2} style={styles.compactSummary}>
@@ -1513,7 +1527,7 @@ function PickExecutionStack({
         <StatusBadge status={activeTask.status} label={mapPickCardStatus(activeTask.status, activeTask.statusLabel)} />
       </View>
 
-      {tasks.filter((task) => task.itemChange?.requiresAction).map((task) => (
+      {tasks.filter((task) => Boolean(task.itemChange)).map((task) => (
         <OrderChangeNotice
           key={`change-${task.id}`}
           canDetach={canDetachOrders}
@@ -3557,6 +3571,31 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
     lineHeight: 17,
+  },
+  compactOrderChangeBadge: {
+    borderRadius: 10,
+    borderWidth: 1,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  compactOrderChangeBadgeInfo: {
+    backgroundColor: '#EEF6FF',
+    borderColor: '#BBD8FA',
+  },
+  compactOrderChangeBadgeWarning: {
+    backgroundColor: '#FFF4EF',
+    borderColor: '#F2B8A9',
+  },
+  compactOrderChangeText: {
+    fontSize: 11,
+    fontWeight: '700',
+    lineHeight: 16,
+  },
+  compactOrderChangeTextInfo: {
+    color: '#175CD3',
+  },
+  compactOrderChangeTextWarning: {
+    color: '#B42318',
   },
   compactTopRow: {
     alignItems: 'center',

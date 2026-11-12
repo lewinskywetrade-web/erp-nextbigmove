@@ -4002,6 +4002,7 @@ export class WmsFulfillmentOpsService {
     const nextOrderStatus = this.resolveFulfillmentOrderStatus({
       currentStatus: order.status,
       claimedById: order.claimedById,
+      basketId: order.basketId,
       totalQuantity,
       allocatedQuantity,
       pickedQuantity,
@@ -4258,6 +4259,7 @@ export class WmsFulfillmentOpsService {
   private resolveFulfillmentOrderStatus(params: {
     currentStatus: WmsFulfillmentOrderStatus;
     claimedById: string | null;
+    basketId?: string | null;
     totalQuantity: number;
     allocatedQuantity: number;
     pickedQuantity: number;
@@ -4279,16 +4281,27 @@ export class WmsFulfillmentOpsService {
       return WmsFulfillmentOrderStatus.PICKED;
     }
 
+    const isActivelyBeingPicked =
+      (params.currentStatus === WmsFulfillmentOrderStatus.IN_PICKING && Boolean(params.claimedById || params.basketId))
+      || params.currentStatus === WmsFulfillmentOrderStatus.READY_FOR_PACK;
+    if (isActivelyBeingPicked) {
+      if (params.totalQuantity <= 0 || params.hasIssue) {
+        return WmsFulfillmentOrderStatus.IN_PICKING;
+      }
+
+      if (params.pickedQuantity >= params.totalQuantity) {
+        return WmsFulfillmentOrderStatus.READY_FOR_PACK;
+      }
+
+      return WmsFulfillmentOrderStatus.IN_PICKING;
+    }
+
     if (params.totalQuantity <= 0 || params.hasIssue) {
       return WmsFulfillmentOrderStatus.ISSUE;
     }
 
     if (params.pickedQuantity >= params.totalQuantity) {
       return WmsFulfillmentOrderStatus.READY_FOR_PACK;
-    }
-
-    if (params.currentStatus === WmsFulfillmentOrderStatus.IN_PICKING && params.claimedById) {
-      return WmsFulfillmentOrderStatus.IN_PICKING;
     }
 
     if (params.allocatedQuantity >= params.totalQuantity) {

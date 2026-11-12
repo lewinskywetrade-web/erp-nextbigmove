@@ -16,6 +16,9 @@ const ACTIVE_PICK_QUEUE_ORDER_STATUSES = [
   WmsFulfillmentOrderStatus.RESTOCKING,
   WmsFulfillmentOrderStatus.ISSUE,
   WmsFulfillmentOrderStatus.IN_PICKING,
+  WmsFulfillmentOrderStatus.READY_FOR_PACK,
+  WmsFulfillmentOrderStatus.PICKED,
+  WmsFulfillmentOrderStatus.PACKING,
 ] as const;
 
 export function resolveWmsIssueRecheckIntervalMs(ageMs: number): number {
@@ -217,7 +220,7 @@ export class WmsIssueOrderReconcilerService implements OnModuleInit {
         posOrder: {
           is: {
             OR: [
-              { status: 1, isVoid: false },
+              { status: { in: [1, 8, 9, 12, 13] }, isVoid: false },
               { status: { in: [2, 3, 4, 5, 6] } },
               { isVoid: true },
             ],

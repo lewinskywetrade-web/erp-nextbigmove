@@ -167,7 +167,7 @@ describe('WmsFulfillmentSyncService targeted source revisions', () => {
             OR: expect.arrayContaining([
               expect.objectContaining({ status: 1 }),
               expect.objectContaining({
-                status: { in: [12, 9] },
+                status: { in: expect.arrayContaining([8, 9, 12, 13]) },
                 wmsFulfillmentOrders: {
                   some: {
                     status: { in: expect.arrayContaining(['PACKING', 'PACKED']) },
@@ -1080,5 +1080,101 @@ describe('WmsFulfillmentSyncService POS shipped pick-status sync', () => {
         issueReason: null,
       }),
     });
+  });
+
+  it('never puts an actively picked order into ISSUE status when POS changes or removes items, and includes active Pick/Pack orders in broad resyncs', async () => {
+    const prisma = {
+      posOrder: {
+        findMany: jest.fn<() => Promise<any[]>>().mockResolvedValue([]),
+      },
+    };
+    const service = new WmsFulfillmentSyncService(prisma as any, {} as any, {} as any);
+    jest.spyOn(service as any, 'syncCanceledPickingOrders').mockResolvedValue({ cleanedOrders: 0 });
+    jest.spyOn(service as any, 'syncPosShippedPickingOrders').mockResolvedValue({ syncedOrders: 0 });
+    jest.spyOn(service as any, 'buildTenantGoLiveOrderFilters').mockResolvedValue([{}]);
+
+    await service.syncConfirmedPickingOrders({
+      tenantId: 'tenant-famco',
+      storeId: 'store-nourio',
+      actorId: 'user-1',
+      stores: [{ id: 'store-nourio', tenantId: 'tenant-famco', shopId: 'shop-nourio' }],
+      limit: null,
+    });
+
+    expect(prisma.posOrder.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        OR: expect.arrayContaining([
+          expect.objectContaining({
+            wmsFulfillmentOrders: {
+              some: {
+                status: {
+                  in: [
+                    WmsFulfillmentOrderStatus.IN_PICKING,
+                    WmsFulfillmentOrderStatus.READY_FOR_PACK,
+                    WmsFulfillmentOrderStatus.PICKED,
+                    WmsFulfillmentOrderStatus.PACKING,
+                  ],
+                },
+              },
+            },
+          }),
+        ]),
+      }),
+    }));
+
+    expect(
+      (service as any).resolveFulfillmentOrderStatus({
+        currentStatus: WmsFulfillmentOrderStatus.IN_PICKING,
+        claimedById: 'picker-1',
+        basketId: 'basket-nourio',
+        totalQuantity: 5,
+        allocatedQuantity: 5,
+        pickedQuantity: 5,
+        hasIssue: true,
+      }),
+    ).toBe(WmsFulfillmentOrderStatus.IN_PICKING);
+
+    expect(
+      (service as any).resolveFulfillmentOrderStatus({
+        currentStatus: WmsFulfillmentOrderStatus.IN_PICKING,
+        claimedById: null,
+        basketId: 'basket-nourio',
+        totalQuantity: 0,
+        allocatedQuantity: 0,
+        pickedQuantity: 0,
+        hasIssue: false,
+      }),
+    ).toBe(WmsFulfillmentOrderStatus.IN_PICKING);
+
+    const plan = (service as any).buildFulfillmentAmendmentPlan(
+      {
+        status: WmsFulfillmentOrderStatus.IN_PICKING,
+        basketId: 'basket-nourio',
+        lines: [],
+        basketPickDemands: [],
+        basketUnits: [],
+      },
+      {
+        hasChanges: true,
+        added: [],
+        removed: [
+          {
+            variationId: 'var-oto',
+            productId: 'prod-oto',
+            productName: 'OTO Nourio - 1 bottle 899',
+            productDisplayId: 'OTO-899',
+            quantityRequired: 1,
+            previousQuantity: 1,
+            nextQuantity: 0,
+            delta: -1,
+          },
+        ],
+        increased: [],
+        decreased: [],
+      },
+      0,
+    );
+    expect(plan.changeState).toBe('PICK_REWORK_REQUIRED');
+    expect(plan.summary.notificationTitle).toBe('Order changed during picking — all items removed');
   });
 });

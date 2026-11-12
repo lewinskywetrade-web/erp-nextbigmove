@@ -91,6 +91,65 @@ describe('WmsMobileService packing POS item guard', () => {
       requiresAction: true,
     }));
   });
+
+  it('surfaces automatic revision notes when changeState is NONE while still detecting a subsequent unapplied POS edit', () => {
+    const revisedOrder = {
+      id: 'fo-4292',
+      posOrderId: '4292',
+      status: WmsFulfillmentOrderStatus.IN_PICKING,
+      changeState: WmsFulfillmentChangeState.NONE,
+      changeDetectedAt: new Date('2026-11-12T03:00:00.000Z'),
+      changeSummary: {
+        autoRebuilt: true,
+        notificationTitle: 'Order updated — pick list refreshed',
+        message: '2 items added and 1 item removed.',
+        addedUnits: 2,
+        removedUnits: 1,
+      },
+      posOrder: {
+        orderSnapshot: {
+          items: [sourceItem('nourio-1'), sourceItem('nourio-2')],
+        },
+      },
+      lines: [
+        sourceLine('nourio-1', 1, 1, WmsFulfillmentLineStatus.READY),
+        sourceLine('nourio-2', 1, 1, WmsFulfillmentLineStatus.READY),
+      ],
+    };
+
+    expect(resolveItemChange(revisedOrder)).toEqual(expect.objectContaining({
+      hasChanged: false,
+      requiresAction: false,
+      autoRebuilt: true,
+      title: 'Order updated — pick list refreshed',
+      message: '2 items added and 1 item removed.',
+    }));
+
+    const editedAgainBeforeSync = {
+      ...revisedOrder,
+      posOrder: {
+        orderSnapshot: {
+          items: [sourceItem('nourio-1'), sourceItem('nourio-3')],
+        },
+      },
+    };
+    expect(resolveItemChange(editedAgainBeforeSync)).toEqual(expect.objectContaining({
+      hasChanged: true,
+      requiresAction: true,
+    }));
+
+    expect(
+      (service as any).resolveFulfillmentOrderStatus({
+        currentStatus: WmsFulfillmentOrderStatus.IN_PICKING,
+        claimedById: 'picker-1',
+        basketId: 'basket-1',
+        totalQuantity: 5,
+        allocatedQuantity: 5,
+        pickedQuantity: 5,
+        hasIssue: true,
+      }),
+    ).toBe(WmsFulfillmentOrderStatus.IN_PICKING);
+  });
 });
 
 describe('WmsMobileService demand packing serial reassignment', () => {

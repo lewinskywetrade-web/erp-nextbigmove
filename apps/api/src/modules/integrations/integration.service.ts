@@ -6360,6 +6360,9 @@ export class IntegrationService {
               WmsFulfillmentOrderStatus.PARTIAL,
               WmsFulfillmentOrderStatus.READY,
               WmsFulfillmentOrderStatus.IN_PICKING,
+              WmsFulfillmentOrderStatus.READY_FOR_PACK,
+              WmsFulfillmentOrderStatus.PICKED,
+              WmsFulfillmentOrderStatus.PACKING,
             ],
           },
           posOrder: {

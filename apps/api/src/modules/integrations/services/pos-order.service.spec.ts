@@ -613,7 +613,7 @@ describe('POS webhook COGS persistence', () => {
 });
 
 describe('shouldTreatNoProductSnapshotAsVoid', () => {
-  it.each([1, 9, 12])(
+  it.each([1, 8, 9, 12, 13])(
     'keeps an explicitly empty snapshot fulfillable while POS status is %s',
     (status) => {
       expect(shouldTreatNoProductSnapshotAsVoid(true, status)).toBe(false);
@@ -630,7 +630,7 @@ describe('shouldTreatNoProductSnapshotAsVoid', () => {
 });
 
 describe('shouldQueueWmsFulfillmentSync', () => {
-  it.each([1, 9, 12])(
+  it.each([1, 8, 9, 12, 13])(
     'queues WMS reconciliation for an active order at POS status %s',
     (status) => {
       expect(shouldQueueWmsFulfillmentSync(status, false)).toBe(true);

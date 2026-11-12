@@ -382,6 +382,10 @@ export function FulfillmentQueueTable({
       >
         {selectedBasket ? (
           <>
+            {selectedBasketChanges.map((task) => (
+              <OrderChangeAlert key={`basket-change-${task.id}`} task={task} />
+            ))}
+
             <div className="grid gap-3 sm:grid-cols-2">
               <TopMetaCard
                 label="Status"
@@ -396,10 +400,6 @@ export function FulfillmentQueueTable({
                 value={<span className="text-sm font-semibold text-primary">{formatDateTime(selectedBasket.basket.claimedAt)}</span>}
               />
             </div>
-
-            {selectedBasketChanges.map((task) => (
-              <OrderChangeAlert key={`basket-change-${task.id}`} task={task} />
-            ))}
 
             {confirmVoidBasketId === selectedBasket.basket.id ? (
               <div className="rounded-[20px] border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
@@ -469,8 +469,19 @@ export function FulfillmentQueueTable({
               description={`${selectedBasketOrders.length} order${selectedBasketOrders.length === 1 ? '' : 's'} currently linked to this basket.`}
             >
               <div className="space-y-3">
-                {selectedBasketOrders.map((order) => (
+                {selectedBasketOrders.map((order) => {
+                  const matchedTask = selectedBasket.tasks.find((task) => task.id === order.id);
+                  return (
                   <div key={order.id} className="rounded-[20px] border border-[#e6edf1] bg-[#fbfcfc] px-4 py-3">
+                    {matchedTask?.itemChange ? (
+                      <div className={`mb-2.5 rounded-xl border px-3 py-2 text-xs ${matchedTask.itemChange.requiresAction ? 'border-amber-200 bg-amber-50 text-amber-900' : 'border-sky-200 bg-sky-50 text-sky-900'}`}>
+                        <span className="font-semibold">
+                          {matchedTask.itemChange.requiresAction ? 'Order changed · Rework required' : 'Order changed · Automatic revision'}
+                        </span>
+                        {' — '}
+                        <span>{matchedTask.itemChange.message}</span>
+                      </div>
+                    ) : null}
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
                         <p className="truncate text-sm font-semibold text-primary">
@@ -495,12 +506,15 @@ export function FulfillmentQueueTable({
                       Customer: <span className="font-semibold text-primary">{order.customerName ?? 'Unavailable'}</span>
                     </p>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </DetailSection>
           </>
         ) : selectedTask ? (
           <>
+            {selectedTask.itemChange ? <OrderChangeAlert task={selectedTask} /> : null}
+
             <div className="grid gap-3 sm:grid-cols-2">
               <TopMetaCard
                 label="Status"
@@ -531,8 +545,6 @@ export function FulfillmentQueueTable({
                 </div>
               ) : null;
             })()}
-
-            {selectedTask.itemChange ? <OrderChangeAlert task={selectedTask} /> : null}
 
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
               <SummaryTile label="Required" value={selectedTask.totals.required} />
@@ -900,7 +912,10 @@ function OrderChangeAlert({ task }: { task: WmsFulfillmentQueueTask }) {
     <div className={`rounded-xl border px-4 py-3 ${change.requiresAction ? 'border-warning/30 bg-warning-soft/45' : 'border-info/30 bg-info-soft'}`}>
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <p className="text-sm font-semibold text-foreground">
+          <p className={`text-[11px] font-semibold uppercase tracking-[0.18em] ${change.requiresAction ? 'text-warning' : 'text-primary'}`}>
+            {change.requiresAction ? 'Order change note · Rework required' : 'Order change note · Automatic revision'}
+          </p>
+          <p className="mt-1 text-sm font-semibold text-foreground">
             {change.title}
           </p>
           <p className="mt-1 text-sm-custom text-muted">
@@ -1006,7 +1021,7 @@ function OrderChangeAlert({ task }: { task: WmsFulfillmentQueueTask }) {
         {change.requiresAction
           ? 'Complete the return first, then follow the assigned pick bin. Packer assignment and packing remain blocked until both steps finish.'
           : task.status === 'ISSUE'
-            ? 'POS item changes were synced, but this order is still blocked by an issue — review the Issue reason above.'
+            ? 'POS item changes were synced, but this order is still blocked by an issue — review the Issue reason below.'
             : 'The current Pick list already uses the latest POS variations and quantities. No manual sync is needed.'}
       </p>
     </div>
@@ -1031,6 +1046,9 @@ function TaskRow({
   const rowIssueReason = task.status === 'ISSUE' || task.issueReason
     ? resolveDisplayIssueReason(task)
     : null;
+  const rowOrderChangeNote = task.itemChange
+    ? `${task.itemChange.requiresAction ? 'Order changed · Rework required' : 'Order changed · Automatic revision'} — ${task.itemChange.message}`
+    : null;
 
   return (
     <tr
@@ -1052,6 +1070,18 @@ function TaskRow({
 
       <BodyCell className="min-w-[220px] font-semibold">
         <div className="min-w-0">
+          {rowOrderChangeNote ? (
+            <div
+              className={`mb-1 inline-flex max-w-[360px] items-center truncate rounded-full border px-2 py-0.5 text-[11px] font-semibold ${
+                task.itemChange?.requiresAction
+                  ? 'border-amber-200 bg-amber-50 text-amber-800'
+                  : 'border-sky-200 bg-sky-50 text-sky-800'
+              }`}
+              title={rowOrderChangeNote}
+            >
+              {rowOrderChangeNote}
+            </div>
+          ) : null}
           <div className="truncate font-semibold text-primary">
             {`${task.store?.tenantName ?? 'Tenant'} · ${task.store?.name ?? 'Store'} · #${task.posOrderId}`}
           </div>
@@ -1112,6 +1142,11 @@ function BasketRow({
   const activeOrders = row.basket.activeFulfillmentOrders > 0
     ? row.basket.activeFulfillmentOrders
     : orderCount;
+  const changedBasketTasks = row.tasks.filter((task) => Boolean(task.itemChange));
+  const basketRequiresRework = changedBasketTasks.some((task) => task.itemChange?.requiresAction);
+  const basketChangeNote = changedBasketTasks.length > 0
+    ? `${basketRequiresRework ? 'Order changed · Rework required' : 'Order changed · Automatic revision'} (${changedBasketTasks.map((task) => `#${task.posOrderId}`).join(', ')})`
+    : null;
 
   return (
     <tr
@@ -1133,6 +1168,18 @@ function BasketRow({
 
       <BodyCell className="min-w-[220px] font-semibold">
         <div className="min-w-0">
+          {basketChangeNote ? (
+            <div
+              className={`mb-1 inline-flex max-w-[340px] items-center truncate rounded-full border px-2 py-0.5 text-[11px] font-semibold ${
+                basketRequiresRework
+                  ? 'border-amber-200 bg-amber-50 text-amber-800'
+                  : 'border-sky-200 bg-sky-50 text-sky-800'
+              }`}
+              title={basketChangeNote}
+            >
+              {basketChangeNote}
+            </div>
+          ) : null}
           <div className="truncate font-semibold text-primary">{row.basket.barcode}</div>
           <div className="mt-1 truncate text-[12px] text-[#6f8290]">
             {primaryStore?.tenantName ?? 'Tenant'} · {primaryStore?.name ?? 'Store'}

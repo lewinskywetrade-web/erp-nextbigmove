@@ -121,6 +121,8 @@ export interface PosOrderUpsertOptions {
   allowIncompleteOrderHydration?: boolean;
 }
 
+const ACTIVE_PRE_SHIP_WMS_POS_ORDER_STATUSES = [1, 8, 9, 12, 13] as const;
+
 export function shouldTreatNoProductSnapshotAsVoid(
   isNoProductOrder: boolean,
   status: number | null | undefined,
@@ -129,14 +131,14 @@ export function shouldTreatNoProductSnapshotAsVoid(
     return false;
   }
 
-  return status !== 1 && status !== 9 && status !== 12;
+  return !(ACTIVE_PRE_SHIP_WMS_POS_ORDER_STATUSES as readonly number[]).includes(status ?? -1);
 }
 
 export function shouldQueueWmsFulfillmentSync(
   status: number | null | undefined,
   isVoid: boolean,
 ) {
-  return !isVoid && (status === 1 || status === 9 || status === 12);
+  return !isVoid && (ACTIVE_PRE_SHIP_WMS_POS_ORDER_STATUSES as readonly number[]).includes(status ?? -1);
 }
 
 @Injectable()

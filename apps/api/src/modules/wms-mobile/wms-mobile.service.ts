@@ -10501,6 +10501,7 @@ export class WmsMobileService {
     const nextOrderStatus = this.resolveFulfillmentOrderStatus({
       currentStatus: order.status,
       claimedById: order.claimedById,
+      basketId: order.basketId,
       totalQuantity,
       allocatedQuantity,
       pickedQuantity,
@@ -10914,6 +10915,7 @@ export class WmsMobileService {
   private resolveFulfillmentOrderStatus(params: {
     currentStatus: WmsFulfillmentOrderStatus;
     claimedById: string | null;
+    basketId?: string | null;
     totalQuantity: number;
     allocatedQuantity: number;
     pickedQuantity: number;
@@ -10935,16 +10937,27 @@ export class WmsMobileService {
       return WmsFulfillmentOrderStatus.PICKED;
     }
 
+    const isActivelyBeingPicked =
+      (params.currentStatus === WmsFulfillmentOrderStatus.IN_PICKING && Boolean(params.claimedById || params.basketId))
+      || params.currentStatus === WmsFulfillmentOrderStatus.READY_FOR_PACK;
+    if (isActivelyBeingPicked) {
+      if (params.totalQuantity <= 0 || params.hasIssue) {
+        return WmsFulfillmentOrderStatus.IN_PICKING;
+      }
+
+      if (params.pickedQuantity >= params.totalQuantity) {
+        return WmsFulfillmentOrderStatus.READY_FOR_PACK;
+      }
+
+      return WmsFulfillmentOrderStatus.IN_PICKING;
+    }
+
     if (params.totalQuantity <= 0 || params.hasIssue) {
       return WmsFulfillmentOrderStatus.ISSUE;
     }
 
     if (params.pickedQuantity >= params.totalQuantity) {
       return WmsFulfillmentOrderStatus.READY_FOR_PACK;
-    }
-
-    if (params.currentStatus === WmsFulfillmentOrderStatus.IN_PICKING && params.claimedById) {
-      return WmsFulfillmentOrderStatus.IN_PICKING;
     }
 
     if (params.allocatedQuantity >= params.totalQuantity) {
@@ -12183,8 +12196,23 @@ export class WmsMobileService {
 
   private resolveFulfillmentOrderItemChange(order: any) {
     const summary = this.asJsonRecord(order?.changeSummary);
-    if (order?.changeDetectedAt || summary) {
-      const changeState = order.changeState ?? WmsFulfillmentChangeState.NONE;
+    const changeState = order?.changeState ?? WmsFulfillmentChangeState.NONE;
+    const sourceLines = Array.isArray(order?.lines)
+      ? order.lines.filter((line: any) => (
+          Math.max(line.sourceQuantityRequired ?? line.quantityRequired ?? 0, 0) > 0
+        ))
+      : [];
+    const canCompareLiveSnapshot =
+      Boolean(order?.posOrder?.orderSnapshot)
+      && sourceLines.length > 0
+      && sourceLines.every((line: any) => 'lineSnapshot' in line);
+    const hasUnappliedLiveSnapshotDiff = canCompareLiveSnapshot
+      && !this.areDemandSignaturesEqual(
+        this.buildOrderSnapshotDemandSignature(order.posOrder.orderSnapshot),
+        this.buildFulfillmentLineDemandSignature(sourceLines),
+      );
+
+    if ((order?.changeDetectedAt || summary) && !hasUnappliedLiveSnapshotDiff) {
       const completedDetachment = changeState === WmsFulfillmentChangeState.NONE
         && Boolean(this.readString(summary?.detachedAt));
       if (completedDetachment) {
@@ -12231,10 +12259,6 @@ export class WmsMobileService {
     if (!order || !Array.isArray(order.lines) || !order.posOrder?.orderSnapshot) {
       return null;
     }
-
-    const sourceLines = order.lines.filter((line: any) => (
-      Math.max(line.sourceQuantityRequired ?? line.quantityRequired ?? 0, 0) > 0
-    ));
 
     if (sourceLines.length === 0) {
       return null;
