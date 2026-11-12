@@ -638,7 +638,6 @@ export async function syncProfileStockPoolLinksTx(
 }
 
 const STOCK_POOL_NOISE_WORDS = new Set([
-  'oto',
   'upsell',
   'promo',
   'bundle',
@@ -706,7 +705,6 @@ const STOCK_POOL_BRAND_TOKENS = new Set([
 ]);
 
 const STOCK_POOL_TOKEN_SYNONYMS: Record<string, string> = {
-  nmg: 'magnesium',
   nour: 'nourio',
   tonios: 'tonio',
 };

@@ -6378,243 +6378,42 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
       });
 
       const existingPooledProfileCount = profiles.filter((p) => Boolean(p.stockPoolGroupId)).length;
-      let equivalenceRowCount = 0;
-      let storeTransferItemCount = 0;
-      let backfilledPoolGroupCount = 0;
-      let sanitizedUnpooledSingletonCount = 0;
 
-      // 3. Reconcile & sanitize Famco shared stock pools so distinct product families
-      //    (e.g. OTO-NMG / Magnesium vs Nourio) never contaminate a single pool group
-      if (profiles.length > 0) {
-        const [equivalences, transferItems] = await Promise.all([
-          prisma.wmsProductProfileEquivalence.findMany({
-            where: { tenantId: tenant.id },
-            select: {
-              sourceProfileId: true,
-              targetProfileId: true,
-              sourceStoreId: true,
-              sourceVariationId: true,
-              targetStoreId: true,
-              targetVariationId: true,
-            },
-          }),
-          prisma.wmsInventoryStoreTransferItem.findMany({
-            where: {
-              transfer: {
-                tenantId: tenant.id,
-              },
-            },
-            select: {
-              fromProductProfileId: true,
-              toProductProfileId: true,
-              fromStoreId: true,
-              fromVariationId: true,
-              toStoreId: true,
-              toVariationId: true,
-            },
-          }),
-        ]);
-        equivalenceRowCount = equivalences.length;
-        storeTransferItemCount = transferItems.length;
-
-        const parentById = new Map<string, string>();
+      // 3. Unpool ALL Famco product profiles back to their original independent products
+      //    so OTO-NMG, Nourio (NOUR), NMG, and NMG-SU1 never cross-pick or swap into each other.
+      let unpooledProfileCount = 0;
+      if (existingPooledProfileCount > 0) {
+        const unpoolRes = await prisma.wmsProductProfile.updateMany({
+          where: {
+            tenantId: tenant.id,
+            stockPoolGroupId: { not: null },
+          },
+          data: {
+            stockPoolGroupId: null,
+          },
+        });
+        unpooledProfileCount = unpoolRes.count;
         for (const profile of profiles) {
-          parentById.set(profile.id, profile.id);
-        }
-        const findRoot = (id: string): string => {
-          let current = id;
-          while (parentById.has(current) && parentById.get(current) !== current) {
-            current = parentById.get(current)!;
-          }
-          let walk = id;
-          while (parentById.has(walk) && parentById.get(walk) !== current) {
-            const next = parentById.get(walk)!;
-            parentById.set(walk, current);
-            walk = next;
-          }
-          if (!parentById.has(id)) {
-            parentById.set(id, id);
-          }
-          return current;
-        };
-        const unionCompatibleProfiles = (leftId: string | undefined, rightId: string | undefined) => {
-          if (!leftId || !rightId || leftId === rightId) {
-            return;
-          }
-          const leftProfile = profileById.get(leftId);
-          const rightProfile = profileById.get(rightId);
-          if (!leftProfile || !rightProfile) {
-            return;
-          }
-          if (!areSeedProfilesCompatibleForStockPool(toDescriptor(leftProfile), toDescriptor(rightProfile))) {
-            return;
-          }
-          const leftRoot = findRoot(leftId);
-          const rightRoot = findRoot(rightId);
-          if (leftRoot !== rightRoot) {
-            parentById.set(rightRoot, leftRoot);
-          }
-        };
-
-        // Preserve existing group links ONLY between compatible product families
-        const existingGroupMembers = new Map<string, string[]>();
-        for (const profile of profiles) {
-          if (!profile.stockPoolGroupId) continue;
-          const list = existingGroupMembers.get(profile.stockPoolGroupId) ?? [];
-          list.push(profile.id);
-          existingGroupMembers.set(profile.stockPoolGroupId, list);
-        }
-        for (const memberIds of Array.from(existingGroupMembers.values())) {
-          for (let i = 0; i < memberIds.length; i += 1) {
-            for (let j = i + 1; j < memberIds.length; j += 1) {
-              unionCompatibleProfiles(memberIds[i], memberIds[j]);
-            }
-          }
-        }
-
-        for (const eq of equivalences) {
-          const src =
-            profileById.get(eq.sourceProfileId)
-            ?? profileByStoreVariation.get(`${eq.sourceStoreId}::${eq.sourceVariationId}`);
-          const dst =
-            profileById.get(eq.targetProfileId)
-            ?? profileByStoreVariation.get(`${eq.targetStoreId}::${eq.targetVariationId}`);
-          unionCompatibleProfiles(src?.id, dst?.id);
-        }
-
-        for (const item of transferItems) {
-          const src =
-            profileById.get(item.fromProductProfileId)
-            ?? profileByStoreVariation.get(`${item.fromStoreId}::${item.fromVariationId}`);
-          const dst =
-            profileById.get(item.toProductProfileId)
-            ?? profileByStoreVariation.get(`${item.toStoreId}::${item.toVariationId}`);
-          unionCompatibleProfiles(src?.id, dst?.id);
-        }
-
-        const componentsByRoot = new Map<string, string[]>();
-        for (const profileId of Array.from(parentById.keys())) {
-          const root = findRoot(profileId);
-          const list = componentsByRoot.get(root) ?? [];
-          list.push(profileId);
-          componentsByRoot.set(root, list);
-        }
-
-        const sortedComponents = Array.from(componentsByRoot.values()).sort(
-          (a, b) => b.length - a.length,
-        );
-        const claimedGroupIds = new Set<string>();
-
-        for (const memberIds of sortedComponents) {
-          if (memberIds.length < 2) {
-            const soloId = memberIds[0];
-            const soloProfile = soloId ? profileById.get(soloId) : undefined;
-            if (soloProfile && soloProfile.stockPoolGroupId) {
-              await prisma.wmsProductProfile.update({
-                where: { id: soloProfile.id },
-                data: { stockPoolGroupId: null },
-              });
-              soloProfile.stockPoolGroupId = null;
-              sanitizedUnpooledSingletonCount += 1;
-            }
-            continue;
-          }
-
-          const candidateExistingGroupIds = Array.from(
-            new Set(
-              memberIds
-                .map((id) => profileById.get(id)?.stockPoolGroupId)
-                .filter((gid): gid is string => Boolean(gid) && !claimedGroupIds.has(gid!)),
-            ),
-          ).sort();
-
-          const groupId = candidateExistingGroupIds[0] ?? randomUUID();
-          claimedGroupIds.add(groupId);
-
-          const needsGroupUpdate = memberIds.some(
-            (id) => profileById.get(id)?.stockPoolGroupId !== groupId,
-          );
-          if (needsGroupUpdate) {
-            await prisma.wmsProductProfile.updateMany({
-              where: {
-                tenantId: tenant.id,
-                id: { in: memberIds },
-              },
-              data: {
-                stockPoolGroupId: groupId,
-              },
-            });
-            backfilledPoolGroupCount += 1;
-          }
-          for (const memberId of memberIds) {
-            const p = profileById.get(memberId);
-            if (p) {
-              p.stockPoolGroupId = groupId;
-            }
-          }
-        }
-
-        console.log(
-          '[FAMCO_POOL_PROFILES_DIAG]',
-          JSON.stringify(
-            profiles.map((p) => ({
-              id: p.id,
-              variationId: p.variationId,
-              name: p.posProduct.name,
-              customId: p.posProduct.customId,
-              displayId: extractSeedVariationDisplayId(p.posProduct.productSnapshot),
-              familyKey: resolveSeedStockPoolProductFamilyKey(toDescriptor(p)),
-              oldGroupId: oldGroupIdByProfileId.get(p.id) ?? null,
-              newGroupId: p.stockPoolGroupId ?? null,
-            })),
-          ),
-        );
-      }
-
-      // 4. Build active pool index (>= 2 members per group) for live Famco queue & unit healing
-      const rawMembersByGroup = new Map<string, Array<(typeof profiles)[number]>>();
-      for (const profile of profiles) {
-        if (!profile.stockPoolGroupId) {
-          continue;
-        }
-        const list = rawMembersByGroup.get(profile.stockPoolGroupId) ?? [];
-        list.push(profile);
-        rawMembersByGroup.set(profile.stockPoolGroupId, list);
-      }
-
-      const activeMembersByGroup = new Map<string, Array<(typeof profiles)[number]>>();
-      const groupIdByStoreVariation = new Map<string, string>();
-      let pooledProfileCount = 0;
-      for (const [groupId, groupMembers] of Array.from(rawMembersByGroup.entries())) {
-        if (groupMembers.length < 2) {
-          continue;
-        }
-        activeMembersByGroup.set(groupId, groupMembers);
-        pooledProfileCount += groupMembers.length;
-        for (const member of groupMembers) {
-          groupIdByStoreVariation.set(`${member.storeId}::${member.variationId}`, groupId);
+          profile.stockPoolGroupId = null;
         }
       }
 
-      const areStoreVariationsNowPooledOrSame = (
-        leftStoreId: string,
-        leftVariationId: string,
-        rightStoreId: string,
-        rightVariationId: string,
-      ): boolean => {
-        if (leftStoreId === rightStoreId && leftVariationId === rightVariationId) {
-          return true;
-        }
-        const leftGroup = groupIdByStoreVariation.get(`${leftStoreId}::${leftVariationId}`);
-        if (!leftGroup) {
-          return false;
-        }
-        const rightGroup = groupIdByStoreVariation.get(`${rightStoreId}::${rightVariationId}`);
-        return leftGroup === rightGroup;
-      };
+      console.log(
+        '[FAMCO_POOL_PROFILES_DIAG]',
+        JSON.stringify(
+          profiles.map((p) => ({
+            id: p.id,
+            variationId: p.variationId,
+            name: p.posProduct.name,
+            customId: p.posProduct.customId,
+            displayId: extractSeedVariationDisplayId(p.posProduct.productSnapshot),
+            oldGroupId: oldGroupIdByProfileId.get(p.id) ?? null,
+            newGroupId: p.stockPoolGroupId ?? null,
+          })),
+        ),
+      );
 
-      // 4B. Revert any prior automated SHARED_STOCK_POOL_HEAL mutations (once, idempotently)
-      //     and ensure confirmed physical OTO-NMG bottle 0100099047 is mapped to OTO-NMG.
+      // 4A. Revert any prior automated SHARED_STOCK_POOL_HEAL mutations (once, idempotent)
       const [priorHealMovements, priorRevertMovements] = await Promise.all([
         prisma.wmsInventoryMovement.findMany({
           where: {
@@ -6769,7 +6568,120 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
         }
       }
 
-      // Ensure confirmed physical OTO-NMG bottle 0100099047 is mapped to OTO-NMG if still unpacked
+      // 4B. Restore any PUTAWAY bin units in Famco that were cross-picked via SHARED_STOCK_POOL
+      //     and subsequently detached back into a bin without restoring their original product.
+      const putawayUnitsWithPoolHistory = await prisma.wmsInventoryUnit.findMany({
+        where: {
+          tenantId: tenant.id,
+          status: WmsInventoryUnitStatus.PUTAWAY,
+          movements: {
+            some: {
+              referenceType: 'SHARED_STOCK_POOL',
+            },
+          },
+        },
+        select: {
+          id: true,
+          code: true,
+          barcode: true,
+          status: true,
+          warehouseId: true,
+          currentLocationId: true,
+          storeId: true,
+          variationId: true,
+          storeTransferItems: {
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            take: 1,
+            select: {
+              createdAt: true,
+            },
+          },
+          movements: {
+            where: {
+              referenceType: {
+                in: ['SHARED_STOCK_POOL', 'SHARED_STOCK_POOL_PUTAWAY_REVERT'],
+              },
+            },
+            orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+            select: {
+              referenceType: true,
+              notes: true,
+              createdAt: true,
+            },
+          },
+        },
+      });
+
+      for (const pUnit of putawayUnitsWithPoolHistory) {
+        const latestTransferAt = pUnit.storeTransferItems[0]?.createdAt ?? null;
+        const postTransferMovements = pUnit.movements.filter(
+          (m) => !latestTransferAt || m.createdAt > latestTransferAt,
+        );
+        if (postTransferMovements.length === 0) {
+          continue;
+        }
+        const lastMovement = postTransferMovements[postTransferMovements.length - 1]!;
+        if (lastMovement.referenceType === 'SHARED_STOCK_POOL_PUTAWAY_REVERT') {
+          continue;
+        }
+        const firstPoolMovement = postTransferMovements.find(
+          (m) => m.referenceType === 'SHARED_STOCK_POOL',
+        );
+        const match = (firstPoolMovement?.notes ?? '').match(/\(([^)\s]+)\s*->\s*([^\s)]+)/);
+        const origVariationId = match?.[1]?.trim();
+        if (!origVariationId || pUnit.variationId === origVariationId) {
+          continue;
+        }
+        const origProfile =
+          profileByStoreVariation.get(`${pUnit.storeId}::${origVariationId}`)
+          ?? profiles.find((p) => p.variationId === origVariationId);
+        if (!origProfile) {
+          continue;
+        }
+        await prisma.wmsInventoryUnit.update({
+          where: { id: pUnit.id },
+          data: {
+            storeId: origProfile.storeId,
+            posProductId: origProfile.posProductId,
+            productProfileId: origProfile.id,
+            productId: origProfile.productId,
+            variationId: origProfile.variationId,
+            posWarehouseRef:
+              pUnit.storeId === origProfile.storeId
+                ? null
+                : origProfile.posWarehouseRef ?? null,
+          },
+        });
+        await prisma.wmsInventoryMovement.create({
+          data: {
+            tenantId: tenant.id,
+            inventoryUnitId: pUnit.id,
+            warehouseId: pUnit.warehouseId,
+            fromLocationId: pUnit.currentLocationId,
+            toLocationId: pUnit.currentLocationId,
+            fromStatus: pUnit.status,
+            toStatus: pUnit.status,
+            movementType: WmsInventoryMovementType.ADJUSTMENT,
+            referenceType: 'SHARED_STOCK_POOL_PUTAWAY_REVERT',
+            referenceCode: pUnit.barcode,
+            notes: `Restored detached putaway bin unit to original pre-pool variant (${pUnit.variationId} -> ${origProfile.variationId})`,
+            createdAt: now,
+          },
+        });
+        healedUnits.push({
+          barcode: pUnit.barcode,
+          code: pUnit.code,
+          status: pUnit.status,
+          fromVariationId: pUnit.variationId,
+          toVariationId: origProfile.variationId,
+          toProductName: origProfile.posProduct.name,
+          source: 'SHARED_STOCK_POOL_PUTAWAY_REVERT',
+        });
+      }
+
+      // 4C. Surgical fix ONLY for barcode 0100099047 on Order #4307 (BASKET-CAV-01-016)
+      //     Do NOT alter or reassign any other orders or baskets.
+      let fixedUnit0100099047Line = false;
       const otoNmgProfile = profiles.find(
         (p) =>
           (p.posProduct.customId ?? '').trim().toUpperCase() === 'OTO-NMG'
@@ -6796,58 +6708,182 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
           },
         });
 
-        if (unit0100099047 && unit0100099047.variationId !== otoNmgProfile.variationId) {
-          await prisma.wmsInventoryUnit.update({
-            where: { id: unit0100099047.id },
-            data: {
-              storeId: otoNmgProfile.storeId,
-              posProductId: otoNmgProfile.posProductId,
-              productProfileId: otoNmgProfile.id,
-              productId: otoNmgProfile.productId,
-              variationId: otoNmgProfile.variationId,
-              posWarehouseRef:
-                unit0100099047.storeId === otoNmgProfile.storeId
-                  ? null
-                  : otoNmgProfile.posWarehouseRef ?? null,
-            },
-          });
+        if (unit0100099047) {
+          if (unit0100099047.variationId !== otoNmgProfile.variationId) {
+            await prisma.wmsInventoryUnit.update({
+              where: { id: unit0100099047.id },
+              data: {
+                storeId: otoNmgProfile.storeId,
+                posProductId: otoNmgProfile.posProductId,
+                productProfileId: otoNmgProfile.id,
+                productId: otoNmgProfile.productId,
+                variationId: otoNmgProfile.variationId,
+                posWarehouseRef:
+                  unit0100099047.storeId === otoNmgProfile.storeId
+                    ? null
+                    : otoNmgProfile.posWarehouseRef ?? null,
+              },
+            });
+            await prisma.wmsInventoryMovement.create({
+              data: {
+                tenantId: tenant.id,
+                inventoryUnitId: unit0100099047.id,
+                warehouseId: unit0100099047.warehouseId,
+                fromLocationId: unit0100099047.currentLocationId,
+                toLocationId: unit0100099047.currentLocationId,
+                fromStatus: unit0100099047.status,
+                toStatus: unit0100099047.status,
+                movementType: WmsInventoryMovementType.ADJUSTMENT,
+                referenceType: 'PHYSICAL_BARCODE_VERIFY',
+                referenceCode: unit0100099047.barcode,
+                notes: `Aligned physical OTO-NMG bottle 0100099047 (${unit0100099047.variationId} -> ${otoNmgProfile.variationId})`,
+                createdAt: now,
+              },
+            });
+            healedUnits.push({
+              barcode: unit0100099047.barcode,
+              code: unit0100099047.code,
+              status: unit0100099047.status,
+              fromVariationId: unit0100099047.variationId,
+              toVariationId: otoNmgProfile.variationId,
+              toProductName: otoNmgProfile.posProduct.name,
+              source: 'PHYSICAL_BARCODE_VERIFY',
+            });
+          }
+
           if (unit0100099047.status === WmsInventoryUnitStatus.PICKED) {
-            await prisma.wmsBasketUnit.updateMany({
+            const basketUnit0100099047 = await prisma.wmsBasketUnit.findFirst({
               where: {
                 inventoryUnitId: unit0100099047.id,
                 status: WmsBasketUnitStatus.PICKED,
               },
-              data: {
-                storeId: otoNmgProfile.storeId,
-                productId: otoNmgProfile.productId,
-                variationId: otoNmgProfile.variationId,
+              select: {
+                id: true,
+                basketId: true,
+                variationId: true,
+                fulfillmentOrderId: true,
+                fulfillmentLineId: true,
               },
             });
+
+            if (basketUnit0100099047) {
+              const order4307 = await prisma.wmsFulfillmentOrder.findFirst({
+                where: {
+                  tenantId: tenant.id,
+                  basketId: basketUnit0100099047.basketId,
+                  posOrderId: '4307',
+                },
+                select: {
+                  id: true,
+                  lines: {
+                    where: {
+                      status: { not: WmsFulfillmentLineStatus.CANCELED },
+                      quantityRequired: { gt: 0 },
+                    },
+                    select: {
+                      id: true,
+                      variationId: true,
+                    },
+                  },
+                },
+              });
+
+              const otoLineOn4307 = order4307?.lines.find(
+                (l) => l.variationId === otoNmgProfile.variationId,
+              );
+
+              if (
+                order4307
+                && otoLineOn4307
+                && (
+                  basketUnit0100099047.variationId !== otoNmgProfile.variationId
+                  || basketUnit0100099047.fulfillmentOrderId !== order4307.id
+                  || basketUnit0100099047.fulfillmentLineId !== otoLineOn4307.id
+                )
+              ) {
+                await prisma.wmsBasketUnit.updateMany({
+                  where: {
+                    id: basketUnit0100099047.id,
+                    status: WmsBasketUnitStatus.PICKED,
+                  },
+                  data: {
+                    storeId: otoNmgProfile.storeId,
+                    productId: otoNmgProfile.productId,
+                    variationId: otoNmgProfile.variationId,
+                    fulfillmentOrderId: order4307.id,
+                    fulfillmentLineId: otoLineOn4307.id,
+                  },
+                });
+
+                const order4307Units = await prisma.wmsBasketUnit.findMany({
+                  where: {
+                    basketId: basketUnit0100099047.basketId,
+                    fulfillmentOrderId: order4307.id,
+                    status: { in: [WmsBasketUnitStatus.PICKED, WmsBasketUnitStatus.PACKED] },
+                  },
+                  select: {
+                    status: true,
+                    fulfillmentLineId: true,
+                  },
+                });
+                for (const line of order4307.lines) {
+                  const pickedCount = order4307Units.filter((u) => u.fulfillmentLineId === line.id).length;
+                  const packedCount = order4307Units.filter(
+                    (u) => u.fulfillmentLineId === line.id && u.status === WmsBasketUnitStatus.PACKED,
+                  ).length;
+                  await prisma.wmsBasketPickDemand.updateMany({
+                    where: {
+                      basketId: basketUnit0100099047.basketId,
+                      fulfillmentLineId: line.id,
+                    },
+                    data: {
+                      quantityPicked: pickedCount,
+                      quantityPacked: packedCount,
+                    },
+                  });
+                }
+                fixedUnit0100099047Line = true;
+              }
+            }
           }
-          await prisma.wmsInventoryMovement.create({
-            data: {
-              tenantId: tenant.id,
-              inventoryUnitId: unit0100099047.id,
-              warehouseId: unit0100099047.warehouseId,
-              fromLocationId: unit0100099047.currentLocationId,
-              toLocationId: unit0100099047.currentLocationId,
-              fromStatus: unit0100099047.status,
-              toStatus: unit0100099047.status,
-              movementType: WmsInventoryMovementType.ADJUSTMENT,
-              referenceType: 'PHYSICAL_BARCODE_VERIFY',
-              referenceCode: unit0100099047.barcode,
-              notes: `Aligned physical OTO-NMG bottle 0100099047 (${unit0100099047.variationId} -> ${otoNmgProfile.variationId})`,
-              createdAt: now,
+        }
+      }
+
+      // 4D. Strip any cross-product " · Bin: ..." suffix from active Famco pick demands so STOX
+      //     always displays each order's true original product name.
+      const pooledLabelDemands = await prisma.wmsBasketPickDemand.findMany({
+        where: {
+          tenantId: tenant.id,
+          productName: { contains: ' · Bin: ' },
+          basket: {
+            status: {
+              in: [
+                WmsBasketStatus.ASSIGNED,
+                WmsBasketStatus.IN_PICKING,
+                WmsBasketStatus.FULL_HELD,
+                WmsBasketStatus.PACKING,
+              ],
             },
-          });
-          healedUnits.push({
-            barcode: unit0100099047.barcode,
-            code: unit0100099047.code,
-            status: unit0100099047.status,
-            fromVariationId: unit0100099047.variationId,
-            toVariationId: otoNmgProfile.variationId,
-            toProductName: otoNmgProfile.posProduct.name,
-            source: 'PHYSICAL_BARCODE_VERIFY',
+          },
+        },
+        select: {
+          id: true,
+          productName: true,
+          fulfillmentLine: {
+            select: {
+              productName: true,
+            },
+          },
+        },
+      });
+      for (const demand of pooledLabelDemands) {
+        const cleanName =
+          demand.fulfillmentLine?.productName
+          || demand.productName.split(' · Bin: ')[0]!.trim();
+        if (cleanName && cleanName !== demand.productName) {
+          await prisma.wmsBasketPickDemand.update({
+            where: { id: demand.id },
+            data: { productName: cleanName },
           });
         }
       }
@@ -6856,323 +6892,11 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
         console.log('[FAMCO_UNIT_HEAL]', JSON.stringify({ count: healedUnits.length, units: healedUnits }));
       }
 
-      // 4C. Realign active demand baskets in Famco (e.g. BASKET-CAV-01-016) so unpacked PICKED
-      //     basket units point to compatible unfilled order lines after pool separation
-      const activeDemandBaskets = await prisma.wmsBasket.findMany({
-        where: {
-          tenantId: tenant.id,
-          status: {
-            in: [
-              WmsBasketStatus.IN_PICKING,
-              WmsBasketStatus.FULL_HELD,
-              WmsBasketStatus.PACKING,
-            ],
-          },
-        },
-        select: {
-          id: true,
-          barcode: true,
-          status: true,
-          fulfillmentOrders: {
-            where: {
-              assignmentMode: WmsFulfillmentAssignmentMode.BASKET_DEMAND,
-              status: {
-                in: [
-                  WmsFulfillmentOrderStatus.IN_PICKING,
-                  WmsFulfillmentOrderStatus.READY_FOR_PACK,
-                  WmsFulfillmentOrderStatus.PICKED,
-                  WmsFulfillmentOrderStatus.PACKING,
-                ],
-              },
-            },
-            select: {
-              id: true,
-              posOrderId: true,
-              storeId: true,
-              status: true,
-              lines: {
-                where: {
-                  status: { not: WmsFulfillmentLineStatus.CANCELED },
-                  quantityRequired: { gt: 0 },
-                },
-                select: {
-                  id: true,
-                  variationId: true,
-                  productName: true,
-                  quantityRequired: true,
-                },
-              },
-            },
-          },
-          basketUnits: {
-            where: {
-              status: {
-                in: [WmsBasketUnitStatus.PICKED, WmsBasketUnitStatus.PACKED],
-              },
-            },
-            orderBy: [{ pickedAt: 'asc' }, { createdAt: 'asc' }],
-            select: {
-              id: true,
-              status: true,
-              storeId: true,
-              productId: true,
-              variationId: true,
-              fulfillmentOrderId: true,
-              fulfillmentLineId: true,
-              inventoryUnit: {
-                select: {
-                  barcode: true,
-                  code: true,
-                },
-              },
-            },
-          },
-        },
-      });
-
-      const realignedBasketSummaries: Array<Record<string, unknown>> = [];
-
-      for (const basket of activeDemandBaskets) {
-        const packedCountByLineId = new Map<string, number>();
-        for (const bu of basket.basketUnits) {
-          if (bu.status === WmsBasketUnitStatus.PACKED && bu.fulfillmentLineId) {
-            packedCountByLineId.set(
-              bu.fulfillmentLineId,
-              (packedCountByLineId.get(bu.fulfillmentLineId) ?? 0) + 1,
-            );
-          }
-        }
-
-        type OpenLineSlot = {
-          orderId: string;
-          posOrderId: string;
-          orderStoreId: string;
-          lineId: string;
-          variationId: string;
-          productName: string;
-          quantityRequired: number;
-          packedCount: number;
-          remainingOpen: number;
-        };
-
-        const openLines: OpenLineSlot[] = [];
-        const openLineById = new Map<string, OpenLineSlot>();
-        for (const order of basket.fulfillmentOrders) {
-          for (const line of order.lines) {
-            const packedCount = packedCountByLineId.get(line.id) ?? 0;
-            const remainingOpen = Math.max(line.quantityRequired - packedCount, 0);
-            const slot: OpenLineSlot = {
-              orderId: order.id,
-              posOrderId: order.posOrderId,
-              orderStoreId: order.storeId,
-              lineId: line.id,
-              variationId: line.variationId,
-              productName: line.productName,
-              quantityRequired: line.quantityRequired,
-              packedCount,
-              remainingOpen,
-            };
-            openLines.push(slot);
-            openLineById.set(line.id, slot);
-          }
-        }
-
-        const pickedUnits = basket.basketUnits.filter(
-          (bu) => bu.status === WmsBasketUnitStatus.PICKED,
-        );
-        if (pickedUnits.length === 0 || openLines.length === 0) {
-          continue;
-        }
-
-        const assignedPickedCountByLineId = new Map<string, number>();
-        let basketHasInvalidPickedAssignment = false;
-        for (const bu of pickedUnits) {
-          const currentLine = bu.fulfillmentLineId ? openLineById.get(bu.fulfillmentLineId) : undefined;
-          if (
-            !currentLine
-            || currentLine.orderId !== bu.fulfillmentOrderId
-            || !areStoreVariationsNowPooledOrSame(
-              currentLine.orderStoreId,
-              currentLine.variationId,
-              bu.storeId,
-              bu.variationId,
-            )
-          ) {
-            basketHasInvalidPickedAssignment = true;
-            break;
-          }
-          const nextCount = (assignedPickedCountByLineId.get(currentLine.lineId) ?? 0) + 1;
-          assignedPickedCountByLineId.set(currentLine.lineId, nextCount);
-          if (nextCount > currentLine.remainingOpen) {
-            basketHasInvalidPickedAssignment = true;
-            break;
-          }
-        }
-
-        if (!basketHasInvalidPickedAssignment) {
-          continue;
-        }
-
-        const slotsLeftByLineId = new Map<string, number>();
-        for (const slot of openLines) {
-          slotsLeftByLineId.set(slot.lineId, slot.remainingOpen);
-        }
-        const targetByBasketUnitId = new Map<string, OpenLineSlot>();
-
-        // Pass 1: Keep already-assigned exact matches within remainingOpen
-        for (const bu of pickedUnits) {
-          const slot = bu.fulfillmentLineId ? openLineById.get(bu.fulfillmentLineId) : undefined;
-          if (!slot || slot.orderId !== bu.fulfillmentOrderId) continue;
-          const left = slotsLeftByLineId.get(slot.lineId) ?? 0;
-          if (left > 0 && slot.orderStoreId === bu.storeId && slot.variationId === bu.variationId) {
-            targetByBasketUnitId.set(bu.id, slot);
-            slotsLeftByLineId.set(slot.lineId, left - 1);
-          }
-        }
-
-        // Pass 2: Keep already-assigned post-split pooled matches within remainingOpen
-        for (const bu of pickedUnits) {
-          if (targetByBasketUnitId.has(bu.id)) continue;
-          const slot = bu.fulfillmentLineId ? openLineById.get(bu.fulfillmentLineId) : undefined;
-          if (!slot || slot.orderId !== bu.fulfillmentOrderId) continue;
-          const left = slotsLeftByLineId.get(slot.lineId) ?? 0;
-          if (
-            left > 0
-            && areStoreVariationsNowPooledOrSame(
-              slot.orderStoreId,
-              slot.variationId,
-              bu.storeId,
-              bu.variationId,
-            )
-          ) {
-            targetByBasketUnitId.set(bu.id, slot);
-            slotsLeftByLineId.set(slot.lineId, left - 1);
-          }
-        }
-
-        // Pass 3: Reassign unmatched units by exact (storeId, variationId) match
-        for (const bu of pickedUnits) {
-          if (targetByBasketUnitId.has(bu.id)) continue;
-          const exactCandidates = openLines.filter(
-            (slot) =>
-              (slotsLeftByLineId.get(slot.lineId) ?? 0) > 0
-              && slot.orderStoreId === bu.storeId
-              && slot.variationId === bu.variationId,
-          );
-          const chosen =
-            exactCandidates.find((slot) => slot.orderId === bu.fulfillmentOrderId)
-            ?? exactCandidates[0];
-          if (chosen) {
-            targetByBasketUnitId.set(bu.id, chosen);
-            slotsLeftByLineId.set(chosen.lineId, (slotsLeftByLineId.get(chosen.lineId) ?? 1) - 1);
-          }
-        }
-
-        // Pass 4: Reassign any remaining unmatched units by post-split shared stock pool
-        for (const bu of pickedUnits) {
-          if (targetByBasketUnitId.has(bu.id)) continue;
-          const pooledCandidates = openLines.filter(
-            (slot) =>
-              (slotsLeftByLineId.get(slot.lineId) ?? 0) > 0
-              && areStoreVariationsNowPooledOrSame(
-                slot.orderStoreId,
-                slot.variationId,
-                bu.storeId,
-                bu.variationId,
-              ),
-          );
-          const chosen =
-            pooledCandidates.find((slot) => slot.orderId === bu.fulfillmentOrderId)
-            ?? pooledCandidates[0];
-          if (chosen) {
-            targetByBasketUnitId.set(bu.id, chosen);
-            slotsLeftByLineId.set(chosen.lineId, (slotsLeftByLineId.get(chosen.lineId) ?? 1) - 1);
-          }
-        }
-
-        const changes: Array<Record<string, unknown>> = [];
-        for (const bu of pickedUnits) {
-          const target = targetByBasketUnitId.get(bu.id);
-          if (!target) continue;
-          if (bu.fulfillmentOrderId !== target.orderId || bu.fulfillmentLineId !== target.lineId) {
-            await prisma.wmsBasketUnit.updateMany({
-              where: {
-                id: bu.id,
-                status: WmsBasketUnitStatus.PICKED,
-              },
-              data: {
-                fulfillmentOrderId: target.orderId,
-                fulfillmentLineId: target.lineId,
-              },
-            });
-            changes.push({
-              basketUnitId: bu.id,
-              barcode: bu.inventoryUnit.barcode,
-              variationId: bu.variationId,
-              fromOrderId: bu.fulfillmentOrderId,
-              fromLineId: bu.fulfillmentLineId,
-              toOrderId: target.orderId,
-              toPosOrderId: target.posOrderId,
-              toLineId: target.lineId,
-              toProductName: target.productName,
-            });
-          }
-        }
-
-        if (changes.length > 0) {
-          // Sync WmsBasketPickDemand counts per line so basket summary stays consistent
-          const postRealignUnits = await prisma.wmsBasketUnit.findMany({
-            where: {
-              basketId: basket.id,
-              status: { in: [WmsBasketUnitStatus.PICKED, WmsBasketUnitStatus.PACKED] },
-            },
-            select: {
-              status: true,
-              fulfillmentLineId: true,
-            },
-          });
-          const pickedPlusPackedByLine = new Map<string, number>();
-          const packedOnlyByLine = new Map<string, number>();
-          for (const u of postRealignUnits) {
-            if (!u.fulfillmentLineId) continue;
-            pickedPlusPackedByLine.set(
-              u.fulfillmentLineId,
-              (pickedPlusPackedByLine.get(u.fulfillmentLineId) ?? 0) + 1,
-            );
-            if (u.status === WmsBasketUnitStatus.PACKED) {
-              packedOnlyByLine.set(
-                u.fulfillmentLineId,
-                (packedOnlyByLine.get(u.fulfillmentLineId) ?? 0) + 1,
-              );
-            }
-          }
-          for (const slot of openLines) {
-            await prisma.wmsBasketPickDemand.updateMany({
-              where: {
-                basketId: basket.id,
-                fulfillmentLineId: slot.lineId,
-              },
-              data: {
-                quantityPicked: pickedPlusPackedByLine.get(slot.lineId) ?? 0,
-                quantityPacked: packedOnlyByLine.get(slot.lineId) ?? 0,
-              },
-            });
-          }
-
-          realignedBasketSummaries.push({
-            basketBarcode: basket.barcode,
-            basketStatus: basket.status,
-            realignedCount: changes.length,
-            changes,
-          });
-        }
-      }
-
-      if (realignedBasketSummaries.length > 0) {
-        console.log('[FAMCO_BASKET_HEAL]', JSON.stringify(realignedBasketSummaries));
-      }
-
       await logFamcoTargetUnitAndBasketDiag('[FAMCO_TARGET_DIAG_AFTER]');
+
+      const activeMembersByGroup = new Map<string, Array<(typeof profiles)[number]>>();
+      const groupIdByStoreVariation = new Map<string, string>();
+      const pooledProfileCount = 0;
 
       const queueStatsBefore = await prisma.wmsFulfillmentOrder.groupBy({
         by: ['status'],
@@ -7572,12 +7296,9 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
           tenantName: tenant.name,
           storeCount: tenant.posStores.length,
           existingPooledProfileCount,
-          equivalenceRowCount,
-          storeTransferItemCount,
-          backfilledPoolGroupCount,
-          sanitizedUnpooledSingletonCount,
+          unpooledProfileCount,
           healedUnitCount: healedUnits.length,
-          realignedBasketCount: realignedBasketSummaries.length,
+          fixedUnit0100099047Line,
           activePoolGroupCount: activeMembersByGroup.size,
           pooledProfileCount,
           putawayBinUnitCount: putawayBinUnits.length,
@@ -8440,6 +8161,7 @@ async function reconcileAllWmsIssueOrdersOnStartup() {
 
 async function main() {
   console.log('Starting database seed...');
+  await reconcileFamcoSharedStockPoolsAndQueue();
   await ensureSuperAdmin();
   await normalizeUserEmails();
   await promoteDesignatedSuperAdmins();
@@ -8455,7 +8177,6 @@ async function main() {
   await logOpenWmsIssueOrdersDiagnostic('[WMS_ISSUE_DIAG_BEFORE]');
   await reconcileToniosSharedStockPoolsAndQueue();
   await reconcileToniosWmsFulfillmentQueue();
-  await reconcileFamcoSharedStockPoolsAndQueue();
   await reconcileAllWmsIssueOrdersOnStartup();
   await logOpenWmsIssueOrdersDiagnostic('[WMS_ISSUE_DIAG_AFTER]');
   await diagnoseErpFreshness();

@@ -255,42 +255,29 @@ describe('wms-stock-pool.util', () => {
   });
 
   describe('resolveStockPoolProductFamilyKey & areProfilesCompatibleForStockPool', () => {
-    it('keeps OTO-NMG / Magnesium strictly separate from Nourio while allowing same-product OTO variants to pool', () => {
+    it('keeps OTO-NMG, Nourio, and Multivitamins Gummies strictly separate as distinct products', () => {
       const nourioBase = {
         name: 'Nourio - 1 bottle 1490',
         customId: 'NOUR',
         variationDisplayId: 'NOUR',
         storeName: 'Nourio',
       };
-      const nourioOto = {
-        name: 'OTO - Nourio 1 bottle',
-        customId: 'OTO-NOUR',
-        variationDisplayId: 'OTO-NOUR',
-        storeName: 'Nourio',
-      };
       const otoNmg = {
-        name: 'OTO-NMG',
+        name: 'OTO Nourio - 1 bottle 899',
         customId: 'OTO-NMG',
         variationDisplayId: 'OTO-NMG',
         storeName: 'Nourio',
       };
       const regularNmg = {
-        name: 'Nourio Magnesium - 1 bottle',
+        name: 'Nourio Multivitamins Gummies',
         customId: 'NMG',
         variationDisplayId: 'NMG',
         storeName: 'Nourio',
       };
 
-      expect(resolveStockPoolProductFamilyKey(nourioBase)).toBe('brand:nourio');
-      expect(resolveStockPoolProductFamilyKey(nourioOto)).toBe('brand:nourio');
-      expect(resolveStockPoolProductFamilyKey(otoNmg)).toBe('product:magnesium');
-      expect(resolveStockPoolProductFamilyKey(regularNmg)).toBe('product:magnesium');
-
-      expect(areProfilesCompatibleForStockPool(nourioBase, nourioOto)).toBe(true);
-      expect(areProfilesCompatibleForStockPool(otoNmg, regularNmg)).toBe(true);
       expect(areProfilesCompatibleForStockPool(nourioBase, otoNmg)).toBe(false);
       expect(areProfilesCompatibleForStockPool(nourioBase, regularNmg)).toBe(false);
-      expect(areProfilesCompatibleForStockPool(nourioOto, otoNmg)).toBe(false);
+      expect(areProfilesCompatibleForStockPool(otoNmg, regularNmg)).toBe(false);
     });
 
     it('matches Tonios same-product Body Wash variants while rejecting unrelated products', () => {
