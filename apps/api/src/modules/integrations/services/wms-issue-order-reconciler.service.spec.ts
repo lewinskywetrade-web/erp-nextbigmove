@@ -373,4 +373,111 @@ describe('WmsIssueOrderReconcilerService & IntegrationService ISSUE hydration', 
     await reconciler.reconcileDueIssueOrders('cron');
     expect(syncPancakeOrdersByStoreId).toHaveBeenCalledTimes(1);
   });
+
+  it('isolates per-store live fetch errors and recovers unbasketed ISSUE orders with pickable lines even when store.enabled is false', async () => {
+    const syncConfirmedPickingOrders = jest
+      .fn<(...args: any[]) => Promise<any>>()
+      .mockResolvedValue({ syncedOrders: 1 });
+    const refreshDemandQueueForScope = jest
+      .fn<(...args: any[]) => Promise<void>>()
+      .mockResolvedValue(undefined);
+
+    let findManyCall = 0;
+    const prisma = {
+      wmsFulfillmentOrder: {
+        findMany: jest.fn<() => Promise<any[]>>().mockImplementation(async () => {
+          findManyCall += 1;
+          if (findManyCall === 1) {
+            return [
+              {
+                id: 'fo-store-broken',
+                tenantId: 'tenant-a',
+                storeId: 'store-broken',
+                shopId: 'shop-broken',
+                posOrderId: '9001',
+                posOrderDbId: 'pos-db-9001',
+                totalQuantity: 0,
+                issueReason: null,
+                store: {
+                  id: 'store-broken',
+                  tenantId: 'tenant-a',
+                  teamId: null,
+                  shopId: 'shop-broken',
+                  integrationId: 'int-a',
+                  apiKey: 'enc-a',
+                  status: 'ACTIVE',
+                  enabled: true,
+                },
+                tenant: { id: 'tenant-a', wmsFulfillmentGoLiveAt: null },
+                posOrder: {
+                  id: 'pos-db-9001',
+                  status: 1,
+                  isVoid: false,
+                  insertedAt: new Date('2026-11-11T05:00:00.000Z'),
+                },
+              },
+              {
+                id: 'fo-4292',
+                tenantId: 'tenant-famco',
+                storeId: 'store-nourio',
+                shopId: 'shop-nourio',
+                posOrderId: '4292',
+                posOrderDbId: 'pos-db-4292',
+                totalQuantity: 5,
+                issueReason: null,
+                store: {
+                  id: 'store-nourio',
+                  tenantId: 'tenant-famco',
+                  teamId: null,
+                  shopId: 'shop-nourio',
+                  integrationId: 'int-famco',
+                  apiKey: null,
+                  status: 'ACTIVE',
+                  enabled: false,
+                },
+                tenant: { id: 'tenant-famco', wmsFulfillmentGoLiveAt: null },
+                posOrder: {
+                  id: 'pos-db-4292',
+                  status: 1,
+                  isVoid: false,
+                  insertedAt: new Date('2026-11-11T06:00:00.000Z'),
+                },
+              },
+            ];
+          }
+          return [
+            { id: 'fo-store-broken', status: WmsFulfillmentOrderStatus.ISSUE },
+            { id: 'fo-4292', status: WmsFulfillmentOrderStatus.READY },
+          ];
+        }),
+      },
+      posShopOwnership: {
+        findUnique: jest.fn<() => Promise<any>>().mockRejectedValue(new Error('DB transient error')),
+      },
+    };
+
+    const service = Object.create(IntegrationService.prototype) as any;
+    service.prisma = prisma;
+    service.logger = { warn: jest.fn(), log: jest.fn() };
+    service.resolveStoreApiKeyForWebhook = jest
+      .fn<() => Promise<string>>()
+      .mockResolvedValue('pos-api-key');
+    service.wmsFulfillmentSyncService = {
+      syncConfirmedPickingOrders,
+      refreshDemandQueueForScope,
+    };
+
+    const summary = await service.reconcileOpenWmsIssueOrders();
+    expect(summary).toEqual({
+      evaluatedCount: 2,
+      recoveredCount: 1,
+      canceledCount: 0,
+      remainingIssueCount: 1,
+    });
+    expect(syncConfirmedPickingOrders).toHaveBeenCalledTimes(2);
+    expect(refreshDemandQueueForScope).toHaveBeenCalledWith({
+      tenantId: 'tenant-famco',
+      storeId: 'store-nourio',
+    });
+  });
 });

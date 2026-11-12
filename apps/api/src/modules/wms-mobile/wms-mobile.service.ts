@@ -10461,7 +10461,26 @@ export class WmsMobileService {
             required,
           )
         : line.reservations.filter((reservation) => reservation.status === WmsPickReservationStatus.PICKED).length;
+      if (required <= 0 && allocated === 0 && picked === 0) {
+        await tx.wmsFulfillmentLine.update({
+          where: { id: line.id },
+          data: {
+            quantityAllocated: 0,
+            quantityPicked: 0,
+            status: WmsFulfillmentLineStatus.CANCELED,
+            issueReason: null,
+          },
+        });
+        continue;
+      }
+
       const nextLineStatus = this.resolveFulfillmentLineStatus(required, allocated, picked, line.status);
+      const nextLineIssueReason = nextLineStatus === WmsFulfillmentLineStatus.READY
+        || nextLineStatus === WmsFulfillmentLineStatus.PICKED
+        ? null
+        : required <= 0
+          ? 'Picked units remain on a removed order item — return units to bin to continue.'
+          : line.issueReason;
 
       totalQuantity += required;
       allocatedQuantity += Math.min(allocated, required);
@@ -10474,10 +10493,7 @@ export class WmsMobileService {
           quantityAllocated: Math.min(allocated, required),
           quantityPicked: Math.min(picked, required),
           status: nextLineStatus,
-          issueReason: nextLineStatus === WmsFulfillmentLineStatus.READY
-            || nextLineStatus === WmsFulfillmentLineStatus.PICKED
-            ? null
-            : line.issueReason,
+          issueReason: nextLineIssueReason,
         },
       });
     }
@@ -10490,6 +10506,9 @@ export class WmsMobileService {
       pickedQuantity,
       hasIssue,
     });
+    const mobileIssueLine = order.lines.find(
+      (line) => line.status !== WmsFulfillmentLineStatus.CANCELED && Boolean(line.issueReason?.trim()),
+    );
 
     await tx.wmsFulfillmentOrder.update({
       where: { id: order.id },
@@ -10501,7 +10520,13 @@ export class WmsMobileService {
         completedAt: nextOrderStatus === WmsFulfillmentOrderStatus.READY_FOR_PACK
           ? order.completedAt ?? now
           : null,
-        issueReason: totalQuantity === 0 ? order.issueReason ?? 'Order has no pickable variation items' : null,
+        issueReason: nextOrderStatus !== WmsFulfillmentOrderStatus.ISSUE
+          ? null
+          : totalQuantity === 0
+            ? order.issueReason ?? 'Order has no pickable variation items'
+            : mobileIssueLine?.issueReason
+              ? `${mobileIssueLine.productName}: ${mobileIssueLine.issueReason}`
+              : order.issueReason ?? 'Order has a fulfillment issue — review order line items or resync the pick queue.',
       },
     });
   }
@@ -13614,11 +13639,74 @@ export class WmsMobileService {
     } satisfies Prisma.WmsBasketInclude;
   }
 
+  private resolveTaskIssueReason(task: any): string | null {
+    const explicitReason = typeof task?.issueReason === 'string' ? task.issueReason.trim() : '';
+    if (explicitReason) {
+      return explicitReason;
+    }
+
+    if (task?.status !== WmsFulfillmentOrderStatus.ISSUE) {
+      return null;
+    }
+
+    const rawLines = Array.isArray(task?.lines) ? task.lines : [];
+    const activeLines = rawLines.filter(
+      (line: any) => line?.status !== WmsFulfillmentLineStatus.CANCELED,
+    );
+    const issueLine = activeLines.find(
+      (line: any) => (
+        line?.status === WmsFulfillmentLineStatus.ISSUE
+        || (typeof line?.issueReason === 'string' && line.issueReason.trim().length > 0)
+      ),
+    );
+    if (issueLine) {
+      const lineReason = typeof issueLine.issueReason === 'string' ? issueLine.issueReason.trim() : '';
+      const productName = typeof issueLine.productName === 'string' ? issueLine.productName.trim() : '';
+      if (lineReason) {
+        return productName ? `${productName}: ${lineReason}` : lineReason;
+      }
+      return productName
+        ? `${productName}: Order item has a fulfillment issue — review line item.`
+        : 'Order item has a fulfillment issue — review order line items.';
+    }
+
+    const totalRequired = Math.max(Number(task?.totalQuantity ?? 0), 0);
+    if (totalRequired <= 0) {
+      if (Array.isArray(task?.fulfillmentAdjustments) && task.fulfillmentAdjustments.length > 0) {
+        return 'All pickable items on this order were bypassed to zero quantity — no units remain to pick.';
+      }
+      if (
+        task?.posOrder
+        && typeof (this.wmsFulfillmentSyncService as any)?.resolveEmptyFulfillmentIssueReason === 'function'
+      ) {
+        return this.wmsFulfillmentSyncService.resolveEmptyFulfillmentIssueReason(
+          task.posOrder.orderSnapshot ?? null,
+          task.posOrder.itemData ?? null,
+        );
+      }
+      return 'Order has no pickable variation items — verify product variation links in Pancake POS or resync queue.';
+    }
+
+    if (task?.posOrder?.isVoid) {
+      return 'Order was voided or deleted in Pancake POS — click Resync queue to cancel it in WMS.';
+    }
+
+    if (typeof task?.posOrder?.status === 'number' && task.posOrder.status !== 1) {
+      const statusLabel = task.posOrder.statusName || String(task.posOrder.status);
+      return `Order is in Pancake POS status "${statusLabel}" (not Confirmed) — click Resync queue to update WMS status.`;
+    }
+
+    return `Order remained in Issue status after a POS item revision (${totalRequired} required unit${totalRequired === 1 ? '' : 's'}) — click Resync queue or Reallocate waiting to refresh pick readiness.`;
+  }
+
   private mapMobilePickingTask(task: any) {
     const lines = Array.isArray(task.lines)
       ? task.lines.filter((line: any) => (
           line.status !== WmsFulfillmentLineStatus.CANCELED
-          && Math.max(line.quantityRequired ?? 0, 0) > 0
+          && (
+            Math.max(line.quantityRequired ?? 0, 0) > 0
+            || line.status === WmsFulfillmentLineStatus.ISSUE
+          )
         ))
       : [];
     const reservations = this.getAllPickReservations({ lines });
@@ -13641,7 +13729,7 @@ export class WmsMobileService {
       assignmentMode: task.assignmentMode ?? WmsFulfillmentAssignmentMode.SERIAL_RESERVED,
       sourceRevision: task.sourceRevision ?? 0,
       statusLabel: this.formatEnumLabel(task.status),
-      issueReason: task.issueReason,
+      issueReason: this.resolveTaskIssueReason(task),
       customer: {
         name: task.customerName,
         phone: task.customerPhone,
@@ -13710,7 +13798,10 @@ export class WmsMobileService {
     const lines = Array.isArray(task.lines)
       ? task.lines.filter((line: any) => (
           line.status !== WmsFulfillmentLineStatus.CANCELED
-          && Math.max(line.quantityRequired ?? 0, 0) > 0
+          && (
+            Math.max(line.quantityRequired ?? 0, 0) > 0
+            || line.status === WmsFulfillmentLineStatus.ISSUE
+          )
         ))
       : [];
     const isDemandOrder = this.isDemandPickingOrder(task);
@@ -13732,7 +13823,7 @@ export class WmsMobileService {
       assignmentMode: task.assignmentMode ?? WmsFulfillmentAssignmentMode.SERIAL_RESERVED,
       sourceRevision: task.sourceRevision ?? 0,
       statusLabel: this.formatEnumLabel(task.status),
-      issueReason: task.issueReason,
+      issueReason: this.resolveTaskIssueReason(task),
       customer: {
         name: task.customerName,
         phone: task.customerPhone,

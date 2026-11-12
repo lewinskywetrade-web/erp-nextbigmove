@@ -6115,6 +6115,7 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
               WmsFulfillmentOrderStatus.READY,
               WmsFulfillmentOrderStatus.RESTOCKING,
               WmsFulfillmentOrderStatus.PARTIAL,
+              WmsFulfillmentOrderStatus.ISSUE,
             ],
           },
           posOrder: {
@@ -6186,13 +6187,26 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
             tenantId: tenant.id,
             assignmentMode: WmsFulfillmentAssignmentMode.BASKET_DEMAND,
             basketId: null,
-            status: {
-              in: [
-                WmsFulfillmentOrderStatus.READY,
-                WmsFulfillmentOrderStatus.RESTOCKING,
-                WmsFulfillmentOrderStatus.PARTIAL,
-              ],
-            },
+            OR: [
+              {
+                status: {
+                  in: [
+                    WmsFulfillmentOrderStatus.READY,
+                    WmsFulfillmentOrderStatus.RESTOCKING,
+                    WmsFulfillmentOrderStatus.PARTIAL,
+                  ],
+                },
+              },
+              {
+                status: WmsFulfillmentOrderStatus.ISSUE,
+                lines: {
+                  some: {
+                    quantityRequired: { gt: 0 },
+                    status: { not: WmsFulfillmentLineStatus.CANCELED },
+                  },
+                },
+              },
+            ],
             posOrder: {
               is: {
                 status: 1,
@@ -6294,6 +6308,28 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
 
       const warehouseIds = Array.from(new Set(putawayBinUnits.map((u) => u.warehouseId)));
       const incompleteOrders: typeof candidateQueueOrders = [];
+
+      // Auto-cancel any orphan zero-required lines on candidate queue orders
+      for (const order of candidateQueueOrders) {
+        for (const line of order.lines) {
+          if (
+            line.status !== WmsFulfillmentLineStatus.CANCELED
+            && line.quantityRequired <= 0
+            && (line.quantityPicked ?? 0) <= 0
+          ) {
+            await prisma.wmsFulfillmentLine.update({
+              where: { id: line.id },
+              data: {
+                quantityAllocated: 0,
+                quantityPicked: 0,
+                status: WmsFulfillmentLineStatus.CANCELED,
+                issueReason: null,
+              },
+            });
+            line.status = WmsFulfillmentLineStatus.CANCELED;
+          }
+        }
+      }
 
       // Pass 1: Complete orders first across all Famco stores
       for (const order of candidateQueueOrders) {
@@ -6446,6 +6482,7 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
               WmsFulfillmentOrderStatus.READY,
               WmsFulfillmentOrderStatus.RESTOCKING,
               WmsFulfillmentOrderStatus.PARTIAL,
+              WmsFulfillmentOrderStatus.ISSUE,
             ],
           },
           posOrder: {
@@ -6485,6 +6522,496 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
   }
 }
 
+async function logOpenWmsIssueOrdersDiagnostic(tag: string) {
+  try {
+    const issueOrders = await prisma.wmsFulfillmentOrder.findMany({
+      where: {
+        status: WmsFulfillmentOrderStatus.ISSUE,
+      },
+      include: {
+        tenant: {
+          select: {
+            id: true,
+            name: true,
+            wmsFulfillmentGoLiveAt: true,
+          },
+        },
+        store: {
+          select: {
+            id: true,
+            name: true,
+            shopName: true,
+            status: true,
+            enabled: true,
+          },
+        },
+        posOrder: {
+          select: {
+            status: true,
+            isVoid: true,
+            dateLocal: true,
+            insertedAt: true,
+            orderSnapshot: true,
+            itemData: true,
+          },
+        },
+        lines: {
+          select: {
+            id: true,
+            variationId: true,
+            productName: true,
+            quantityRequired: true,
+            quantityAllocated: true,
+            quantityPicked: true,
+            status: true,
+            issueReason: true,
+          },
+        },
+      },
+      orderBy: [{ createdAt: 'desc' }],
+      take: 100,
+    });
+
+    const visiblePickQueueIssueOrders = issueOrders.filter((order) => {
+      const goLiveAt = order.tenant?.wmsFulfillmentGoLiveAt ?? null;
+      if (goLiveAt && order.posOrder.insertedAt < goLiveAt) {
+        return false;
+      }
+      return order.posOrder.status === 1 && !order.posOrder.isVoid;
+    });
+
+    console.log(
+      tag,
+      JSON.stringify({
+        totalIssueRowCount: issueOrders.length,
+        visibleConfirmedIssueCount: visiblePickQueueIssueOrders.length,
+        orders: visiblePickQueueIssueOrders.map((order) => {
+          const snapshot =
+            order.posOrder.orderSnapshot
+            && typeof order.posOrder.orderSnapshot === 'object'
+            && !Array.isArray(order.posOrder.orderSnapshot)
+              ? (order.posOrder.orderSnapshot as Record<string, any>)
+              : null;
+          const rawItems = Array.isArray(snapshot?.items) ? snapshot!.items : null;
+          return {
+            id: order.id,
+            posOrderId: order.posOrderId,
+            tenantName: order.tenant?.name ?? null,
+            storeName: order.store?.shopName || order.store?.name || null,
+            storeEnabled: order.store?.enabled ?? null,
+            assignmentMode: order.assignmentMode,
+            basketId: order.basketId,
+            totalQuantity: order.totalQuantity,
+            allocatedQuantity: order.allocatedQuantity,
+            pickedQuantity: order.pickedQuantity,
+            issueReason: order.issueReason,
+            changeState: order.changeState,
+            dateLocal: order.posOrder.dateLocal,
+            snapshotItemsCount: rawItems ? rawItems.length : null,
+            lines: order.lines.map((l) => ({
+              variationId: l.variationId,
+              productName: l.productName,
+              qtyReq: l.quantityRequired,
+              qtyAlloc: l.quantityAllocated,
+              qtyPicked: l.quantityPicked,
+              status: l.status,
+              issueReason: l.issueReason,
+            })),
+          };
+        }),
+      }),
+    );
+  } catch (err: any) {
+    console.error(`Warning during ${tag}:`, err?.message || err);
+  }
+}
+
+function deriveSeedEmptyIssueReason(
+  orderSnapshot: Prisma.JsonValue | null,
+  fallbackItemData: Prisma.JsonValue | null,
+  hasBypassAdjustment: boolean,
+): string {
+  if (hasBypassAdjustment) {
+    return 'All pickable items on this order were bypassed to zero quantity — no units remain to pick.';
+  }
+  const snapshot =
+    orderSnapshot && typeof orderSnapshot === 'object' && !Array.isArray(orderSnapshot)
+      ? (orderSnapshot as Record<string, any>)
+      : null;
+  const hasSnapshotItemsArray = Array.isArray(snapshot?.items);
+  const snapshotItems = hasSnapshotItemsArray ? (snapshot!.items as any[]) : [];
+  const fallbackItems = Array.isArray(fallbackItemData) ? (fallbackItemData as any[]) : [];
+
+  if (!hasSnapshotItemsArray && fallbackItems.length === 0) {
+    return 'Order line items have not arrived from Pancake POS yet — syncing from POS';
+  }
+  if (snapshotItems.length === 0 && fallbackItems.length === 0) {
+    return 'Order has no line items in Pancake POS — add a product variation in POS to pick';
+  }
+
+  const effectiveItems = snapshotItems.length > 0 ? snapshotItems : fallbackItems;
+  const objectItems = effectiveItems.filter(
+    (item): item is Record<string, any> => Boolean(item && typeof item === 'object' && !Array.isArray(item)),
+  );
+  if (
+    objectItems.length > 0
+    && objectItems.every((item) => {
+      const qty = Math.max(Number(item.quantity ?? 0), 0);
+      const returned =
+        Math.max(Number(item.returned_count ?? 0), 0)
+        + Math.max(Number(item.return_quantity ?? 0), 0)
+        + Math.max(Number(item.returning_quantity ?? 0), 0);
+      return qty > 0 && returned >= qty;
+    })
+  ) {
+    return 'All order line items are marked returned in Pancake POS';
+  }
+
+  const unlinkedNames = objectItems
+    .map((item) => {
+      const varInfo =
+        item.variation_info && typeof item.variation_info === 'object'
+          ? (item.variation_info as Record<string, any>)
+          : null;
+      const rawName =
+        varInfo?.name ?? item.variationName ?? item.product_name ?? item.note_product ?? item.name;
+      return typeof rawName === 'string' && rawName.trim() ? rawName.trim() : null;
+    })
+    .filter((name): name is string => Boolean(name));
+
+  if (unlinkedNames.length > 0) {
+    return `Order item in Pancake POS ("${unlinkedNames.slice(0, 2).join(', ')}") is not linked to a catalog variation — link a product variation in POS to pick`;
+  }
+
+  return 'Order item in Pancake POS is not linked to a catalog variation — link a product variation in POS to pick';
+}
+
+async function reconcileAllWmsIssueOrdersOnStartup() {
+  try {
+    const now = new Date();
+    const issueOrders = await prisma.wmsFulfillmentOrder.findMany({
+      where: {
+        status: WmsFulfillmentOrderStatus.ISSUE,
+        basketId: null,
+        pickedQuantity: 0,
+      },
+      include: {
+        tenant: {
+          select: {
+            id: true,
+            wmsFulfillmentGoLiveAt: true,
+          },
+        },
+        posOrder: {
+          select: {
+            status: true,
+            isVoid: true,
+            insertedAt: true,
+            orderSnapshot: true,
+            itemData: true,
+          },
+        },
+        fulfillmentAdjustments: {
+          where: { status: 'ACTIVE' },
+          select: { id: true },
+        },
+        lines: true,
+      },
+    });
+
+    let canceledCount = 0;
+    let packedShippedCount = 0;
+    let recoveredWithLinesCount = 0;
+    let backfilledReasonCount = 0;
+
+    for (const order of issueOrders) {
+      const goLiveAt = order.tenant?.wmsFulfillmentGoLiveAt ?? null;
+      if (goLiveAt && order.posOrder.insertedAt < goLiveAt) {
+        await prisma.wmsFulfillmentLine.updateMany({
+          where: { fulfillmentOrderId: order.id },
+          data: {
+            quantityAllocated: 0,
+            quantityPicked: 0,
+            status: WmsFulfillmentLineStatus.CANCELED,
+            issueReason: 'Excluded before client WMS fulfillment go-live.',
+          },
+        });
+        await prisma.wmsFulfillmentOrder.update({
+          where: { id: order.id },
+          data: {
+            status: WmsFulfillmentOrderStatus.CANCELED,
+            issueReason: 'Excluded before client WMS fulfillment go-live.',
+            allocatedQuantity: 0,
+            pickedQuantity: 0,
+            completedAt: now,
+            lastSyncedAt: now,
+          },
+        });
+        canceledCount += 1;
+        continue;
+      }
+
+      if (order.posOrder.isVoid || order.posOrder.status === 6 || order.posOrder.status === 7) {
+        const cancelReason = order.posOrder.isVoid
+          ? 'Voided in Pancake POS.'
+          : 'Canceled in Pancake POS.';
+        await prisma.wmsFulfillmentLine.updateMany({
+          where: { fulfillmentOrderId: order.id },
+          data: {
+            quantityAllocated: 0,
+            quantityPicked: 0,
+            status: WmsFulfillmentLineStatus.CANCELED,
+            issueReason: cancelReason,
+          },
+        });
+        await prisma.wmsFulfillmentOrder.update({
+          where: { id: order.id },
+          data: {
+            status: WmsFulfillmentOrderStatus.CANCELED,
+            issueReason: cancelReason,
+            allocatedQuantity: 0,
+            pickedQuantity: 0,
+            completedAt: now,
+            lastSyncedAt: now,
+          },
+        });
+        canceledCount += 1;
+        continue;
+      }
+
+      if ([2, 3, 4, 5].includes(order.posOrder.status)) {
+        await prisma.wmsFulfillmentLine.updateMany({
+          where: {
+            fulfillmentOrderId: order.id,
+            status: { not: WmsFulfillmentLineStatus.CANCELED },
+          },
+          data: {
+            status: WmsFulfillmentLineStatus.PICKED,
+            issueReason: null,
+          },
+        });
+        await prisma.wmsFulfillmentOrder.update({
+          where: { id: order.id },
+          data: {
+            status: WmsFulfillmentOrderStatus.PACKED,
+            issueReason: null,
+            completedAt: order.completedAt ?? now,
+            lastSyncedAt: now,
+          },
+        });
+        packedShippedCount += 1;
+        continue;
+      }
+
+      // Clean up any orphan zero-required lines first
+      for (const line of order.lines) {
+        if (
+          line.status !== WmsFulfillmentLineStatus.CANCELED
+          && line.quantityRequired <= 0
+          && (line.quantityPicked ?? 0) <= 0
+        ) {
+          await prisma.wmsFulfillmentLine.update({
+            where: { id: line.id },
+            data: {
+              quantityAllocated: 0,
+              quantityPicked: 0,
+              status: WmsFulfillmentLineStatus.CANCELED,
+              issueReason: null,
+            },
+          });
+          line.status = WmsFulfillmentLineStatus.CANCELED;
+        }
+      }
+
+      const activeLines = order.lines.filter(
+        (line) => line.status !== WmsFulfillmentLineStatus.CANCELED && line.quantityRequired > 0,
+      );
+
+      if (order.posOrder.status === 1 && activeLines.length > 0) {
+        const [putawayUnits, heldBins] = await Promise.all([
+          prisma.wmsInventoryUnit.findMany({
+            where: {
+              tenantId: order.tenantId,
+              storeId: order.storeId,
+              variationId: { in: activeLines.map((line) => line.variationId) },
+              status: WmsInventoryUnitStatus.PUTAWAY,
+              currentLocationId: { not: null },
+              currentLocation: { is: { kind: WmsLocationKind.BIN, isActive: true } },
+              OR: [{ expirationDate: null }, { expirationDate: { gt: now } }],
+              pickReservations: { none: { status: { in: ['RESERVED', 'PICKED'] } } },
+              basketUnits: { none: { status: { in: ['PICKED', 'PACKED'] } } },
+            },
+            select: {
+              warehouseId: true,
+              variationId: true,
+            },
+          }),
+          prisma.wmsBasketPickDemandBin.findMany({
+            where: {
+              tenantId: order.tenantId,
+              variationId: { in: activeLines.map((line) => line.variationId) },
+              basket: {
+                status: { in: ['ASSIGNED', 'IN_PICKING', 'FULL_HELD'] },
+              },
+              demand: {
+                storeId: order.storeId,
+              },
+            },
+            select: {
+              warehouseId: true,
+              variationId: true,
+              quantityTarget: true,
+              quantityPicked: true,
+            },
+          }),
+        ]);
+        const heldByWarehouseVariation = new Map<string, number>();
+        for (const hold of heldBins) {
+          const remainingHold = Math.max((hold.quantityTarget ?? 0) - (hold.quantityPicked ?? 0), 0);
+          if (remainingHold <= 0) continue;
+          const key = `${hold.warehouseId}::${hold.variationId}`;
+          heldByWarehouseVariation.set(key, (heldByWarehouseVariation.get(key) ?? 0) + remainingHold);
+        }
+        const netAvailableInWarehouse = (whId: string, variationId: string) => {
+          const raw = putawayUnits.filter(
+            (u) => u.warehouseId === whId && u.variationId === variationId,
+          ).length;
+          const held = heldByWarehouseVariation.get(`${whId}::${variationId}`) ?? 0;
+          return Math.max(raw - held, 0);
+        };
+
+        const warehouseIds = Array.from(new Set(putawayUnits.map((unit) => unit.warehouseId)));
+        let chosenWarehouseId: string | null = warehouseIds[0] ?? null;
+        let bestAlloc = -1;
+        for (const whId of warehouseIds) {
+          let sumAlloc = 0;
+          let full = true;
+          for (const line of activeLines) {
+            const avail = netAvailableInWarehouse(whId, line.variationId);
+            const alloc = Math.min(avail, line.quantityRequired);
+            sumAlloc += alloc;
+            if (alloc < line.quantityRequired) {
+              full = false;
+            }
+          }
+          const score = (full ? 1_000_000 : 0) + sumAlloc;
+          if (score > bestAlloc) {
+            bestAlloc = score;
+            chosenWarehouseId = whId;
+          }
+        }
+
+        let orderTotal = 0;
+        let orderAlloc = 0;
+        let allReady = true;
+        for (const line of activeLines) {
+          const avail = chosenWarehouseId
+            ? netAvailableInWarehouse(chosenWarehouseId, line.variationId)
+            : 0;
+          const alloc = Math.min(avail, line.quantityRequired);
+          orderTotal += line.quantityRequired;
+          orderAlloc += alloc;
+          if (alloc < line.quantityRequired) {
+            allReady = false;
+          }
+        }
+
+        for (const line of activeLines) {
+          const avail = chosenWarehouseId
+            ? netAvailableInWarehouse(chosenWarehouseId, line.variationId)
+            : 0;
+          const alloc = allReady ? line.quantityRequired : Math.min(avail, line.quantityRequired);
+          const lineStatus = alloc >= line.quantityRequired
+            ? WmsFulfillmentLineStatus.READY
+            : alloc > 0
+              ? WmsFulfillmentLineStatus.PARTIAL
+              : WmsFulfillmentLineStatus.RESTOCKING;
+          const missing = Math.max(line.quantityRequired - avail, 0);
+          await prisma.wmsFulfillmentLine.update({
+            where: { id: line.id },
+            data: {
+              quantityAllocated: alloc,
+              quantityPicked: 0,
+              status: lineStatus,
+              issueReason: allReady
+                ? null
+                : lineStatus === WmsFulfillmentLineStatus.READY
+                  ? 'Stock is available for this item, but the complete order cannot be fulfilled yet.'
+                  : avail <= 0
+                    ? `Needs ${line.quantityRequired} unit${line.quantityRequired === 1 ? '' : 's'} in putaway bin inventory.`
+                    : `${avail} of ${line.quantityRequired} required unit${line.quantityRequired === 1 ? '' : 's'} available in the selected warehouse; needs ${missing} more.`,
+            },
+          });
+        }
+
+        await prisma.wmsFulfillmentOrder.update({
+          where: { id: order.id },
+          data: {
+            warehouseId: null,
+            totalQuantity: orderTotal,
+            allocatedQuantity: allReady ? orderTotal : orderAlloc,
+            pickedQuantity: 0,
+            status: allReady
+              ? WmsFulfillmentOrderStatus.READY
+              : orderAlloc > 0
+                ? WmsFulfillmentOrderStatus.PARTIAL
+                : WmsFulfillmentOrderStatus.RESTOCKING,
+            issueReason: null,
+            lastSyncedAt: now,
+          },
+        });
+        recoveredWithLinesCount += 1;
+        continue;
+      }
+
+      if (activeLines.length === 0) {
+        const concreteReason = deriveSeedEmptyIssueReason(
+          order.posOrder.orderSnapshot,
+          order.posOrder.itemData,
+          order.fulfillmentAdjustments.length > 0,
+        );
+        if (!order.issueReason || order.issueReason === 'Order has no pickable variation items') {
+          await prisma.wmsFulfillmentOrder.update({
+            where: { id: order.id },
+            data: {
+              totalQuantity: 0,
+              allocatedQuantity: 0,
+              issueReason: concreteReason,
+              lastSyncedAt: now,
+            },
+          });
+          backfilledReasonCount += 1;
+        }
+      } else if (!order.issueReason) {
+        await prisma.wmsFulfillmentOrder.update({
+          where: { id: order.id },
+          data: {
+            issueReason: `Order is in Pancake POS status ${order.posOrder.status} (not Confirmed) — resync queue to update WMS status.`,
+            lastSyncedAt: now,
+          },
+        });
+        backfilledReasonCount += 1;
+      }
+    }
+
+    console.log(
+      '[WMS_ISSUE_STARTUP_RECONCILE]',
+      JSON.stringify({
+        evaluatedCount: issueOrders.length,
+        canceledCount,
+        packedShippedCount,
+        recoveredWithLinesCount,
+        backfilledReasonCount,
+      }),
+    );
+  } catch (err: any) {
+    console.error(
+      'Warning during WMS ISSUE startup reconciliation:',
+      err?.message || err,
+    );
+  }
+}
+
 async function main() {
   console.log('Starting database seed...');
   await ensureSuperAdmin();
@@ -6499,7 +7026,10 @@ async function main() {
   await backfill2026OrderCogsAndReports();
   await syncToniosPosConnectionAndOrders();
   await reconcileToniosWmsFulfillmentQueue();
+  await logOpenWmsIssueOrdersDiagnostic('[WMS_ISSUE_DIAG_BEFORE]');
   await reconcileFamcoSharedStockPoolsAndQueue();
+  await reconcileAllWmsIssueOrdersOnStartup();
+  await logOpenWmsIssueOrdersDiagnostic('[WMS_ISSUE_DIAG_AFTER]');
   await diagnoseErpFreshness();
   console.log('Seed completed successfully!');
 }

@@ -3919,12 +3919,31 @@ export class WmsInventoryService {
       const picked = line.reservations.filter(
         (reservation) => reservation.status === WmsPickReservationStatus.PICKED,
       ).length;
+      if (required <= 0 && allocated === 0 && picked === 0) {
+        await tx.wmsFulfillmentLine.update({
+          where: { id: line.id },
+          data: {
+            quantityAllocated: 0,
+            quantityPicked: 0,
+            status: WmsFulfillmentLineStatus.CANCELED,
+            issueReason: null,
+          },
+        });
+        continue;
+      }
+
       const nextLineStatus = this.resolveFulfillmentLineStatusAfterInventoryVoid(
         required,
         allocated,
         picked,
         line.status,
       );
+      const nextLineIssueReason = nextLineStatus === WmsFulfillmentLineStatus.READY
+        || nextLineStatus === WmsFulfillmentLineStatus.PICKED
+        ? null
+        : required <= 0
+          ? 'Picked or reserved units remain on a removed order item — return units to bin to continue.'
+          : line.issueReason;
 
       totalQuantity += required;
       allocatedQuantity += Math.min(allocated, required);
@@ -3937,10 +3956,7 @@ export class WmsInventoryService {
           quantityAllocated: Math.min(allocated, required),
           quantityPicked: Math.min(picked, required),
           status: nextLineStatus,
-          issueReason: nextLineStatus === WmsFulfillmentLineStatus.READY
-            || nextLineStatus === WmsFulfillmentLineStatus.PICKED
-            ? null
-            : line.issueReason,
+          issueReason: nextLineIssueReason,
         },
       });
     }
@@ -3953,6 +3969,9 @@ export class WmsInventoryService {
       pickedQuantity,
       hasIssue,
     });
+    const voidIssueLine = order.lines.find(
+      (line) => line.status !== WmsFulfillmentLineStatus.CANCELED && Boolean(line.issueReason?.trim()),
+    );
 
     await tx.wmsFulfillmentOrder.update({
       where: { id: order.id },
@@ -3964,7 +3983,13 @@ export class WmsInventoryService {
         completedAt: nextOrderStatus === WmsFulfillmentOrderStatus.READY_FOR_PACK
           ? order.completedAt ?? now
           : null,
-        issueReason: totalQuantity === 0 ? order.issueReason ?? 'Order has no pickable variation items' : null,
+        issueReason: nextOrderStatus !== WmsFulfillmentOrderStatus.ISSUE
+          ? null
+          : totalQuantity === 0
+            ? order.issueReason ?? 'Order has no pickable variation items'
+            : voidIssueLine?.issueReason
+              ? `${voidIssueLine.productName}: ${voidIssueLine.issueReason}`
+              : order.issueReason ?? 'Reserved inventory unit was voided — reallocate or review order items.',
       },
     });
   }

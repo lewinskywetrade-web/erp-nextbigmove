@@ -3536,14 +3536,13 @@ export class WmsFulfillmentOpsService {
 
       const required = Math.max(line.quantityRequired, 0);
       if (required <= 0) {
-        hasIssue = true;
         await tx.wmsFulfillmentLine.update({
           where: { id: line.id },
           data: {
             quantityAllocated: 0,
             quantityPicked: 0,
-            status: WmsFulfillmentLineStatus.ISSUE,
-            issueReason: 'Order line has no required quantity.',
+            status: WmsFulfillmentLineStatus.CANCELED,
+            issueReason: null,
           },
         });
         continue;
@@ -3633,6 +3632,12 @@ export class WmsFulfillmentOpsService {
       }
     }
 
+    const evaluatedAvailabilityLines: Array<{
+      productName: string;
+      status: WmsFulfillmentLineStatus;
+      issueReason: string | null;
+    }> = [];
+
     for (const line of order.lines) {
       if (line.status === WmsFulfillmentLineStatus.CANCELED) {
         continue;
@@ -3649,10 +3654,23 @@ export class WmsFulfillmentOpsService {
       const availableInSelectedWarehouse = selectedWarehouseId && eligibleLine
         ? eligibleLine.availabilityByWarehouse.get(selectedWarehouseId) ?? 0
         : 0;
+      const nextLineIssueReason = nextLineStatus === WmsFulfillmentLineStatus.READY
+        ? null
+        : this.buildDemandAvailabilityIssueReason({
+            required,
+            availableInSelectedWarehouse,
+            totalAvailableAcrossWarehouses: eligibleLine?.totalAvailableAcrossWarehouses ?? 0,
+            warehouseLocked,
+          });
 
       totalQuantity += required;
       allocatedQuantity += nextAllocated;
       hasIssue = hasIssue || nextLineStatus === WmsFulfillmentLineStatus.ISSUE;
+      evaluatedAvailabilityLines.push({
+        productName: line.productName,
+        status: nextLineStatus,
+        issueReason: nextLineIssueReason,
+      });
 
       await tx.wmsFulfillmentLine.update({
         where: { id: line.id },
@@ -3660,14 +3678,7 @@ export class WmsFulfillmentOpsService {
           quantityAllocated: nextAllocated,
           quantityPicked: 0,
           status: nextLineStatus,
-          issueReason: nextLineStatus === WmsFulfillmentLineStatus.READY
-            ? null
-            : this.buildDemandAvailabilityIssueReason({
-                required,
-                availableInSelectedWarehouse,
-                totalAvailableAcrossWarehouses: eligibleLine?.totalAvailableAcrossWarehouses ?? 0,
-                warehouseLocked,
-              }),
+          issueReason: nextLineIssueReason,
         },
       });
     }
@@ -3680,6 +3691,9 @@ export class WmsFulfillmentOpsService {
       pickedQuantity,
       hasIssue,
     });
+    const availabilityIssueLine = evaluatedAvailabilityLines.find(
+      (entry) => entry.status === WmsFulfillmentLineStatus.ISSUE || Boolean(entry.issueReason?.trim()),
+    );
 
     await tx.wmsFulfillmentOrder.update({
       where: { id: order.id },
@@ -3689,7 +3703,13 @@ export class WmsFulfillmentOpsService {
         allocatedQuantity,
         pickedQuantity,
         status: nextOrderStatus,
-        issueReason: totalQuantity === 0 ? order.issueReason ?? 'Order has no pickable variation items' : null,
+        issueReason: nextOrderStatus !== WmsFulfillmentOrderStatus.ISSUE
+          ? null
+          : totalQuantity === 0
+            ? order.issueReason ?? 'Order has no pickable variation items'
+            : availabilityIssueLine?.issueReason
+              ? `${availabilityIssueLine.productName}: ${availabilityIssueLine.issueReason}`
+              : order.issueReason ?? 'Order has a fulfillment issue — review order line items or resync the pick queue.',
         claimedById: null,
         claimedAt: null,
         basketId: null,
@@ -3902,6 +3922,11 @@ export class WmsFulfillmentOpsService {
     let allocatedQuantity = 0;
     let pickedQuantity = 0;
     let hasIssue = false;
+    const evaluatedProgressLines: Array<{
+      productName: string;
+      status: WmsFulfillmentLineStatus;
+      issueReason: string | null;
+    }> = [];
 
     for (const line of order.lines) {
       if (line.status === WmsFulfillmentLineStatus.CANCELED) {
@@ -3933,12 +3958,35 @@ export class WmsFulfillmentOpsService {
             0,
           )
         : line.reservations.filter((reservation) => reservation.status === WmsPickReservationStatus.PICKED).length;
+      if (required <= 0 && allocated === 0 && picked === 0) {
+        await tx.wmsFulfillmentLine.update({
+          where: { id: line.id },
+          data: {
+            quantityAllocated: 0,
+            quantityPicked: 0,
+            status: WmsFulfillmentLineStatus.CANCELED,
+            issueReason: null,
+          },
+        });
+        continue;
+      }
+
       const nextLineStatus = this.resolveFulfillmentLineStatus(required, allocated, picked, line.status);
+      const nextLineIssueReason = nextLineStatus === WmsFulfillmentLineStatus.READY || nextLineStatus === WmsFulfillmentLineStatus.PICKED
+        ? null
+        : required <= 0
+          ? 'Picked units remain on a removed order item — return units to bin to continue.'
+          : line.issueReason;
 
       totalQuantity += required;
       allocatedQuantity += Math.min(allocated, required);
       pickedQuantity += Math.min(picked, required);
       hasIssue = hasIssue || nextLineStatus === WmsFulfillmentLineStatus.ISSUE;
+      evaluatedProgressLines.push({
+        productName: line.productName,
+        status: nextLineStatus,
+        issueReason: nextLineIssueReason,
+      });
 
       await tx.wmsFulfillmentLine.update({
         where: { id: line.id },
@@ -3946,9 +3994,7 @@ export class WmsFulfillmentOpsService {
           quantityAllocated: Math.min(allocated, required),
           quantityPicked: Math.min(picked, required),
           status: nextLineStatus,
-          issueReason: nextLineStatus === WmsFulfillmentLineStatus.READY || nextLineStatus === WmsFulfillmentLineStatus.PICKED
-            ? null
-            : line.issueReason,
+          issueReason: nextLineIssueReason,
         },
       });
     }
@@ -3961,6 +4007,9 @@ export class WmsFulfillmentOpsService {
       pickedQuantity,
       hasIssue,
     });
+    const progressIssueLine = evaluatedProgressLines.find(
+      (entry) => entry.status === WmsFulfillmentLineStatus.ISSUE || Boolean(entry.issueReason?.trim()),
+    );
 
     await tx.wmsFulfillmentOrder.update({
       where: { id: order.id },
@@ -3972,7 +4021,13 @@ export class WmsFulfillmentOpsService {
         completedAt: nextOrderStatus === WmsFulfillmentOrderStatus.READY_FOR_PACK
           ? order.completedAt ?? now
           : null,
-        issueReason: totalQuantity === 0 ? order.issueReason ?? 'Order has no pickable variation items' : null,
+        issueReason: nextOrderStatus !== WmsFulfillmentOrderStatus.ISSUE
+          ? null
+          : totalQuantity === 0
+            ? order.issueReason ?? 'Order has no pickable variation items'
+            : progressIssueLine?.issueReason
+              ? `${progressIssueLine.productName}: ${progressIssueLine.issueReason}`
+              : order.issueReason ?? 'Order has a fulfillment issue — review order line items or resync the pick queue.',
       },
     });
   }

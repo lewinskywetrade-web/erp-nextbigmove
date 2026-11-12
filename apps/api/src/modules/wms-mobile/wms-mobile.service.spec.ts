@@ -367,4 +367,101 @@ describe('WmsMobileService basket POS-shipped pick order reconciliation', () => 
       }],
     });
   });
+
+  it('always surfaces a diagnostic issueReason on ISSUE tasks even when DB issueReason is null', () => {
+    const service = Object.assign(Object.create(WmsMobileService.prototype), {
+      wmsFulfillmentSyncService: {
+        resolveEmptyFulfillmentIssueReason: jest
+          .fn()
+          .mockReturnValue('Order item in Pancake POS is not linked to a catalog variation — link a product variation in POS to pick'),
+      },
+    }) as WmsMobileService;
+
+    const mappedRevisionIssue = (service as any).mapMobilePickingTask({
+      id: 'fo-4292',
+      posOrderId: '4292',
+      shopId: 'shop-nourio',
+      status: WmsFulfillmentOrderStatus.ISSUE,
+      assignmentMode: 'BASKET_DEMAND',
+      sourceRevision: 2,
+      issueReason: null,
+      customerName: 'myrna tan rioflorido',
+      customerPhone: '09175277746',
+      totalQuantity: 5,
+      allocatedQuantity: 0,
+      pickedQuantity: 0,
+      store: {
+        id: 'store-nourio',
+        tenantId: 'tenant-famco',
+        name: 'Nourio',
+        shopName: 'Nourio',
+        tenant: { name: 'FAMCO' },
+      },
+      posOrder: {
+        status: 1,
+        isVoid: false,
+        dateLocal: '2026-11-11',
+      },
+      lines: [
+        {
+          id: 'line-1',
+          variationId: 'var-1',
+          productId: 'prod-1',
+          productName: 'Nourio Item',
+          productDisplayId: 'NR-01',
+          status: 'RESTOCKING',
+          issueReason: null,
+          quantityRequired: 5,
+          quantityAllocated: 0,
+          quantityPicked: 0,
+          reservations: [],
+        },
+      ],
+      basketUnits: [],
+      fulfillmentAdjustments: [],
+      amendments: [],
+    });
+
+    expect(mappedRevisionIssue.issueReason).toContain('Order remained in Issue status after a POS item revision (5 required units)');
+
+    const mappedLineIssue = (service as any).mapMobilePickingTask({
+      id: 'fo-line-issue',
+      posOrderId: '4293',
+      shopId: 'shop-nourio',
+      status: WmsFulfillmentOrderStatus.ISSUE,
+      assignmentMode: 'BASKET_DEMAND',
+      sourceRevision: 1,
+      issueReason: null,
+      customerName: 'Test Customer',
+      customerPhone: '09170000000',
+      totalQuantity: 2,
+      allocatedQuantity: 0,
+      pickedQuantity: 1,
+      posOrder: { status: 1, isVoid: false },
+      lines: [
+        {
+          id: 'line-zero-issue',
+          variationId: 'var-removed',
+          productId: 'prod-removed',
+          productName: 'Removed Serum',
+          productDisplayId: 'RM-01',
+          status: 'ISSUE',
+          issueReason: 'Picked units remain on a removed order item — return units to bin to continue.',
+          quantityRequired: 0,
+          quantityAllocated: 0,
+          quantityPicked: 1,
+          reservations: [],
+        },
+      ],
+      basketUnits: [],
+      fulfillmentAdjustments: [],
+      amendments: [],
+    });
+
+    expect(mappedLineIssue.issueReason).toBe(
+      'Removed Serum: Picked units remain on a removed order item — return units to bin to continue.',
+    );
+    expect(mappedLineIssue.lines).toHaveLength(1);
+    expect(mappedLineIssue.lines[0].status).toBe('ISSUE');
+  });
 });

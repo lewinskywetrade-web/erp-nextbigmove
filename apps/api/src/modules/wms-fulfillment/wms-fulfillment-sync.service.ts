@@ -609,9 +609,12 @@ export class WmsFulfillmentSyncService {
                     completedAt: null,
                   }
                 : existing.status === WmsFulfillmentOrderStatus.ISSUE
-                  && lines.length === 0
-                  && emptyOrderIssueReason
-                  ? { issueReason: emptyOrderIssueReason }
+                  ? {
+                      issueReason:
+                        emptyOrderIssueReason
+                        ?? existing.issueReason
+                        ?? 'Order has a fulfillment issue — review order line items or resync the pick queue.',
+                    }
                   : {}),
               lastSyncedAt: new Date(),
             },
@@ -633,6 +636,11 @@ export class WmsFulfillmentSyncService {
         const nextRevision = hasNewSourceRevision
           ? lockedRevision.sourceRevision + 1
           : Math.max(lockedRevision.sourceRevision, 1);
+        const nextSyncedOrderStatus = shouldRecoverTransientCancellation || shouldRecoverUnbasketedIssueOrder
+          ? WmsFulfillmentOrderStatus.RESTOCKING
+          : shouldMarkUnbasketedEmptyOrderIssue
+            ? WmsFulfillmentOrderStatus.ISSUE
+            : existing.status;
 
         await tx.wmsFulfillmentOrder.update({
           where: { id: existing.id },
@@ -650,7 +658,14 @@ export class WmsFulfillmentSyncService {
             changeState: amendment.changeState,
             changeDetectedAt: new Date(),
             changeSummary: amendment.summary as Prisma.InputJsonValue,
-            issueReason: emptyOrderIssueReason,
+            issueReason:
+              nextSyncedOrderStatus === WmsFulfillmentOrderStatus.ISSUE
+                ? (
+                    emptyOrderIssueReason
+                    ?? existing.issueReason
+                    ?? 'Order has a fulfillment issue — review order line items or resync the pick queue.'
+                  )
+                : null,
             ...(shouldRecoverTransientCancellation
               ? {
                   status: WmsFulfillmentOrderStatus.RESTOCKING,
@@ -3423,12 +3438,19 @@ export class WmsFulfillmentSyncService {
       });
     }
 
+    const nextBasketDemandStatus =
+      params.lines.length === 0 && params.amendment.changeState === WmsFulfillmentChangeState.NONE
+        ? WmsFulfillmentOrderStatus.ISSUE
+        : WmsFulfillmentOrderStatus.IN_PICKING;
     await tx.wmsFulfillmentOrder.update({
       where: { id: params.order.id },
       data: {
-        status: params.lines.length === 0 && params.amendment.changeState === WmsFulfillmentChangeState.NONE
-          ? WmsFulfillmentOrderStatus.ISSUE
-          : WmsFulfillmentOrderStatus.IN_PICKING,
+        status: nextBasketDemandStatus,
+        ...(nextBasketDemandStatus === WmsFulfillmentOrderStatus.ISSUE
+          ? {
+              issueReason: 'All pickable items were removed from this order in Pancake POS — void basket or cancel in WMS.',
+            }
+          : {}),
         allocatedQuantity: Math.min(totalAllocated, params.lines.reduce((sum, line) => sum + line.quantityRequired, 0)),
         pickedQuantity: Math.min(totalPicked, params.lines.reduce((sum, line) => sum + line.quantityRequired, 0)),
         packedById: null,
@@ -3714,7 +3736,14 @@ export class WmsFulfillmentSyncService {
         where: { id: order.id },
         data: {
           changeState: WmsFulfillmentChangeState.NONE,
-          ...(order.totalQuantity === 0 ? { status: WmsFulfillmentOrderStatus.ISSUE } : {}),
+          ...(order.totalQuantity === 0
+            ? {
+                status: WmsFulfillmentOrderStatus.ISSUE,
+                issueReason:
+                  order.issueReason
+                  ?? 'All pickable items were removed from this order in Pancake POS — no units remain to pick.',
+              }
+            : {}),
         },
       });
       return true;
@@ -4426,6 +4455,11 @@ export class WmsFulfillmentSyncService {
     let allocatedQuantity = 0;
     let pickedQuantity = 0;
     let hasIssue = false;
+    const evaluatedLines: Array<{
+      productName: string;
+      status: WmsFulfillmentLineStatus;
+      issueReason: string | null;
+    }> = [];
 
     for (const line of order.lines) {
       if (line.status === WmsFulfillmentLineStatus.CANCELED) {
@@ -4445,12 +4479,36 @@ export class WmsFulfillmentSyncService {
       const required = Math.max(line.quantityRequired, 0);
       const allocated = line.reservations.length;
       const picked = line.reservations.filter((reservation) => reservation.status === WmsPickReservationStatus.PICKED).length;
+      if (required <= 0 && allocated === 0 && picked === 0) {
+        await tx.wmsFulfillmentLine.update({
+          where: { id: line.id },
+          data: {
+            quantityAllocated: 0,
+            quantityPicked: 0,
+            status: WmsFulfillmentLineStatus.CANCELED,
+            issueReason: null,
+          },
+        });
+        continue;
+      }
+
       const nextLineStatus = this.resolveFulfillmentLineStatus(required, allocated, picked, line.status);
+      const nextLineIssueReason = nextLineStatus === WmsFulfillmentLineStatus.READY
+        || nextLineStatus === WmsFulfillmentLineStatus.PICKED
+        ? null
+        : required <= 0
+          ? 'Picked or reserved units remain on a removed order item — return units to bin to continue.'
+          : line.issueReason;
 
       totalQuantity += required;
       allocatedQuantity += Math.min(allocated, required);
       pickedQuantity += Math.min(picked, required);
       hasIssue = hasIssue || nextLineStatus === WmsFulfillmentLineStatus.ISSUE;
+      evaluatedLines.push({
+        productName: line.productName,
+        status: nextLineStatus,
+        issueReason: nextLineIssueReason,
+      });
 
       await tx.wmsFulfillmentLine.update({
         where: { id: line.id },
@@ -4458,10 +4516,7 @@ export class WmsFulfillmentSyncService {
           quantityAllocated: Math.min(allocated, required),
           quantityPicked: Math.min(picked, required),
           status: nextLineStatus,
-          issueReason: nextLineStatus === WmsFulfillmentLineStatus.READY
-            || nextLineStatus === WmsFulfillmentLineStatus.PICKED
-            ? null
-            : line.issueReason,
+          issueReason: nextLineIssueReason,
         },
       });
     }
@@ -4485,7 +4540,12 @@ export class WmsFulfillmentSyncService {
         completedAt: nextOrderStatus === WmsFulfillmentOrderStatus.READY_FOR_PACK
           ? order.completedAt ?? now
           : null,
-        issueReason: totalQuantity === 0 ? order.issueReason ?? 'Order has no pickable variation items' : null,
+        issueReason: this.resolveOrderIssueReason({
+          nextOrderStatus,
+          totalQuantity,
+          existingIssueReason: order.issueReason,
+          lines: evaluatedLines,
+        }),
       },
     });
   }
@@ -4664,14 +4724,13 @@ export class WmsFulfillmentSyncService {
 
       const required = Math.max(line.quantityRequired, 0);
       if (required <= 0) {
-        hasIssue = true;
         await tx.wmsFulfillmentLine.update({
           where: { id: line.id },
           data: {
             quantityAllocated: 0,
             quantityPicked: 0,
-            status: WmsFulfillmentLineStatus.ISSUE,
-            issueReason: 'Order line has no required quantity.',
+            status: WmsFulfillmentLineStatus.CANCELED,
+            issueReason: null,
           },
         });
         continue;
@@ -4793,6 +4852,12 @@ export class WmsFulfillmentSyncService {
         (selectedAllocationByLineId.get(line.id) ?? 0) >= line.required
       ));
 
+    const evaluatedDemandLines: Array<{
+      productName: string;
+      status: WmsFulfillmentLineStatus;
+      issueReason: string | null;
+    }> = [];
+
     for (const line of order.lines) {
       if (line.status === WmsFulfillmentLineStatus.CANCELED) {
         continue;
@@ -4814,6 +4879,21 @@ export class WmsFulfillmentSyncService {
       const availableInSelectedWarehouse = selectedWarehouseId && eligibleLine
         ? eligibleLine.availabilityByWarehouse.get(selectedWarehouseId) ?? 0
         : 0;
+      const nextLineIssueReason = nextLineStatus === WmsFulfillmentLineStatus.READY
+        ? null
+        : !orderIsFullyAllocatable && availableInSelectedWarehouse >= required
+          ? 'Stock is available for this item, but the complete order cannot be fulfilled yet.'
+          : this.buildDemandAvailabilityIssueReason({
+              required,
+              availableInSelectedWarehouse,
+              totalAvailableAcrossWarehouses: eligibleLine?.totalAvailableAcrossWarehouses ?? 0,
+              warehouseLocked,
+            });
+      evaluatedDemandLines.push({
+        productName: line.productName,
+        status: nextLineStatus,
+        issueReason: nextLineIssueReason,
+      });
 
       await tx.wmsFulfillmentLine.update({
         where: { id: line.id },
@@ -4821,16 +4901,7 @@ export class WmsFulfillmentSyncService {
           quantityAllocated: nextAllocated,
           quantityPicked: 0,
           status: nextLineStatus,
-          issueReason: nextLineStatus === WmsFulfillmentLineStatus.READY
-            ? null
-            : !orderIsFullyAllocatable && availableInSelectedWarehouse >= required
-              ? 'Stock is available for this item, but the complete order cannot be fulfilled yet.'
-              : this.buildDemandAvailabilityIssueReason({
-                  required,
-                  availableInSelectedWarehouse,
-                  totalAvailableAcrossWarehouses: eligibleLine?.totalAvailableAcrossWarehouses ?? 0,
-                  warehouseLocked,
-                }),
+          issueReason: nextLineIssueReason,
         },
       });
     }
@@ -4853,7 +4924,12 @@ export class WmsFulfillmentSyncService {
         pickedQuantity,
         status: nextOrderStatus,
         completedAt: null,
-        issueReason: totalQuantity === 0 ? order.issueReason ?? 'Order has no pickable variation items' : null,
+        issueReason: this.resolveOrderIssueReason({
+          nextOrderStatus,
+          totalQuantity,
+          existingIssueReason: order.issueReason,
+          lines: evaluatedDemandLines,
+        }),
       },
     });
 
@@ -5215,6 +5291,56 @@ export class WmsFulfillmentSyncService {
     }
 
     return 'Order item in Pancake POS is not linked to a catalog variation — link a product variation in POS to pick';
+  }
+
+  public resolveOrderIssueReason(params: {
+    nextOrderStatus: WmsFulfillmentOrderStatus;
+    totalQuantity: number;
+    existingIssueReason?: string | null;
+    lines?: Array<{
+      productName: string;
+      status: WmsFulfillmentLineStatus;
+      issueReason?: string | null;
+    }>;
+    orderSnapshot?: Prisma.JsonValue | null;
+    itemData?: Prisma.JsonValue | null;
+  }): string | null {
+    if (params.nextOrderStatus !== WmsFulfillmentOrderStatus.ISSUE) {
+      return null;
+    }
+
+    if (params.totalQuantity <= 0) {
+      const existing = params.existingIssueReason?.trim();
+      if (existing) {
+        return existing;
+      }
+      if (params.orderSnapshot !== undefined || params.itemData !== undefined) {
+        return this.resolveEmptyFulfillmentIssueReason(
+          params.orderSnapshot ?? null,
+          params.itemData ?? null,
+        );
+      }
+      return 'Order has no pickable variation items';
+    }
+
+    const issueLine = (params.lines ?? []).find(
+      (line) => line.status === WmsFulfillmentLineStatus.ISSUE || Boolean(line.issueReason?.trim()),
+    );
+    if (issueLine) {
+      const lineReason = issueLine.issueReason?.trim();
+      const lineName = issueLine.productName?.trim();
+      if (lineReason) {
+        return lineName ? `${lineName}: ${lineReason}` : lineReason;
+      }
+      return lineName
+        ? `${lineName}: Order item has a fulfillment issue — review line item.`
+        : 'Order item has a fulfillment issue — review order line items.';
+    }
+
+    return (
+      params.existingIssueReason?.trim()
+      || 'Order has a fulfillment issue — review order line items or resync the pick queue.'
+    );
   }
 
   public async extractFulfillmentLinesFromOrderSnapshot(

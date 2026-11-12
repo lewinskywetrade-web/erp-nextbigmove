@@ -957,4 +957,128 @@ describe('WmsFulfillmentSyncService POS shipped pick-status sync', () => {
       expect.any(Object),
     );
   });
+
+  it('auto-cancels orphan zero-required lines and never leaves ISSUE orders with null issueReason', async () => {
+    const lineUpdate = jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({});
+    const orderUpdate = jest.fn<(...args: any[]) => Promise<any>>().mockResolvedValue({});
+    const tx = {
+      wmsFulfillmentLine: {
+        update: lineUpdate,
+      },
+      wmsFulfillmentOrder: {
+        update: orderUpdate,
+      },
+      wmsProductProfile: {
+        findMany: jest.fn<() => Promise<any[]>>().mockResolvedValue([]),
+      },
+      wmsInventoryUnit: {
+        groupBy: jest.fn<() => Promise<any[]>>().mockResolvedValue([
+          { warehouseId: 'wh-1', _count: { _all: 10 } },
+        ]),
+      },
+      wmsBasketPickDemandBin: {
+        findMany: jest.fn<() => Promise<any[]>>().mockResolvedValue([]),
+      },
+    };
+
+    const service = new WmsFulfillmentSyncService({} as any, {} as any, {} as any);
+
+    expect(
+      service.resolveOrderIssueReason({
+        nextOrderStatus: WmsFulfillmentOrderStatus.READY,
+        totalQuantity: 5,
+        existingIssueReason: 'stale',
+      }),
+    ).toBeNull();
+
+    expect(
+      service.resolveOrderIssueReason({
+        nextOrderStatus: WmsFulfillmentOrderStatus.ISSUE,
+        totalQuantity: 5,
+        existingIssueReason: null,
+        lines: [
+          {
+            productName: 'Nourio Glow Serum',
+            status: 'ISSUE' as any,
+            issueReason: 'Picked units remain on a removed order item.',
+          },
+        ],
+      }),
+    ).toBe('Nourio Glow Serum: Picked units remain on a removed order item.');
+
+    expect(
+      service.resolveOrderIssueReason({
+        nextOrderStatus: WmsFulfillmentOrderStatus.ISSUE,
+        totalQuantity: 5,
+        existingIssueReason: null,
+        lines: [],
+      }),
+    ).toBe('Order has a fulfillment issue — review order line items or resync the pick queue.');
+
+    await (service as any).refreshDemandFulfillmentOrderReadinessTx(
+      tx as any,
+      'fo-4292',
+      new Date(),
+      {
+        order: {
+          id: 'fo-4292',
+          tenantId: 'tenant-famco',
+          storeId: 'store-nourio',
+          warehouseId: null,
+          posWarehouseRef: null,
+          assignmentMode: WmsFulfillmentAssignmentMode.BASKET_DEMAND,
+          status: WmsFulfillmentOrderStatus.ISSUE,
+          issueReason: null,
+          basketId: null,
+          claimedById: null,
+          posOrder: {
+            status: 1,
+            isVoid: false,
+            dateLocal: '2026-11-11',
+          },
+          lines: [
+            {
+              id: 'line-orphan-zero',
+              variationId: 'var-removed',
+              productName: 'Removed Item',
+              quantityRequired: 0,
+              quantityAllocated: 0,
+              quantityPicked: 0,
+              status: 'ISSUE',
+              issueReason: 'Order line has no required quantity.',
+            },
+            {
+              id: 'line-valid-5',
+              variationId: 'var-active',
+              productName: 'Nourio Active Item',
+              quantityRequired: 5,
+              quantityAllocated: 0,
+              quantityPicked: 0,
+              status: 'RESTOCKING',
+              issueReason: null,
+            },
+          ],
+        },
+      },
+    );
+
+    expect(lineUpdate).toHaveBeenCalledWith({
+      where: { id: 'line-orphan-zero' },
+      data: {
+        quantityAllocated: 0,
+        quantityPicked: 0,
+        status: 'CANCELED',
+        issueReason: null,
+      },
+    });
+    expect(orderUpdate).toHaveBeenCalledWith({
+      where: { id: 'fo-4292' },
+      data: expect.objectContaining({
+        totalQuantity: 5,
+        allocatedQuantity: 5,
+        status: WmsFulfillmentOrderStatus.READY,
+        issueReason: null,
+      }),
+    });
+  });
 });

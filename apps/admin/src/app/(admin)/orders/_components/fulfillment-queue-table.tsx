@@ -522,14 +522,17 @@ export function FulfillmentQueueTable({
               />
             </div>
 
-            {selectedTask.itemChange ? <OrderChangeAlert task={selectedTask} /> : null}
+            {(() => {
+              const displayIssueReason = resolveDisplayIssueReason(selectedTask);
+              return displayIssueReason ? (
+                <div className="rounded-[20px] border border-amber-200 bg-amber-50 px-4 py-3">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-amber-700">Issue reason</p>
+                  <p className="mt-1 text-sm text-amber-900">{displayIssueReason}</p>
+                </div>
+              ) : null;
+            })()}
 
-            {selectedTask.issueReason ? (
-              <div className="rounded-[20px] border border-amber-200 bg-amber-50 px-4 py-3">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-amber-700">Issue reason</p>
-                <p className="mt-1 text-sm text-amber-900">{selectedTask.issueReason}</p>
-              </div>
-            ) : null}
+            {selectedTask.itemChange ? <OrderChangeAlert task={selectedTask} /> : null}
 
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
               <SummaryTile label="Required" value={selectedTask.totals.required} />
@@ -1002,7 +1005,9 @@ function OrderChangeAlert({ task }: { task: WmsFulfillmentQueueTask }) {
       <p className="mt-3 text-xs text-muted">
         {change.requiresAction
           ? 'Complete the return first, then follow the assigned pick bin. Packer assignment and packing remain blocked until both steps finish.'
-          : 'The current Pick list already uses the latest POS variations and quantities. No manual sync is needed.'}
+          : task.status === 'ISSUE'
+            ? 'POS item changes were synced, but this order is still blocked by an issue — review the Issue reason above.'
+            : 'The current Pick list already uses the latest POS variations and quantities. No manual sync is needed.'}
       </p>
     </div>
   );
@@ -1023,6 +1028,9 @@ function TaskRow({
   const lastColumn = mode === 'pick'
     ? task.warehouse?.name ?? 'Not assigned'
     : basketLabel;
+  const rowIssueReason = task.status === 'ISSUE' || task.issueReason
+    ? resolveDisplayIssueReason(task)
+    : null;
 
   return (
     <tr
@@ -1047,6 +1055,14 @@ function TaskRow({
           <div className="truncate font-semibold text-primary">
             {`${task.store?.tenantName ?? 'Tenant'} · ${task.store?.name ?? 'Store'} · #${task.posOrderId}`}
           </div>
+          {rowIssueReason ? (
+            <div
+              className="mt-1 max-w-[340px] truncate text-[12px] font-medium text-amber-700"
+              title={rowIssueReason}
+            >
+              {rowIssueReason}
+            </div>
+          ) : null}
         </div>
       </BodyCell>
 
@@ -1345,7 +1361,42 @@ function formatDateTime(raw: string | null) {
 }
 
 function getVisibleQueueLines(task: WmsFulfillmentQueueTask) {
-  return task.lines.filter((line) => line.status !== 'CANCELED' && line.required > 0);
+  return task.lines.filter(
+    (line) => line.status !== 'CANCELED' && (line.required > 0 || line.status === 'ISSUE'),
+  );
+}
+
+function resolveDisplayIssueReason(task: WmsFulfillmentQueueTask): string | null {
+  const explicit = task.issueReason?.trim();
+  if (explicit) {
+    return explicit;
+  }
+
+  if (task.status !== 'ISSUE') {
+    return null;
+  }
+
+  const issueLine = task.lines.find(
+    (line) => line.status !== 'CANCELED' && (line.status === 'ISSUE' || Boolean(line.issueReason?.trim())),
+  );
+  if (issueLine) {
+    const lineReason = issueLine.issueReason?.trim();
+    if (lineReason) {
+      return issueLine.productName ? `${issueLine.productName}: ${lineReason}` : lineReason;
+    }
+    return issueLine.productName
+      ? `${issueLine.productName}: Order item has a fulfillment issue — review line item.`
+      : 'Order item has a fulfillment issue — review order line items.';
+  }
+
+  if (task.totals.required <= 0) {
+    if (task.fulfillmentAdjustment) {
+      return 'All pickable items on this order were bypassed to zero quantity — no units remain to pick.';
+    }
+    return 'Order has no pickable variation items — verify product variation links in Pancake POS or click Resync queue.';
+  }
+
+  return `Order remained in Issue status after a POS item revision (${task.totals.required} required unit${task.totals.required === 1 ? '' : 's'}) — click Resync queue or Reallocate waiting to refresh pick readiness.`;
 }
 
 function getStatusTone(statusLabel: string) {

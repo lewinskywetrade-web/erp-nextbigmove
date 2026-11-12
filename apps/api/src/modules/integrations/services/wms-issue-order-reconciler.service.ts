@@ -6,7 +6,7 @@ import { shouldRunApiBackgroundServices } from '../../../common/runtime/process-
 import { IntegrationService } from '../integration.service';
 
 const MAX_RECONCILE_PER_TICK = 30;
-const MAX_CANDIDATE_SCAN = 150;
+const MAX_CANDIDATE_SCAN = 500;
 const PICK_QUEUE_STORE_SYNC_INTERVAL_MS = 2 * 60_000;
 const MAX_PICK_QUEUE_STORES_PER_TICK = 4;
 const STARTUP_MAX_PICK_QUEUE_STORES = 12;
@@ -91,19 +91,44 @@ export class WmsIssueOrderReconcilerService implements OnModuleInit {
           store: {
             is: {
               status: IntegrationStatus.ACTIVE,
-              NOT: { enabled: false },
             },
           },
         },
         select: {
           id: true,
           createdAt: true,
+          totalQuantity: true,
+          issueReason: true,
+          posOrder: {
+            select: {
+              status: true,
+              isVoid: true,
+            },
+          },
         },
         orderBy: [{ createdAt: 'desc' }],
         take: MAX_CANDIDATE_SCAN,
       });
 
-      const activeIdSet = new Set(openIssueOrders.map((row) => row.id));
+      const prioritizedIssueOrders = [...openIssueOrders].sort((left: any, right: any) => {
+        const leftConfirmedVisible =
+          (left.posOrder?.status ?? 1) === 1 && !left.posOrder?.isVoid ? 1 : 0;
+        const rightConfirmedVisible =
+          (right.posOrder?.status ?? 1) === 1 && !right.posOrder?.isVoid ? 1 : 0;
+        if (leftConfirmedVisible !== rightConfirmedVisible) {
+          return rightConfirmedVisible - leftConfirmedVisible;
+        }
+        const leftNeedsImmediateHeal =
+          (left.totalQuantity ?? 0) > 0 || !left.issueReason ? 1 : 0;
+        const rightNeedsImmediateHeal =
+          (right.totalQuantity ?? 0) > 0 || !right.issueReason ? 1 : 0;
+        if (leftNeedsImmediateHeal !== rightNeedsImmediateHeal) {
+          return rightNeedsImmediateHeal - leftNeedsImmediateHeal;
+        }
+        return 0;
+      });
+
+      const activeIdSet = new Set(prioritizedIssueOrders.map((row) => row.id));
       for (const trackedId of Array.from(this.lastCheckedAtByOrderId.keys())) {
         if (!activeIdSet.has(trackedId)) {
           this.lastCheckedAtByOrderId.delete(trackedId);
@@ -111,7 +136,7 @@ export class WmsIssueOrderReconcilerService implements OnModuleInit {
       }
 
       const dueOrderIds: string[] = [];
-      for (const row of openIssueOrders) {
+      for (const row of prioritizedIssueOrders) {
         const createdAtMs = row.createdAt instanceof Date ? row.createdAt.getTime() : nowMs;
         const ageMs = Math.max(nowMs - createdAtMs, 0);
         const intervalMs = resolveWmsIssueRecheckIntervalMs(ageMs);

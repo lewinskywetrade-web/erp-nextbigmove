@@ -6007,7 +6007,6 @@ export class IntegrationService {
         store: {
           is: {
             status: IntegrationStatus.ACTIVE,
-            NOT: { enabled: false },
           },
         },
       },
@@ -6109,121 +6108,145 @@ export class IntegrationService {
     }
 
     for (const { store, rows } of activeByStoreId.values()) {
-      const refsToSync = new Map<string, { shopId: string; posOrderId: string }>();
-      for (const row of rows) {
-        const refKey = `${row.shopId}::${row.posOrderId}`;
-        refsToSync.set(refKey, { shopId: row.shopId, posOrderId: row.posOrderId });
-      }
-
-      let apiKey: string | null = null;
       try {
-        apiKey = await this.resolveStoreApiKeyForWebhook(store.tenantId, {
-          id: store.id,
-          integrationId: store.integrationId,
-          apiKey: store.apiKey,
-        });
-      } catch {
-        apiKey = null;
-      }
+        const refsToSync = new Map<string, { shopId: string; posOrderId: string }>();
+        for (const row of rows) {
+          const refKey = `${row.shopId}::${row.posOrderId}`;
+          refsToSync.set(refKey, { shopId: row.shopId, posOrderId: row.posOrderId });
+        }
 
-      if (apiKey && store.shopId) {
-        if (store.status === 'ACTIVE' && store.enabled !== false) {
-          const existingOwnership = await this.prisma.posShopOwnership.findUnique({
-            where: { shopId: store.shopId },
-            select: { shopId: true },
-          });
-          if (!existingOwnership) {
-            try {
-              await this.posShopOwnershipService.claimShopOwnership({
-                storeId: store.id,
-                reason: 'Auto-claimed during WMS issue order reconciliation',
-              });
-            } catch {
-              // Ignore ownership auto-claim conflicts; resolveOrderRoutes handles routing safely.
-            }
+        let apiKey: string | null = null;
+        if (store.enabled !== false) {
+          try {
+            apiKey = await this.resolveStoreApiKeyForWebhook(store.tenantId, {
+              id: store.id,
+              integrationId: store.integrationId,
+              apiKey: store.apiKey,
+            });
+          } catch {
+            apiKey = null;
           }
         }
 
-        await this.maybeAutoSyncStoreCatalog(
-          store.id,
-          store.tenantId,
-          params?.forceCatalogSync ? 30_000 : 5 * 60_000,
-        );
-
-        const liveOrders: Record<string, any>[] = [];
-        for (const row of rows) {
-          const posOrderId = row.posOrderId?.trim();
-          if (!posOrderId) continue;
-
-          const liveRes = await this.fetchSingleOrderFromPancakeDetailed(
-            store.shopId,
-            posOrderId,
-            apiKey,
-          );
-          if (liveRes.status === 'not_found') {
-            if (!row.posOrder.isVoid) {
-              await this.prisma.posOrder.updateMany({
-                where: {
-                  id: row.posOrderDbId,
-                  tenantId: row.tenantId,
-                },
-                data: {
-                  isVoid: true,
-                },
+        if (apiKey && store.shopId && store.enabled !== false) {
+          try {
+            if (store.status === 'ACTIVE') {
+              const existingOwnership = await this.prisma.posShopOwnership.findUnique({
+                where: { shopId: store.shopId },
+                select: { shopId: true },
               });
+              if (!existingOwnership) {
+                try {
+                  await this.posShopOwnershipService.claimShopOwnership({
+                    storeId: store.id,
+                    reason: 'Auto-claimed during WMS issue order reconciliation',
+                  });
+                } catch {
+                  // Ignore ownership auto-claim conflicts; resolveOrderRoutes handles routing safely.
+                }
+              }
             }
-            continue;
-          }
 
-          if (liveRes.status === 'ok') {
-            liveOrders.push({
-              ...liveRes.data,
-              shop_id: liveRes.data.shop_id ?? store.shopId,
+            await this.maybeAutoSyncStoreCatalog(
+              store.id,
+              store.tenantId,
+              params?.forceCatalogSync ? 30_000 : 5 * 60_000,
+            );
+
+            const liveOrders: Record<string, any>[] = [];
+            for (const row of rows) {
+              const posOrderId = row.posOrderId?.trim();
+              if (!posOrderId) continue;
+
+              const liveRes = await this.fetchSingleOrderFromPancakeDetailed(
+                store.shopId,
+                posOrderId,
+                apiKey,
+              );
+              if (liveRes.status === 'not_found') {
+                if (!row.posOrder.isVoid) {
+                  await this.prisma.posOrder.updateMany({
+                    where: {
+                      id: row.posOrderDbId,
+                      tenantId: row.tenantId,
+                    },
+                    data: {
+                      isVoid: true,
+                    },
+                  });
+                }
+                continue;
+              }
+
+              if (liveRes.status === 'ok') {
+                liveOrders.push({
+                  ...liveRes.data,
+                  shop_id: liveRes.data.shop_id ?? store.shopId,
+                });
+              }
+            }
+
+            if (liveOrders.length > 0) {
+              const routing = await this.posShopOwnershipService.resolveOrderRoutes(
+                store.tenantId,
+                liveOrders,
+              );
+              const matchingRoute = routing.routes.find(
+                (route) => route.tenantId === store.tenantId && route.store.id === store.id,
+              );
+              const ordersForStore = matchingRoute?.orders ?? liveOrders;
+              if (ordersForStore.length > 0) {
+                await this.posOrderService.upsertPosOrdersWithOutcomes(
+                  store.tenantId,
+                  store.id,
+                  ordersForStore,
+                  store.teamId ?? null,
+                  { allowIncompleteOrderHydration: true },
+                );
+              }
+
+              try {
+                await this.ensureStoreOrdersHavePositiveCogs(store.tenantId, store.shopId);
+              } catch {
+                // Non-blocking COGS backfill.
+              }
+            }
+          } catch (liveErr: any) {
+            this.logger.warn(
+              `Live Pancake hydration skipped for store=${store.id} during ISSUE reconciliation: ${liveErr?.message || 'Unknown error'}`,
+            );
+          }
+        }
+
+        if (this.wmsFulfillmentSyncService && refsToSync.size > 0) {
+          await this.wmsFulfillmentSyncService.syncConfirmedPickingOrders({
+            tenantId: store.tenantId,
+            storeId: store.id,
+            actorId: null,
+            stores: [
+              {
+                id: store.id,
+                tenantId: store.tenantId,
+                shopId: store.shopId,
+              },
+            ],
+            posOrderRefs: Array.from(refsToSync.values()),
+          });
+
+          if (
+            rows.some((row) => (row.totalQuantity ?? 0) > 0)
+            && typeof (this.wmsFulfillmentSyncService as any).refreshDemandQueueForScope === 'function'
+          ) {
+            await (this.wmsFulfillmentSyncService as any).refreshDemandQueueForScope({
+              tenantId: store.tenantId,
+              storeId: store.id,
             });
           }
         }
-
-        if (liveOrders.length > 0) {
-          const routing = await this.posShopOwnershipService.resolveOrderRoutes(
-            store.tenantId,
-            liveOrders,
-          );
-          const matchingRoute = routing.routes.find(
-            (route) => route.tenantId === store.tenantId && route.store.id === store.id,
-          );
-          const ordersForStore = matchingRoute?.orders ?? liveOrders;
-          if (ordersForStore.length > 0) {
-            await this.posOrderService.upsertPosOrdersWithOutcomes(
-              store.tenantId,
-              store.id,
-              ordersForStore,
-              store.teamId ?? null,
-              { allowIncompleteOrderHydration: true },
-            );
-          }
-
-          try {
-            await this.ensureStoreOrdersHavePositiveCogs(store.tenantId, store.shopId);
-          } catch {
-            // Non-blocking COGS backfill.
-          }
-        }
-      }
-
-      if (this.wmsFulfillmentSyncService && refsToSync.size > 0) {
-        await this.wmsFulfillmentSyncService.syncConfirmedPickingOrders({
-          tenantId: store.tenantId,
-          storeId: store.id,
-          actorId: null,
-          stores: [
-            {
-              id: store.id,
-              tenantId: store.tenantId,
-              shopId: store.shopId,
-            },
-          ],
-          posOrderRefs: Array.from(refsToSync.values()),
-        });
+      } catch (storeErr: any) {
+        this.logger.warn(
+          `WMS ISSUE reconciliation failed for store=${store.id}: ${storeErr?.message || 'Unknown error'}`,
+        );
       }
     }
 
