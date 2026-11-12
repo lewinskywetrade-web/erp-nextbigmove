@@ -157,6 +157,9 @@ export type WmsInventoryStoreTransferOptionsResponse = {
     name: string;
     label: string;
     alreadyPooled?: boolean;
+    recommendShareStockPool?: boolean;
+    priorTransferBatches?: number;
+    bidirectionalTransferHistory?: boolean;
   }>;
   suggestion: {
     profileId: string;

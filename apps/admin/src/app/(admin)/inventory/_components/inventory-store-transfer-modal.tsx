@@ -220,6 +220,10 @@ export function InventoryStoreTransferModal({
                     <span className="inline-flex items-center rounded-full border border-[#b9decb] bg-[#ecf8f2] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-[#286348]">
                       Already linked
                     </span>
+                  ) : selectedTargetProduct?.recommendShareStockPool ? (
+                    <span className="inline-flex items-center rounded-full border border-[#b9decb] bg-[#ecf8f2] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-[#286348]">
+                      Recommended · repeat transfer
+                    </span>
                   ) : null}
                 </div>
                 <p className="mt-0.5 text-[12px] text-[#667b8a]">

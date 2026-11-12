@@ -1128,7 +1128,7 @@ export class WmsInventoryService {
           take: 200,
         })
       : [];
-    const [sourceProfile, savedEquivalence] = await Promise.all([
+    const [sourceProfile, savedEquivalence, priorTransferItems] = await Promise.all([
       query.sourceProfileId
         ? this.prisma.wmsProductProfile.findFirst({
             where: {
@@ -1158,7 +1158,64 @@ export class WmsInventoryService {
             },
           })
         : Promise.resolve(null),
+      query.sourceProfileId && activeTargetStoreId && this.prisma.wmsInventoryStoreTransferItem?.findMany
+        ? this.prisma.wmsInventoryStoreTransferItem.findMany({
+            where: {
+              transfer: {
+                tenantId: scope.activeTenantId,
+              },
+              OR: [
+                {
+                  fromProductProfileId: query.sourceProfileId,
+                  toStoreId: activeTargetStoreId,
+                },
+                {
+                  toProductProfileId: query.sourceProfileId,
+                  fromStoreId: activeTargetStoreId,
+                },
+              ],
+            },
+            select: {
+              transferId: true,
+              fromProductProfileId: true,
+              toProductProfileId: true,
+            },
+            take: 500,
+          })
+        : Promise.resolve([]),
     ]);
+
+    const transferStatsByProfileId = new Map<
+      string,
+      { forwardTransferIds: Set<string>; reverseTransferIds: Set<string> }
+    >();
+    if (query.sourceProfileId && Array.isArray(priorTransferItems)) {
+      for (const item of priorTransferItems) {
+        if (
+          item.fromProductProfileId === query.sourceProfileId
+          && item.toProductProfileId
+          && item.toProductProfileId !== query.sourceProfileId
+        ) {
+          const stats = transferStatsByProfileId.get(item.toProductProfileId) ?? {
+            forwardTransferIds: new Set<string>(),
+            reverseTransferIds: new Set<string>(),
+          };
+          stats.forwardTransferIds.add(item.transferId);
+          transferStatsByProfileId.set(item.toProductProfileId, stats);
+        } else if (
+          item.toProductProfileId === query.sourceProfileId
+          && item.fromProductProfileId
+          && item.fromProductProfileId !== query.sourceProfileId
+        ) {
+          const stats = transferStatsByProfileId.get(item.fromProductProfileId) ?? {
+            forwardTransferIds: new Set<string>(),
+            reverseTransferIds: new Set<string>(),
+          };
+          stats.reverseTransferIds.add(item.transferId);
+          transferStatsByProfileId.set(item.fromProductProfileId, stats);
+        }
+      }
+    }
 
     const isSameStoreTarget = Boolean(
       sourceProfile
@@ -1171,9 +1228,17 @@ export class WmsInventoryService {
         && this.isStockableVariation(profile.productId, profile.variationId)
         && !(isSameStoreTarget && profile.variationId === sourceProfile?.variationId)
       ))
-      .map((profile) =>
-        this.mapStoreTransferProductOption(profile, sourceProfile?.stockPoolGroupId ?? null),
-      );
+      .map((profile) => {
+        const stats = transferStatsByProfileId.get(profile.id);
+        return this.mapStoreTransferProductOption(
+          profile,
+          sourceProfile?.stockPoolGroupId ?? null,
+          {
+            forwardTransferCount: stats?.forwardTransferIds.size ?? 0,
+            reverseTransferCount: stats?.reverseTransferIds.size ?? 0,
+          },
+        );
+      });
     const suggestion = this.resolveStoreTransferSuggestion({
       sourceProfile,
       products: mappedProducts,
@@ -3716,7 +3781,19 @@ export class WmsInventoryService {
       };
     },
     sourceStockPoolGroupId: string | null = null,
+    transferHistory?: {
+      forwardTransferCount: number;
+      reverseTransferCount: number;
+    },
   ) {
+    const alreadyPooled = Boolean(
+      sourceStockPoolGroupId
+      && profile.stockPoolGroupId
+      && profile.stockPoolGroupId === sourceStockPoolGroupId,
+    );
+    const forwardCount = transferHistory?.forwardTransferCount ?? 0;
+    const reverseCount = transferHistory?.reverseTransferCount ?? 0;
+    const priorTransferBatches = forwardCount + reverseCount;
     return {
       id: profile.id,
       profileId: profile.id,
@@ -3727,11 +3804,10 @@ export class WmsInventoryService {
       productCustomId: profile.posProduct.customId,
       name: profile.posProduct.name,
       label: profile.posProduct.name,
-      alreadyPooled: Boolean(
-        sourceStockPoolGroupId
-        && profile.stockPoolGroupId
-        && profile.stockPoolGroupId === sourceStockPoolGroupId,
-      ),
+      alreadyPooled,
+      recommendShareStockPool: !alreadyPooled && priorTransferBatches > 0,
+      priorTransferBatches,
+      bidirectionalTransferHistory: reverseCount > 0,
     };
   }
 
@@ -3798,6 +3874,25 @@ export class WmsInventoryService {
         profileId: savedProduct.profileId,
         label: savedProduct.label,
         reason: 'Saved mapping',
+        confidence: 'high',
+      };
+    }
+
+    const priorTransferredProduct = [...params.products]
+      .filter((product) => (product.priorTransferBatches ?? 0) > 0)
+      .sort((left, right) => {
+        const biDiff = Number(Boolean(right.bidirectionalTransferHistory)) - Number(Boolean(left.bidirectionalTransferHistory));
+        if (biDiff !== 0) return biDiff;
+        return (right.priorTransferBatches ?? 0) - (left.priorTransferBatches ?? 0);
+      })[0] ?? null;
+
+    if (priorTransferredProduct) {
+      return {
+        profileId: priorTransferredProduct.profileId,
+        label: priorTransferredProduct.label,
+        reason: priorTransferredProduct.bidirectionalTransferHistory
+          ? 'Previously transferred back and forth'
+          : 'Previously transferred variant',
         confidence: 'high',
       };
     }

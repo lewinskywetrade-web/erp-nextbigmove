@@ -788,6 +788,14 @@ describe('WmsFulfillmentSyncService line extraction & ISSUE recovery', () => {
         [],
       ),
     ).toBe(
+      'Order item in Pancake POS ("Custom freebie") is not linked to a catalog variation — link a product variation in POS to pick',
+    );
+    expect(
+      service.resolveEmptyFulfillmentIssueReason(
+        { items: [{ quantity: 1, variation_id: null }] },
+        [],
+      ),
+    ).toBe(
       'Order item in Pancake POS is not linked to a catalog variation — link a product variation in POS to pick',
     );
   });
@@ -1080,6 +1088,19 @@ describe('WmsFulfillmentSyncService POS shipped pick-status sync', () => {
         issueReason: null,
       }),
     });
+
+    expect(
+      service.resolveEmptyFulfillmentIssueReason({
+        items: [
+          {
+            quantity: 2,
+            variation_info: { name: 'Nourio Promo Pack' },
+          },
+        ],
+      } as any),
+    ).toBe(
+      'Order item in Pancake POS ("Nourio Promo Pack") is not linked to a catalog variation — link a product variation in POS to pick',
+    );
   });
 
   it('never puts an actively picked order into ISSUE status when POS changes or removes items, and includes active Pick/Pack orders in broad resyncs', async () => {

@@ -1,6 +1,7 @@
 import { InjectQueue, Process, Processor, OnQueueFailed } from '@nestjs/bull';
-import { Logger } from '@nestjs/common';
+import { Logger, OnModuleInit } from '@nestjs/common';
 import { Job, Queue } from 'bull';
+import { shouldRunPancakeWorkers } from '../../../common/runtime/process-role';
 import { IntegrationService } from '../integration.service';
 import {
   PANCAKE_WEBHOOK_AUTO_CANCEL_JOB,
@@ -34,7 +35,7 @@ const PANCAKE_REPORTS_HYDRATE_PROCESSOR_CONCURRENCY = positiveIntegerFromEnv(
 const QUEUE_METRICS_INTERVAL_MS = 30_000;
 
 @Processor(PANCAKE_WEBHOOK_QUEUE)
-export class PancakeWebhookQueueProcessor {
+export class PancakeWebhookQueueProcessor implements OnModuleInit {
   private readonly logger = new Logger(PancakeWebhookQueueProcessor.name);
   private lastQueueMetricsAt = 0;
 
@@ -43,6 +44,48 @@ export class PancakeWebhookQueueProcessor {
     @InjectQueue(PANCAKE_WEBHOOK_QUEUE)
     private readonly pancakeWebhookQueue: Queue,
   ) {}
+
+  onModuleInit() {
+    if (!shouldRunPancakeWorkers()) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      void this.purgeLegacyReportsNotAvailableFailedJobs();
+    }, 5_000);
+    timer.unref?.();
+  }
+
+  async purgeLegacyReportsNotAvailableFailedJobs(): Promise<number> {
+    if (typeof this.pancakeWebhookQueue?.getFailed !== 'function') {
+      return 0;
+    }
+    try {
+      const failedJobs = await this.pancakeWebhookQueue.getFailed(0, 2000);
+      let purged = 0;
+      for (const job of failedJobs) {
+        const reason = typeof job?.failedReason === 'string' ? job.failedReason : '';
+        if (reason.includes('reports_by_phone not available yet')) {
+          try {
+            await job.remove();
+            purged += 1;
+          } catch {
+            // Ignore race if job was already cleaned up
+          }
+        }
+      }
+      if (purged > 0) {
+        this.logger.log(
+          `Purged ${purged} legacy "reports_by_phone not available yet" failed jobs from ${PANCAKE_WEBHOOK_QUEUE}`,
+        );
+      }
+      return purged;
+    } catch (error) {
+      this.logger.warn(
+        `Skipped legacy reports_by_phone failed-job cleanup: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return 0;
+    }
+  }
 
   @Process({
     name: PANCAKE_WEBHOOK_JOB,

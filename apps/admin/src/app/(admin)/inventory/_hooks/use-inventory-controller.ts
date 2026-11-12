@@ -371,11 +371,13 @@ export function useInventoryController() {
     ),
   });
   const suggestedTargetProfileId = storeTransferOptionsQuery.data?.suggestion?.profileId ?? null;
-  const suggestedTargetAlreadyPooled = Boolean(
-    suggestedTargetProfileId
-    && storeTransferOptionsQuery.data?.products.find(
-      (product) => product.profileId === suggestedTargetProfileId,
-    )?.alreadyPooled,
+  const suggestedTargetProduct = suggestedTargetProfileId
+    ? storeTransferOptionsQuery.data?.products.find(
+        (product) => product.profileId === suggestedTargetProfileId,
+      ) ?? null
+    : null;
+  const suggestedTargetShouldPool = Boolean(
+    suggestedTargetProduct?.alreadyPooled || suggestedTargetProduct?.recommendShareStockPool,
   );
 
   useEffect(() => {
@@ -394,7 +396,7 @@ export function useInventoryController() {
         : {
             ...current,
             targetProfileId: suggestedTargetProfileId,
-            shareStockPool: suggestedTargetAlreadyPooled,
+            shareStockPool: suggestedTargetShouldPool,
           }
     ));
   }, [
@@ -402,7 +404,7 @@ export function useInventoryController() {
     storeTransferModal.targetStoreId,
     storeTransferModal.targetProfileId,
     suggestedTargetProfileId,
-    suggestedTargetAlreadyPooled,
+    suggestedTargetShouldPool,
   ]);
 
   const createTransferMutation = useMutation({
@@ -724,7 +726,9 @@ export function useInventoryController() {
       setStoreTransferModal((current) => ({
         ...current,
         targetProfileId,
-        shareStockPool: Boolean(matchedProduct?.alreadyPooled),
+        shareStockPool: Boolean(
+          matchedProduct?.alreadyPooled || matchedProduct?.recommendShareStockPool,
+        ),
         errorMessage: null,
       }));
     },

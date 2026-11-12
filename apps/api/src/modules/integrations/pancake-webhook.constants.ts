@@ -45,6 +45,7 @@ export interface PancakeWebhookReportsHydrateJobData {
   shopId: string;
   orderId: string;
   customerPhone: string;
+  attempt?: number;
   requestId?: string;
   logId?: string;
 }

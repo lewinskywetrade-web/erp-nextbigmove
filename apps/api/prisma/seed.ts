@@ -6,7 +6,9 @@ import {
   PrismaClient,
   RbacWorkspace,
   RoleScope,
+  WmsFulfillmentAmendmentStatus,
   WmsFulfillmentAssignmentMode,
+  WmsFulfillmentChangeState,
   WmsFulfillmentLineStatus,
   WmsFulfillmentOrderStatus,
   WmsInventoryUnitStatus,
@@ -5566,11 +5568,43 @@ async function reconcileToniosWmsFulfillmentQueue() {
         }
       }
 
-      // 3. Recompute BASKET_DEMAND readiness against eligible PUTAWAY BIN inventory units
+      // 3. Recompute BASKET_DEMAND readiness against eligible PUTAWAY BIN inventory units (Shared-Stock-Pool-aware)
+      const pooledProfileRows = await prisma.wmsProductProfile.findMany({
+        where: {
+          tenantId: store.tenantId,
+          stockPoolGroupId: { not: null },
+          status: { not: WmsProductProfileStatus.ARCHIVED },
+        },
+        select: {
+          storeId: true,
+          variationId: true,
+          stockPoolGroupId: true,
+        },
+      });
+      const rawPoolByGroup = new Map<string, Array<{ storeId: string; variationId: string }>>();
+      for (const row of pooledProfileRows) {
+        if (!row.stockPoolGroupId) continue;
+        const list = rawPoolByGroup.get(row.stockPoolGroupId) ?? [];
+        list.push({ storeId: row.storeId, variationId: row.variationId });
+        rawPoolByGroup.set(row.stockPoolGroupId, list);
+      }
+      const groupIdByStoreVar = new Map<string, string>();
+      const poolMembersByGroup = new Map<string, Array<{ storeId: string; variationId: string }>>();
+      for (const [gid, members] of rawPoolByGroup.entries()) {
+        if (members.length < 2) continue;
+        poolMembersByGroup.set(gid, members);
+        for (const m of members) {
+          groupIdByStoreVar.set(`${m.storeId}::${m.variationId}`, gid);
+        }
+      }
+      const buildToniosAllocKey = (whId: string, storeId: string, variationId: string) => {
+        const gid = groupIdByStoreVar.get(`${storeId}::${variationId}`);
+        return gid ? `${whId}::pool:${gid}` : `${whId}::${storeId}::${variationId}`;
+      };
+
       const putawayBinUnits = await prisma.wmsInventoryUnit.findMany({
         where: {
           tenantId: store.tenantId,
-          storeId: store.id,
           status: WmsInventoryUnitStatus.PUTAWAY,
           currentLocationId: { not: null },
           currentLocation: { is: { kind: WmsLocationKind.BIN, isActive: true } },
@@ -5580,26 +5614,33 @@ async function reconcileToniosWmsFulfillmentQueue() {
         },
         select: {
           warehouseId: true,
+          storeId: true,
           variationId: true,
           posWarehouseRef: true,
         },
       });
 
-      const activeHolds = await prisma.wmsBasketPickDemandBin.groupBy({
-        by: ['warehouseId', 'variationId'],
+      const activeHoldBins = await prisma.wmsBasketPickDemandBin.findMany({
         where: {
           tenantId: store.tenantId,
           basket: {
             status: { in: ['ASSIGNED', 'IN_PICKING', 'FULL_HELD'] },
           },
         },
-        _sum: { quantityTarget: true, quantityPicked: true },
+        select: {
+          warehouseId: true,
+          variationId: true,
+          quantityTarget: true,
+          quantityPicked: true,
+          demand: { select: { storeId: true } },
+        },
       });
-      const heldByWhVar = new Map<string, number>();
-      for (const hold of activeHolds) {
-        const held = Math.max((hold._sum.quantityTarget ?? 0) - (hold._sum.quantityPicked ?? 0), 0);
+      const heldByAllocKey = new Map<string, number>();
+      for (const hold of activeHoldBins) {
+        const held = Math.max((hold.quantityTarget ?? 0) - (hold.quantityPicked ?? 0), 0);
         if (held > 0) {
-          heldByWhVar.set(`${hold.warehouseId}::${hold.variationId}`, held);
+          const allocKey = buildToniosAllocKey(hold.warehouseId, hold.demand.storeId, hold.variationId);
+          heldByAllocKey.set(allocKey, (heldByAllocKey.get(allocKey) ?? 0) + held);
         }
       }
 
@@ -5631,15 +5672,24 @@ async function reconcileToniosWmsFulfillmentQueue() {
         orderBy: [{ posOrder: { dateLocal: 'asc' } }, { id: 'asc' }],
       });
 
-      const virtualUsedByWhVar = new Map<string, number>();
+      const virtualUsedByAllocKey = new Map<string, number>();
       const availableFor = (warehouseId: string, variationId: string, orderPosWhRef: string | null) => {
-        const rawCount = putawayBinUnits.filter((u) => (
-          u.warehouseId === warehouseId
-          && u.variationId === variationId
-          && (!orderPosWhRef || !u.posWarehouseRef || u.posWarehouseRef === orderPosWhRef)
-        )).length;
-        const held = heldByWhVar.get(`${warehouseId}::${variationId}`) ?? 0;
-        const used = virtualUsedByWhVar.get(`${warehouseId}::${variationId}`) ?? 0;
+        const allocKey = buildToniosAllocKey(warehouseId, store.id, variationId);
+        const gid = groupIdByStoreVar.get(`${store.id}::${variationId}`);
+        const rawCount = gid
+          ? putawayBinUnits.filter((u) => {
+              if (u.warehouseId !== warehouseId) return false;
+              const members = poolMembersByGroup.get(gid) ?? [];
+              return members.some((m) => m.storeId === u.storeId && m.variationId === u.variationId);
+            }).length
+          : putawayBinUnits.filter((u) => (
+              u.warehouseId === warehouseId
+              && u.storeId === store.id
+              && u.variationId === variationId
+              && (!orderPosWhRef || !u.posWarehouseRef || u.posWarehouseRef === orderPosWhRef)
+            )).length;
+        const held = heldByAllocKey.get(allocKey) ?? 0;
+        const used = virtualUsedByAllocKey.get(allocKey) ?? 0;
         return Math.max(rawCount - held - used, 0);
       };
 
@@ -5669,8 +5719,8 @@ async function reconcileToniosWmsFulfillmentQueue() {
 
         let orderTotal = 0;
         for (const line of activeLines) {
-          const key = `${fullWarehouseId}::${line.variationId}`;
-          virtualUsedByWhVar.set(key, (virtualUsedByWhVar.get(key) ?? 0) + line.quantityRequired);
+          const key = buildToniosAllocKey(fullWarehouseId, store.id, line.variationId);
+          virtualUsedByAllocKey.set(key, (virtualUsedByAllocKey.get(key) ?? 0) + line.quantityRequired);
           orderTotal += line.quantityRequired;
           await prisma.wmsFulfillmentLine.update({
             where: { id: line.id },
@@ -5721,8 +5771,8 @@ async function reconcileToniosWmsFulfillmentQueue() {
           const avail = bestWarehouseId ? availableFor(bestWarehouseId, line.variationId, order.posWarehouseRef) : 0;
           const alloc = Math.min(avail, line.quantityRequired);
           if (bestWarehouseId && alloc > 0) {
-            const key = `${bestWarehouseId}::${line.variationId}`;
-            virtualUsedByWhVar.set(key, (virtualUsedByWhVar.get(key) ?? 0) + alloc);
+            const key = buildToniosAllocKey(bestWarehouseId, store.id, line.variationId);
+            virtualUsedByAllocKey.set(key, (virtualUsedByAllocKey.get(key) ?? 0) + alloc);
           }
           orderTotal += line.quantityRequired;
           orderAlloc += alloc;
@@ -6686,9 +6736,265 @@ function deriveSeedEmptyIssueReason(
   return 'Order item in Pancake POS is not linked to a catalog variation — link a product variation in POS to pick';
 }
 
+async function reconcileToniosSharedStockPoolsAndQueue() {
+  try {
+    const toniosTenants = await prisma.tenant.findMany({
+      where: {
+        OR: [
+          { name: { contains: 'cristobal', mode: 'insensitive' } },
+          { slug: { contains: 'cristobal', mode: 'insensitive' } },
+          {
+            posStores: {
+              some: {
+                OR: [
+                  { name: { contains: 'tonios', mode: 'insensitive' } },
+                  { shopName: { contains: 'tonios', mode: 'insensitive' } },
+                ],
+              },
+            },
+          },
+        ],
+      },
+      select: {
+        id: true,
+        name: true,
+        slug: true,
+        wmsFulfillmentGoLiveAt: true,
+      },
+    });
+
+    if (toniosTenants.length === 0) {
+      return;
+    }
+
+    const now = new Date();
+    for (const tenant of toniosTenants) {
+      const posProducts = await prisma.posProduct.findMany({
+        where: {
+          variationId: { not: null },
+          store: { tenantId: tenant.id },
+        },
+        select: {
+          id: true,
+          storeId: true,
+          productId: true,
+          variationId: true,
+          warehouseId: true,
+        },
+      });
+      const stockablePosProducts = posProducts.filter(
+        (product) => Boolean(product.variationId) && product.variationId !== product.productId,
+      );
+      if (stockablePosProducts.length > 0) {
+        const existingRows = await prisma.wmsProductProfile.findMany({
+          where: { posProductId: { in: stockablePosProducts.map((p) => p.id) } },
+          select: { posProductId: true },
+        });
+        const existingSet = new Set(existingRows.map((row) => row.posProductId));
+        const missing = stockablePosProducts.filter((product) => !existingSet.has(product.id));
+        if (missing.length > 0) {
+          await prisma.wmsProductProfile.createMany({
+            data: missing.map((product) => ({
+              tenantId: tenant.id,
+              storeId: product.storeId,
+              posProductId: product.id,
+              productId: product.productId,
+              variationId: product.variationId!,
+              posWarehouseRef: product.warehouseId,
+              status: WmsProductProfileStatus.DEFAULT,
+              isSerialized: true,
+            })),
+            skipDuplicates: true,
+          });
+        }
+      }
+
+      const rawProfiles = await prisma.wmsProductProfile.findMany({
+        where: {
+          tenantId: tenant.id,
+          status: { not: WmsProductProfileStatus.ARCHIVED },
+        },
+        select: {
+          id: true,
+          storeId: true,
+          productId: true,
+          variationId: true,
+          stockPoolGroupId: true,
+          posProduct: {
+            select: {
+              productId: true,
+              variationId: true,
+            },
+          },
+        },
+      });
+      const profiles = rawProfiles.filter(
+        (p) =>
+          Boolean(p.variationId)
+          && p.variationId !== p.productId
+          && Boolean(p.posProduct.variationId)
+          && p.posProduct.variationId !== p.posProduct.productId,
+      );
+      const profileById = new Map(profiles.map((p) => [p.id, p]));
+      const profileByStoreVariation = new Map(
+        profiles.map((p) => [`${p.storeId}::${p.variationId}`, p]),
+      );
+
+      const transferItems = await prisma.wmsInventoryStoreTransferItem.findMany({
+        where: {
+          transfer: { tenantId: tenant.id },
+        },
+        select: {
+          fromProductProfileId: true,
+          toProductProfileId: true,
+          fromStoreId: true,
+          fromVariationId: true,
+          toStoreId: true,
+          toVariationId: true,
+        },
+      });
+
+      const directedEdges = new Set<string>();
+      for (const item of transferItems) {
+        const src =
+          (item.fromProductProfileId ? profileById.get(item.fromProductProfileId) : undefined)
+          ?? profileByStoreVariation.get(`${item.fromStoreId}::${item.fromVariationId}`);
+        const dst =
+          (item.toProductProfileId ? profileById.get(item.toProductProfileId) : undefined)
+          ?? profileByStoreVariation.get(`${item.toStoreId}::${item.toVariationId}`);
+        if (src && dst && src.id !== dst.id) {
+          directedEdges.add(`${src.id}::${dst.id}`);
+        }
+      }
+
+      const parentById = new Map<string, string>();
+      const findRoot = (id: string): string => {
+        let cur = id;
+        while (parentById.has(cur) && parentById.get(cur) !== cur) {
+          cur = parentById.get(cur)!;
+        }
+        if (!parentById.has(id)) {
+          parentById.set(id, id);
+        }
+        return cur;
+      };
+      const union = (a: string, b: string) => {
+        const ra = findRoot(a);
+        const rb = findRoot(b);
+        if (ra !== rb) {
+          parentById.set(rb, ra);
+        }
+      };
+
+      // Preserve existing groups first
+      const byExistingGroup = new Map<string, string[]>();
+      for (const p of profiles) {
+        if (!p.stockPoolGroupId) continue;
+        const list = byExistingGroup.get(p.stockPoolGroupId) ?? [];
+        list.push(p.id);
+        byExistingGroup.set(p.stockPoolGroupId, list);
+      }
+      for (const ids of byExistingGroup.values()) {
+        for (let i = 1; i < ids.length; i += 1) {
+          union(ids[0], ids[i]);
+        }
+      }
+
+      // Link any bidirectional Change Variant pair (transferred A -> B and B -> A)
+      for (const edge of directedEdges) {
+        const [leftId, rightId] = edge.split('::');
+        if (leftId && rightId && directedEdges.has(`${rightId}::${leftId}`)) {
+          union(leftId, rightId);
+        }
+      }
+
+      const components = new Map<string, string[]>();
+      for (const profileId of parentById.keys()) {
+        const root = findRoot(profileId);
+        const list = components.get(root) ?? [];
+        list.push(profileId);
+        components.set(root, list);
+      }
+
+      let newlyLinkedGroups = 0;
+      for (const memberIds of components.values()) {
+        if (memberIds.length < 2) continue;
+        const existingGroupIds = Array.from(
+          new Set(
+            memberIds
+              .map((id) => profileById.get(id)?.stockPoolGroupId)
+              .filter((gid): gid is string => Boolean(gid)),
+          ),
+        ).sort();
+        const canonicalGroupId = existingGroupIds[0] ?? randomUUID();
+        const needsUpdate = memberIds.some(
+          (id) => profileById.get(id)?.stockPoolGroupId !== canonicalGroupId,
+        );
+        if (needsUpdate) {
+          await prisma.wmsProductProfile.updateMany({
+            where: {
+              tenantId: tenant.id,
+              id: { in: memberIds },
+            },
+            data: {
+              stockPoolGroupId: canonicalGroupId,
+            },
+          });
+          newlyLinkedGroups += 1;
+        }
+      }
+
+      console.log(
+        '[TONIOS_POOL_RECONCILE]',
+        JSON.stringify({
+          tenantId: tenant.id,
+          tenantName: tenant.name,
+          transferItemCount: transferItems.length,
+          newlyLinkedGroups,
+        }),
+      );
+    }
+  } catch (err: any) {
+    console.error(
+      'Warning during Tonios shared stock pool reconciliation:',
+      err?.message || err,
+    );
+  }
+}
+
 async function reconcileAllWmsIssueOrdersOnStartup() {
   try {
     const now = new Date();
+    // Resolve any dangling OPEN amendments on unbasketed 0-picked orders across all tenants
+    const staleAmendedUnbasketedOrders = await prisma.wmsFulfillmentOrder.findMany({
+      where: {
+        basketId: null,
+        pickedQuantity: 0,
+        OR: [
+          { changeState: { not: WmsFulfillmentChangeState.NONE } },
+          { amendments: { some: { status: WmsFulfillmentAmendmentStatus.OPEN } } },
+        ],
+      },
+      select: { id: true },
+    });
+    if (staleAmendedUnbasketedOrders.length > 0) {
+      const staleOrderIds = staleAmendedUnbasketedOrders.map((o) => o.id);
+      await prisma.wmsFulfillmentAmendment.updateMany({
+        where: {
+          fulfillmentOrderId: { in: staleOrderIds },
+          status: WmsFulfillmentAmendmentStatus.OPEN,
+        },
+        data: {
+          status: WmsFulfillmentAmendmentStatus.RESOLVED,
+          resolvedAt: now,
+        },
+      });
+      await prisma.wmsFulfillmentOrder.updateMany({
+        where: { id: { in: staleOrderIds } },
+        data: { changeState: WmsFulfillmentChangeState.NONE },
+      });
+    }
+
     const issueOrders = await prisma.wmsFulfillmentOrder.findMany({
       where: {
         status: WmsFulfillmentOrderStatus.ISSUE,
@@ -6718,6 +7024,49 @@ async function reconcileAllWmsIssueOrdersOnStartup() {
         lines: true,
       },
     });
+
+    const poolCacheByTenant = new Map<
+      string,
+      {
+        groupByStoreVar: Map<string, string>;
+        membersByGroup: Map<string, Array<{ storeId: string; variationId: string }>>;
+      }
+    >();
+    const getTenantPoolLookup = async (tenantId: string) => {
+      const cached = poolCacheByTenant.get(tenantId);
+      if (cached) return cached;
+      const pooledRows = await prisma.wmsProductProfile.findMany({
+        where: {
+          tenantId,
+          stockPoolGroupId: { not: null },
+          status: { not: WmsProductProfileStatus.ARCHIVED },
+        },
+        select: {
+          storeId: true,
+          variationId: true,
+          stockPoolGroupId: true,
+        },
+      });
+      const rawByGroup = new Map<string, Array<{ storeId: string; variationId: string }>>();
+      for (const row of pooledRows) {
+        if (!row.stockPoolGroupId) continue;
+        const list = rawByGroup.get(row.stockPoolGroupId) ?? [];
+        list.push({ storeId: row.storeId, variationId: row.variationId });
+        rawByGroup.set(row.stockPoolGroupId, list);
+      }
+      const groupByStoreVar = new Map<string, string>();
+      const membersByGroup = new Map<string, Array<{ storeId: string; variationId: string }>>();
+      for (const [gid, members] of rawByGroup.entries()) {
+        if (members.length < 2) continue;
+        membersByGroup.set(gid, members);
+        for (const m of members) {
+          groupByStoreVar.set(`${m.storeId}::${m.variationId}`, gid);
+        }
+      }
+      const built = { groupByStoreVar, membersByGroup };
+      poolCacheByTenant.set(tenantId, built);
+      return built;
+    };
 
     let canceledCount = 0;
     let packedShippedCount = 0;
@@ -6827,56 +7176,90 @@ async function reconcileAllWmsIssueOrdersOnStartup() {
         (line) => line.status !== WmsFulfillmentLineStatus.CANCELED && line.quantityRequired > 0,
       );
 
-      if (order.posOrder.status === 1 && activeLines.length > 0) {
+      if ([1, 9, 12].includes(order.posOrder.status) && activeLines.length > 0) {
+        const poolLookup = await getTenantPoolLookup(order.tenantId);
+        const scopePairs = new Map<string, { storeId: string; variationId: string }>();
+        for (const line of activeLines) {
+          const gid = poolLookup.groupByStoreVar.get(`${order.storeId}::${line.variationId}`);
+          if (gid) {
+            for (const member of poolLookup.membersByGroup.get(gid) ?? []) {
+              scopePairs.set(`${member.storeId}::${member.variationId}`, member);
+            }
+          } else {
+            scopePairs.set(`${order.storeId}::${line.variationId}`, {
+              storeId: order.storeId,
+              variationId: line.variationId,
+            });
+          }
+        }
+        const scopeOrClauses = Array.from(scopePairs.values());
+
         const [putawayUnits, heldBins] = await Promise.all([
           prisma.wmsInventoryUnit.findMany({
             where: {
               tenantId: order.tenantId,
-              storeId: order.storeId,
-              variationId: { in: activeLines.map((line) => line.variationId) },
+              OR: scopeOrClauses,
               status: WmsInventoryUnitStatus.PUTAWAY,
               currentLocationId: { not: null },
               currentLocation: { is: { kind: WmsLocationKind.BIN, isActive: true } },
-              OR: [{ expirationDate: null }, { expirationDate: { gt: now } }],
+              AND: [{ OR: [{ expirationDate: null }, { expirationDate: { gt: now } }] }],
               pickReservations: { none: { status: { in: ['RESERVED', 'PICKED'] } } },
               basketUnits: { none: { status: { in: ['PICKED', 'PACKED'] } } },
             },
             select: {
               warehouseId: true,
+              storeId: true,
               variationId: true,
+              posWarehouseRef: true,
             },
           }),
           prisma.wmsBasketPickDemandBin.findMany({
             where: {
               tenantId: order.tenantId,
-              variationId: { in: activeLines.map((line) => line.variationId) },
               basket: {
                 status: { in: ['ASSIGNED', 'IN_PICKING', 'FULL_HELD'] },
               },
-              demand: {
-                storeId: order.storeId,
-              },
+              OR: scopeOrClauses.map((pair) => ({
+                variationId: pair.variationId,
+                demand: { storeId: pair.storeId },
+              })),
             },
             select: {
               warehouseId: true,
               variationId: true,
               quantityTarget: true,
               quantityPicked: true,
+              demand: { select: { storeId: true } },
             },
           }),
         ]);
-        const heldByWarehouseVariation = new Map<string, number>();
+        const buildPoolKey = (whId: string, storeId: string, variationId: string) => {
+          const gid = poolLookup.groupByStoreVar.get(`${storeId}::${variationId}`);
+          return gid ? `${whId}::pool:${gid}` : `${whId}::${storeId}::${variationId}`;
+        };
+        const heldByAllocKey = new Map<string, number>();
         for (const hold of heldBins) {
           const remainingHold = Math.max((hold.quantityTarget ?? 0) - (hold.quantityPicked ?? 0), 0);
           if (remainingHold <= 0) continue;
-          const key = `${hold.warehouseId}::${hold.variationId}`;
-          heldByWarehouseVariation.set(key, (heldByWarehouseVariation.get(key) ?? 0) + remainingHold);
+          const key = buildPoolKey(hold.warehouseId, hold.demand.storeId, hold.variationId);
+          heldByAllocKey.set(key, (heldByAllocKey.get(key) ?? 0) + remainingHold);
         }
         const netAvailableInWarehouse = (whId: string, variationId: string) => {
-          const raw = putawayUnits.filter(
-            (u) => u.warehouseId === whId && u.variationId === variationId,
-          ).length;
-          const held = heldByWarehouseVariation.get(`${whId}::${variationId}`) ?? 0;
+          const gid = poolLookup.groupByStoreVar.get(`${order.storeId}::${variationId}`);
+          const raw = gid
+            ? putawayUnits.filter((u) => {
+                if (u.warehouseId !== whId) return false;
+                const members = poolLookup.membersByGroup.get(gid) ?? [];
+                return members.some((m) => m.storeId === u.storeId && m.variationId === u.variationId);
+              }).length
+            : putawayUnits.filter(
+                (u) =>
+                  u.warehouseId === whId
+                  && u.storeId === order.storeId
+                  && u.variationId === variationId
+                  && (!order.posWarehouseRef || !u.posWarehouseRef || u.posWarehouseRef === order.posWarehouseRef),
+              ).length;
+          const held = heldByAllocKey.get(buildPoolKey(whId, order.storeId, variationId)) ?? 0;
           return Math.max(raw - held, 0);
         };
 
@@ -7027,6 +7410,8 @@ async function main() {
   await syncToniosPosConnectionAndOrders();
   await reconcileToniosWmsFulfillmentQueue();
   await logOpenWmsIssueOrdersDiagnostic('[WMS_ISSUE_DIAG_BEFORE]');
+  await reconcileToniosSharedStockPoolsAndQueue();
+  await reconcileToniosWmsFulfillmentQueue();
   await reconcileFamcoSharedStockPoolsAndQueue();
   await reconcileAllWmsIssueOrdersOnStartup();
   await logOpenWmsIssueOrdersDiagnostic('[WMS_ISSUE_DIAG_AFTER]');

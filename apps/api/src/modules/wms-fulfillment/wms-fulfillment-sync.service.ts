@@ -598,6 +598,24 @@ export class WmsFulfillmentSyncService {
           );
 
         if ((!hasNewSourceRevision || isInitialHashBackfill) && !shouldRecoverUnbasketedIssueOrder) {
+          const shouldClearStaleUnbasketedAmendment =
+            !existing.basketId
+            && existing.pickedQuantity === 0
+            && existing.changeState !== WmsFulfillmentChangeState.NONE;
+
+          if (shouldClearStaleUnbasketedAmendment) {
+            await tx.wmsFulfillmentAmendment.updateMany({
+              where: {
+                fulfillmentOrderId: existing.id,
+                status: WmsFulfillmentAmendmentStatus.OPEN,
+              },
+              data: {
+                status: WmsFulfillmentAmendmentStatus.RESOLVED,
+                resolvedAt: new Date(),
+              },
+            });
+          }
+
           if (shouldRecoverTransientCancellation) {
             await tx.wmsFulfillmentLine.updateMany({
               where: {
@@ -616,6 +634,9 @@ export class WmsFulfillmentSyncService {
             data: {
               sourceItemsHash,
               sourceRevision: Math.max(lockedRevision.sourceRevision, 1),
+              ...(shouldClearStaleUnbasketedAmendment
+                ? { changeState: WmsFulfillmentChangeState.NONE }
+                : {}),
               ...(shouldRecoverTransientCancellation
                 ? {
                     status: WmsFulfillmentOrderStatus.RESTOCKING,
@@ -862,6 +883,17 @@ export class WmsFulfillmentSyncService {
               diff: amendment.summary as Prisma.InputJsonValue,
               requiredActions: amendment.requiredActions as Prisma.InputJsonValue,
               resolvedAt: amendment.changeState === WmsFulfillmentChangeState.NONE ? new Date() : null,
+            },
+          });
+        } else if (!existing.basketId && existing.pickedQuantity === 0 && amendment.changeState === WmsFulfillmentChangeState.NONE) {
+          await tx.wmsFulfillmentAmendment.updateMany({
+            where: {
+              fulfillmentOrderId: existing.id,
+              status: WmsFulfillmentAmendmentStatus.OPEN,
+            },
+            data: {
+              status: WmsFulfillmentAmendmentStatus.RESOLVED,
+              resolvedAt: new Date(),
             },
           });
         }
@@ -5386,6 +5418,28 @@ export class WmsFulfillmentSyncService {
       })
     ) {
       return 'All order line items are marked returned in Pancake POS';
+    }
+
+    const unlinkedNames = Array.from(
+      new Set(
+        objectItems
+          .map((item) => {
+            const varInfo = this.asJsonRecord(item.variation_info);
+            const candidate =
+              varInfo?.name
+              ?? item.variationName
+              ?? item.product_name
+              ?? item.note_product
+              ?? item.name;
+            return typeof candidate === 'string' && candidate.trim().length > 0
+              ? candidate.trim()
+              : null;
+          })
+          .filter((name): name is string => Boolean(name)),
+      ),
+    );
+    if (unlinkedNames.length > 0) {
+      return `Order item in Pancake POS ("${unlinkedNames.slice(0, 2).join(', ')}") is not linked to a catalog variation — link a product variation in POS to pick`;
     }
 
     return 'Order item in Pancake POS is not linked to a catalog variation — link a product variation in POS to pick';

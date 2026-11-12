@@ -1025,11 +1025,24 @@ export class IntegrationService {
 
   private async enqueueReportsHydrateJob(
     data: PancakeWebhookReportsHydrateJobData,
+    options?: { delayMs?: number },
   ): Promise<void> {
-    await this.pancakeWebhookQueue.add(PANCAKE_WEBHOOK_REPORTS_HYDRATE_JOB, data, {
-      jobId: `pancake-reports-hydrate:${data.tenantId}:${data.shopId}:${data.orderId}`,
-      ...this.getPancakeReportsHydrateQueueJobOptions(),
-    });
+    const attempt = Math.max(1, Math.floor(Number(data.attempt || 1)));
+    const baseOptions = this.getPancakeReportsHydrateQueueJobOptions();
+    const jobId = attempt > 1
+      ? `pancake-reports-hydrate:${data.tenantId}:${data.shopId}:${data.orderId}:a${attempt}`
+      : `pancake-reports-hydrate:${data.tenantId}:${data.shopId}:${data.orderId}`;
+    await this.pancakeWebhookQueue.add(
+      PANCAKE_WEBHOOK_REPORTS_HYDRATE_JOB,
+      { ...data, attempt },
+      {
+        jobId,
+        ...baseOptions,
+        delay: typeof options?.delayMs === 'number'
+          ? Math.max(0, Math.floor(options.delayMs))
+          : baseOptions.delay,
+      },
+    );
   }
 
   async processPancakeAutoCancelJob(
@@ -1213,10 +1226,39 @@ export class IntegrationService {
       jobData.orderId,
     );
     if (!reportsResult.metrics) {
-      throw new Error(
-        reportsResult.warning ||
-          `reports_by_phone not available yet for shop_id=${jobData.shopId} order_id=${jobData.orderId}`,
+      if (reportsResult.warning === 'Missing valid customer phone for reports_by_phone lookup') {
+        return { success: false, reason: 'INVALID_PHONE', hydrated: false };
+      }
+      if (reportsResult.warning) {
+        throw new Error(reportsResult.warning);
+      }
+
+      const attempt = Math.max(1, Math.floor(Number(jobData.attempt || 1)));
+      const maxAttempts = Math.max(
+        1,
+        Number(process.env.PANCAKE_REPORTS_HYDRATE_QUEUE_ATTEMPTS || 8),
       );
+      if (attempt < maxAttempts) {
+        const baseBackoffMs = Math.max(
+          1000,
+          Number(process.env.PANCAKE_REPORTS_HYDRATE_QUEUE_BACKOFF_MS || 15000),
+        );
+        const nextDelayMs = Math.min(10 * 60_000, baseBackoffMs * Math.pow(2, attempt - 1));
+        try {
+          await this.enqueueReportsHydrateJob(
+            { ...jobData, attempt: attempt + 1 },
+            { delayMs: nextDelayMs },
+          );
+        } catch (enqueueErr: any) {
+          const msg = (enqueueErr?.message || '').toString().toLowerCase();
+          if (!(msg.includes('job') && msg.includes('exist'))) {
+            throw enqueueErr;
+          }
+        }
+        return { success: false, reason: 'REPORTS_NOT_READY_REQUEUED', hydrated: false };
+      }
+
+      return { success: false, reason: 'REPORTS_NOT_AVAILABLE', hydrated: false };
     }
 
     await this.prisma.posOrder.updateMany({
