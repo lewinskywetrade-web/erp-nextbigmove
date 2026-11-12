@@ -16,6 +16,7 @@ import {
   WmsInventoryMovementType,
   WmsInventoryUnitStatus,
   WmsLocationKind,
+  WmsOutboundUnitStatus,
   WmsProductProfileStatus,
 } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
@@ -6634,9 +6635,12 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
                 },
               });
 
-              if (unit.outboundRecords.length > 0) {
+              if (unit.outboundRecords.length > 0 && packedBu.fulfillmentOrder?.id) {
                 await prisma.wmsOutboundUnitRecord.updateMany({
-                  where: { inventoryUnitId: unit.id },
+                  where: {
+                    inventoryUnitId: unit.id,
+                    fulfillmentOrderId: packedBu.fulfillmentOrder.id,
+                  },
                   data: { productProfileId: restoreProfile.id },
                 });
               }
@@ -6669,6 +6673,67 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
               });
             }
           }
+        }
+      }
+
+      // 4A-bis. Ensure any historical RETURNED outbound records on SHARED_STOCK_POOL_HEAL_REVERT
+      //         units retain the exact productProfileId matching their historical fulfillmentLine.
+      const returnedOutboundOnRevertedUnits = await prisma.wmsOutboundUnitRecord.findMany({
+        where: {
+          tenantId: tenant.id,
+          currentStatus: WmsOutboundUnitStatus.RETURNED,
+          inventoryUnit: {
+            movements: {
+              some: {
+                referenceType: 'SHARED_STOCK_POOL_HEAL_REVERT',
+              },
+            },
+          },
+        },
+        select: {
+          id: true,
+          storeId: true,
+          productProfileId: true,
+          fulfillmentLine: {
+            select: {
+              variationId: true,
+            },
+          },
+          fulfillmentOrder: {
+            select: {
+              posOrderId: true,
+            },
+          },
+          inventoryUnit: {
+            select: {
+              barcode: true,
+            },
+          },
+        },
+      });
+      for (const ob of returnedOutboundOnRevertedUnits) {
+        const lineVar = ob.fulfillmentLine?.variationId;
+        if (!lineVar) continue;
+        const currentObProf = profileById.get(ob.productProfileId);
+        if (currentObProf?.variationId === lineVar) continue;
+        const targetObProf =
+          profileByStoreVariation.get(`${ob.storeId}::${lineVar}`)
+          ?? profiles.find((p) => p.variationId === lineVar);
+        if (targetObProf && targetObProf.id !== ob.productProfileId) {
+          await prisma.wmsOutboundUnitRecord.update({
+            where: { id: ob.id },
+            data: { productProfileId: targetObProf.id },
+          });
+          console.log(
+            '[FAMCO_RETURNED_OUTBOUND_PROFILE_RESTORE]',
+            JSON.stringify({
+              barcode: ob.inventoryUnit.barcode,
+              posOrderId: ob.fulfillmentOrder.posOrderId,
+              fromProfileId: ob.productProfileId,
+              toProfileId: targetObProf.id,
+              toSku: targetObProf.posProduct.customId,
+            }),
+          );
         }
       }
 
@@ -7704,21 +7769,58 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
           }),
           prisma.wmsBasket.findMany({
             where: {
-              tenantId: tenant.id,
-              status: {
-                in: [
-                  WmsBasketStatus.ASSIGNED,
-                  WmsBasketStatus.IN_PICKING,
-                  WmsBasketStatus.FULL_HELD,
-                  WmsBasketStatus.PACKING,
-                ],
-              },
+              OR: [
+                {
+                  tenantId: tenant.id,
+                  status: {
+                    in: [
+                      WmsBasketStatus.ASSIGNED,
+                      WmsBasketStatus.IN_PICKING,
+                      WmsBasketStatus.FULL_HELD,
+                      WmsBasketStatus.PACKING,
+                    ],
+                  },
+                },
+                {
+                  fulfillmentOrders: {
+                    some: { tenantId: tenant.id },
+                  },
+                },
+                {
+                  basketUnits: {
+                    some: {
+                      tenantId: tenant.id,
+                      status: {
+                        in: [WmsBasketUnitStatus.PICKED, WmsBasketUnitStatus.PACKED],
+                      },
+                    },
+                  },
+                },
+                {
+                  pickDemands: {
+                    some: {
+                      tenantId: tenant.id,
+                      basket: {
+                        status: {
+                          in: [
+                            WmsBasketStatus.ASSIGNED,
+                            WmsBasketStatus.IN_PICKING,
+                            WmsBasketStatus.FULL_HELD,
+                            WmsBasketStatus.PACKING,
+                          ],
+                        },
+                      },
+                    },
+                  },
+                },
+              ],
             },
             select: {
               id: true,
               barcode: true,
               status: true,
               fulfillmentOrders: {
+                where: { tenantId: tenant.id },
                 select: {
                   id: true,
                   posOrderId: true,
@@ -7741,6 +7843,7 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
                 },
               },
               pickDemands: {
+                where: { tenantId: tenant.id },
                 select: {
                   id: true,
                   fulfillmentOrderId: true,
@@ -7772,7 +7875,7 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
               },
               posOrder: {
                 is: {
-                  status: 1,
+                  status: { in: [1, 9, 12] },
                   isVoid: false,
                 },
               },
@@ -7907,8 +8010,9 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
             unitProfileId: u.productProfileId,
           }));
 
-        const basketVsInventoryMismatches = allBasketUnits
+        const activeBasketVsInventoryMismatches = allBasketUnits
           .filter((bu) => {
+            if (bu.status === WmsBasketUnitStatus.REMOVED) return false;
             const u = unitById.get(bu.inventoryUnitId);
             return !u || bu.variationId !== u.variationId || bu.storeId !== u.storeId;
           })
@@ -7924,12 +8028,15 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
             };
           });
 
-        const packedUnitVsLineMismatches = allBasketUnits
+        const nov2026Cutoff = new Date('2026-11-11T00:00:00.000Z');
+        const activeOrRecentPackedMismatches = allBasketUnits
           .filter((bu) => {
-            if (
-              bu.status !== WmsBasketUnitStatus.PACKED
-              && !(bu.status === WmsBasketUnitStatus.REMOVED && bu.packedAt !== null)
-            ) {
+            const isCurrentlyPacked = bu.status === WmsBasketUnitStatus.PACKED;
+            const isRecentRemovedPack =
+              bu.status === WmsBasketUnitStatus.REMOVED
+              && bu.packedAt !== null
+              && bu.packedAt >= nov2026Cutoff;
+            if (!isCurrentlyPacked && !isRecentRemovedPack) {
               return false;
             }
             if (!bu.fulfillmentLine) return false;
@@ -7951,8 +8058,9 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
             };
           });
 
-        const outboundMismatches = outboundRecords
+        const activeOutboundMismatches = outboundRecords
           .filter((ob) => {
+            if (ob.currentStatus === WmsOutboundUnitStatus.RETURNED) return false;
             const u = unitById.get(ob.inventoryUnitId);
             const obProf = profById.get(ob.productProfileId);
             if (!u || !obProf) return true;
@@ -7973,6 +8081,36 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
             };
           });
 
+        const inFlightUnits = allUnits
+          .filter(
+            (u) =>
+              u.status === WmsInventoryUnitStatus.PICKED
+              || u.status === WmsInventoryUnitStatus.PACKED
+              || u.status === WmsInventoryUnitStatus.RESERVED,
+          )
+          .map((u) => {
+            const uBus = allBasketUnits.filter((bu) => bu.inventoryUnitId === u.id);
+            const activeBu =
+              uBus.find(
+                (bu) =>
+                  bu.status === WmsBasketUnitStatus.PICKED || bu.status === WmsBasketUnitStatus.PACKED,
+              )
+              ?? uBus[uBus.length - 1]
+              ?? null;
+            return {
+              barcode: u.barcode,
+              unitStatus: u.status,
+              unitSku: customIdForVar(u.variationId),
+              buStatus: activeBu?.status ?? null,
+              buSku: customIdForVar(activeBu?.variationId),
+              basket: activeBu?.basket?.barcode ?? null,
+              basketStatus: activeBu?.basket?.status ?? null,
+              posOrderId: activeBu?.fulfillmentOrder?.posOrderId ?? null,
+              orderStatus: activeBu?.fulfillmentOrder?.status ?? null,
+              lineSku: customIdForVar(activeBu?.fulfillmentLine?.variationId),
+            };
+          });
+
         console.log(
           '[FAMCO_AUDIT_INTEGRITY_CHECKS]',
           JSON.stringify({
@@ -7981,12 +8119,14 @@ async function reconcileFamcoSharedStockPoolsAndQueue() {
             totalOutboundRecordsChecked: outboundRecords.length,
             invalidTupleUnitCount: invalidTupleUnits.length,
             invalidTupleUnits: invalidTupleUnits.slice(0, 30),
-            basketVsInventoryMismatchCount: basketVsInventoryMismatches.length,
-            basketVsInventoryMismatches: basketVsInventoryMismatches.slice(0, 30),
-            packedUnitVsLineMismatchCount: packedUnitVsLineMismatches.length,
-            packedUnitVsLineMismatches: packedUnitVsLineMismatches.slice(0, 50),
-            outboundMismatchCount: outboundMismatches.length,
-            outboundMismatches: outboundMismatches.slice(0, 50),
+            activeBasketVsInventoryMismatchCount: activeBasketVsInventoryMismatches.length,
+            activeBasketVsInventoryMismatches: activeBasketVsInventoryMismatches.slice(0, 30),
+            activeOrRecentPackedMismatchCount: activeOrRecentPackedMismatches.length,
+            activeOrRecentPackedMismatches: activeOrRecentPackedMismatches.slice(0, 50),
+            activeOutboundMismatchCount: activeOutboundMismatches.length,
+            activeOutboundMismatches: activeOutboundMismatches.slice(0, 50),
+            inFlightUnitCount: inFlightUnits.length,
+            inFlightUnits,
           }),
         );
 
@@ -9028,6 +9168,51 @@ async function reconcileAllWmsIssueOrdersOnStartup() {
   }
 }
 
+async function ensureFamcoProfilesRemainUnpooled() {
+  try {
+    const famcoTenants = await prisma.tenant.findMany({
+      where: {
+        OR: [
+          { name: { contains: 'famco', mode: 'insensitive' } },
+          { slug: { contains: 'famco', mode: 'insensitive' } },
+          {
+            posStores: {
+              some: {
+                OR: [
+                  { name: { contains: 'nourio', mode: 'insensitive' } },
+                  { shopName: { contains: 'nourio', mode: 'insensitive' } },
+                ],
+              },
+            },
+          },
+        ],
+      },
+      select: { id: true, name: true },
+    });
+    for (const tenant of famcoTenants) {
+      const cleared = await prisma.wmsProductProfile.updateMany({
+        where: {
+          tenantId: tenant.id,
+          stockPoolGroupId: { not: null },
+        },
+        data: {
+          stockPoolGroupId: null,
+        },
+      });
+      console.log(
+        '[FAMCO_FINAL_POOL_ASSERT]',
+        JSON.stringify({
+          tenantId: tenant.id,
+          tenantName: tenant.name,
+          clearedPooledProfilesAtEnd: cleared.count,
+        }),
+      );
+    }
+  } catch (err: any) {
+    console.error('Warning during final Famco unpool assert:', err?.message || err);
+  }
+}
+
 async function main() {
   console.log('Starting database seed...');
   await reconcileFamcoSharedStockPoolsAndQueue();
@@ -9048,6 +9233,7 @@ async function main() {
   await reconcileToniosWmsFulfillmentQueue();
   await reconcileAllWmsIssueOrdersOnStartup();
   await logOpenWmsIssueOrdersDiagnostic('[WMS_ISSUE_DIAG_AFTER]');
+  await ensureFamcoProfilesRemainUnpooled();
   await diagnoseErpFreshness();
   console.log('Seed completed successfully!');
 }

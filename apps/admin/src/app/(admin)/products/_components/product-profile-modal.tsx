@@ -235,12 +235,20 @@ export function ProductProfileModal({
         type="button"
         disabled={inputsDisabled}
         onClick={async () => {
+          const initialLinkedIds = Array.from(
+            new Set((profile.linkedProfiles ?? []).map((peer) => peer.profileId)),
+          ).sort();
+          const currentLinkedIds = Array.from(new Set(formState.linkedProfileIds)).sort();
+          const linkedProfilesChanged =
+            initialLinkedIds.length !== currentLinkedIds.length
+            || initialLinkedIds.some((id, index) => id !== currentLinkedIds[index]);
+          const { linkedProfileIds: _omittedLinkedProfileIds, ...restFormState } = formState;
           await onSubmit({
-            ...formState,
+            ...restFormState,
             inhouseUnitCost: toOptionalNumber(formState.inhouseUnitCost),
             supplierUnitCost: toOptionalNumber(formState.supplierUnitCost),
             notes: formState.notes?.trim() ? formState.notes.trim() : null,
-            linkedProfileIds: formState.linkedProfileIds,
+            ...(linkedProfilesChanged ? { linkedProfileIds: currentLinkedIds } : {}),
           });
         }}
         className="btn btn-md btn-primary"
