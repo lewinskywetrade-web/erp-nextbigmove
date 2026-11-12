@@ -40,6 +40,7 @@ import { WmsFulfillmentSyncService } from './wms-fulfillment-sync.service';
 import {
   EMPTY_STOCK_POOL_INDEX,
   loadTenantStockPoolIndex,
+  restoreUnitPrePoolVariantOnPutawayTx,
   type TenantStockPoolIndex,
 } from './wms-stock-pool.util';
 
@@ -3441,6 +3442,12 @@ export class WmsFulfillmentOpsService {
     });
 
     if (inventoryUpdate.count === 1) {
+      if (targetStatus === WmsInventoryUnitStatus.PUTAWAY) {
+        await restoreUnitPrePoolVariantOnPutawayTx(tx, {
+          inventoryUnitId: params.inventoryUnitId,
+          actorId: params.actorId,
+        });
+      }
       return true;
     }
 

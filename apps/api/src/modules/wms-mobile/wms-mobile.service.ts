@@ -51,6 +51,7 @@ import { WmsFulfillmentSyncService } from '../wms-fulfillment/wms-fulfillment-sy
 import {
   EMPTY_STOCK_POOL_INDEX,
   loadTenantStockPoolIndex,
+  restoreUnitPrePoolVariantOnPutawayTx,
   type TenantStockPoolIndex,
 } from '../wms-fulfillment/wms-stock-pool.util';
 import {
@@ -5376,6 +5377,31 @@ export class WmsMobileService {
             throw new ConflictException(`Unit ${scannedUnit.code} is no longer ready for packing`);
           }
 
+          if (
+            isCrossVariantPack
+            && targetPoolMember
+            && scannedUnit.variationId !== targetPoolMember.variationId
+          ) {
+            await tx.wmsInventoryMovement.create({
+              data: {
+                tenantId: scopedOrder.tenantId,
+                inventoryUnitId: scannedUnit.id,
+                warehouseId: scannedUnit.warehouseId,
+                fromLocationId: scannedUnit.currentLocationId,
+                toLocationId: scannedUnit.currentLocationId,
+                fromStatus: scannedUnit.status,
+                toStatus: scannedUnit.status,
+                movementType: WmsInventoryMovementType.ADJUSTMENT,
+                referenceType: 'SHARED_STOCK_POOL',
+                referenceId: scopedOrder.id,
+                referenceCode: scopedOrder.posOrderId,
+                notes: `Auto-assigned from shared stock pool on pack (${scannedUnit.variationId} -> ${targetPoolMember.variationId})`,
+                actorId: userId,
+                createdAt: now,
+              },
+            });
+          }
+
           await tx.wmsInventoryMovement.create({
             data: {
               tenantId: scopedOrder.tenantId,
@@ -9160,6 +9186,11 @@ export class WmsMobileService {
           currentLocationId: destinationBinId,
           updatedById: userId,
         },
+      });
+      await restoreUnitPrePoolVariantOnPutawayTx(tx, {
+        inventoryUnitId,
+        actorId: userId,
+        now,
       });
       await tx.wmsBasketUnit.update({
         where: { id: basketUnit.id },

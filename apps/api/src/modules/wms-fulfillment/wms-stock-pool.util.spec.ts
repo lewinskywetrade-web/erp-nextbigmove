@@ -1,11 +1,16 @@
 import { describe, expect, it, jest } from '@jest/globals';
-import { WmsBasketStatus, WmsFulfillmentOrderStatus } from '@prisma/client';
+import {
+  WmsBasketStatus,
+  WmsFulfillmentOrderStatus,
+  WmsInventoryUnitStatus,
+} from '@prisma/client';
 import {
   TenantStockPoolIndex,
   areProfilesCompatibleForStockPool,
   linkProfilesIntoSharedStockPoolTx,
   loadTenantStockPoolIndex,
   resolveStockPoolProductFamilyKey,
+  restoreUnitPrePoolVariantOnPutawayTx,
   syncProfileStockPoolLinksTx,
 } from './wms-stock-pool.util';
 
@@ -299,6 +304,79 @@ describe('wms-stock-pool.util', () => {
 
       expect(areProfilesCompatibleForStockPool(oldBodyWash, newBodyWash)).toBe(true);
       expect(areProfilesCompatibleForStockPool(newBodyWash, hairPomade)).toBe(false);
+    });
+  });
+
+  describe('restoreUnitPrePoolVariantOnPutawayTx', () => {
+    it('restores original variant when a pool-reassigned unit is returned to putaway', async () => {
+      const unitUpdate = jest.fn(async () => ({ id: 'unit-1' }));
+      const movementCreate = jest.fn(async () => ({ id: 'mov-revert' }));
+
+      const result = await restoreUnitPrePoolVariantOnPutawayTx(
+        {
+          wmsInventoryMovement: {
+            findMany: jest.fn(async () => [
+              {
+                referenceType: 'SHARED_STOCK_POOL',
+                notes: 'Auto-assigned from shared stock pool on pick (var-orig -> var-target)',
+                createdAt: new Date('2026-11-12T05:00:00Z'),
+              },
+            ]) as never,
+            findFirst: jest.fn(async () => ({
+              createdAt: new Date('2026-11-11T01:00:00Z'),
+            })) as never,
+            create: movementCreate as never,
+          },
+          wmsInventoryStoreTransferItem: {
+            findFirst: jest.fn(async () => null) as never,
+          },
+          wmsInventoryUnit: {
+            findUnique: jest.fn(async () => ({
+              id: 'unit-1',
+              tenantId,
+              warehouseId: 'wh-1',
+              currentLocationId: 'bin-1',
+              status: WmsInventoryUnitStatus.PUTAWAY,
+              storeId: 'store-1',
+              variationId: 'var-target',
+              barcode: '0100012345',
+            })) as never,
+            update: unitUpdate as never,
+          },
+          wmsProductProfile: {
+            findMany: jest.fn(async () => [
+              {
+                id: 'prof-orig',
+                storeId: 'store-1',
+                posProductId: 'pos-orig',
+                productId: 'prod-orig',
+                variationId: 'var-orig',
+                posWarehouseRef: null,
+              },
+            ]) as never,
+          },
+        },
+        {
+          inventoryUnitId: 'unit-1',
+          actorId: 'user-1',
+          now: new Date('2026-11-12T06:00:00Z'),
+        },
+      );
+
+      expect(result).toEqual({ restoredVariationId: 'var-orig' });
+      expect(unitUpdate).toHaveBeenCalledWith({
+        where: { id: 'unit-1' },
+        data: {
+          storeId: 'store-1',
+          posProductId: 'pos-orig',
+          productProfileId: 'prof-orig',
+          productId: 'prod-orig',
+          variationId: 'var-orig',
+          posWarehouseRef: null,
+          updatedById: 'user-1',
+        },
+      });
+      expect(movementCreate).toHaveBeenCalledTimes(1);
     });
   });
 });

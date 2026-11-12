@@ -3,6 +3,8 @@ import {
   Prisma,
   WmsBasketStatus,
   WmsFulfillmentOrderStatus,
+  WmsInventoryMovementType,
+  WmsInventoryUnitStatus,
   WmsProductProfileStatus,
 } from '@prisma/client';
 
@@ -832,4 +834,194 @@ export function areProfilesCompatibleForStockPool(
 
   return false;
 }
+
+type RestorePoolVariantClient = {
+  wmsInventoryMovement?: {
+    findMany?: Prisma.TransactionClient['wmsInventoryMovement']['findMany'];
+    findFirst?: Prisma.TransactionClient['wmsInventoryMovement']['findFirst'];
+    create?: Prisma.TransactionClient['wmsInventoryMovement']['create'];
+  };
+  wmsInventoryStoreTransferItem?: {
+    findFirst?: Prisma.TransactionClient['wmsInventoryStoreTransferItem']['findFirst'];
+  };
+  wmsInventoryUnit?: {
+    findUnique?: Prisma.TransactionClient['wmsInventoryUnit']['findUnique'];
+    update?: Prisma.TransactionClient['wmsInventoryUnit']['update'];
+  };
+  wmsProductProfile?: {
+    findMany?: Prisma.TransactionClient['wmsProductProfile']['findMany'];
+  };
+};
+
+/**
+ * When a unit that was cross-reassigned via `SHARED_STOCK_POOL` on pick/pack/reserve
+ * is returned back to a `PUTAWAY` bin (via detach, unpick, cancel, void, or amendment),
+ * restore its pre-pool `(storeId, posProductId, productProfileId, productId, variationId)`
+ * so the bin stock continues to reflect the physical product inside the bin.
+ */
+export async function restoreUnitPrePoolVariantOnPutawayTx(
+  client: RestorePoolVariantClient,
+  params: {
+    inventoryUnitId: string;
+    actorId?: string | null;
+    now?: Date;
+  },
+): Promise<{ restoredVariationId: string } | null> {
+  if (
+    !client.wmsInventoryMovement?.findMany
+    || !client.wmsInventoryMovement?.findFirst
+    || !client.wmsInventoryMovement?.create
+    || !client.wmsInventoryUnit?.findUnique
+    || !client.wmsInventoryUnit?.update
+    || !client.wmsProductProfile?.findMany
+  ) {
+    return null;
+  }
+
+  const poolMovements = await client.wmsInventoryMovement.findMany({
+    where: {
+      inventoryUnitId: params.inventoryUnitId,
+      referenceType: {
+        in: ['SHARED_STOCK_POOL', 'SHARED_STOCK_POOL_PUTAWAY_REVERT'],
+      },
+    },
+    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+    select: {
+      referenceType: true,
+      notes: true,
+      createdAt: true,
+    },
+  });
+
+  if (poolMovements.length === 0) {
+    return null;
+  }
+
+  const [unit, lastPutawayMovement, lastStoreTransfer] = await Promise.all([
+    client.wmsInventoryUnit.findUnique({
+      where: { id: params.inventoryUnitId },
+      select: {
+        id: true,
+        tenantId: true,
+        warehouseId: true,
+        currentLocationId: true,
+        status: true,
+        storeId: true,
+        variationId: true,
+        barcode: true,
+      },
+    }),
+    client.wmsInventoryMovement.findFirst({
+      where: {
+        inventoryUnitId: params.inventoryUnitId,
+        toStatus: WmsInventoryUnitStatus.PUTAWAY,
+        NOT: {
+          referenceType: 'SHARED_STOCK_POOL_PUTAWAY_REVERT',
+        },
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      select: {
+        createdAt: true,
+      },
+    }),
+    client.wmsInventoryStoreTransferItem?.findFirst
+      ? client.wmsInventoryStoreTransferItem.findFirst({
+          where: { inventoryUnitId: params.inventoryUnitId },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          select: { createdAt: true },
+        })
+      : Promise.resolve(null),
+  ]);
+
+  if (!unit) {
+    return null;
+  }
+
+  const baselineAt =
+    lastPutawayMovement?.createdAt && lastStoreTransfer?.createdAt
+      ? (lastPutawayMovement.createdAt > lastStoreTransfer.createdAt
+          ? lastPutawayMovement.createdAt
+          : lastStoreTransfer.createdAt)
+      : (lastPutawayMovement?.createdAt ?? lastStoreTransfer?.createdAt ?? null);
+
+  const recentPoolMovements = poolMovements.filter(
+    (movement) => !baselineAt || movement.createdAt > baselineAt,
+  );
+  if (recentPoolMovements.length === 0) {
+    return null;
+  }
+
+  const latestRecent = recentPoolMovements[recentPoolMovements.length - 1]!;
+  if (latestRecent.referenceType === 'SHARED_STOCK_POOL_PUTAWAY_REVERT') {
+    return null;
+  }
+
+  const firstPoolMovement = recentPoolMovements.find(
+    (movement) => movement.referenceType === 'SHARED_STOCK_POOL',
+  );
+  const match = (firstPoolMovement?.notes ?? '').match(/\(([^)\s]+)\s*->\s*([^\s)]+)\)/);
+  const origVariationId = match?.[1]?.trim();
+  if (!origVariationId || unit.variationId === origVariationId) {
+    return null;
+  }
+
+  const candidateProfiles = await client.wmsProductProfile.findMany({
+    where: {
+      tenantId: unit.tenantId,
+      variationId: origVariationId,
+    },
+    select: {
+      id: true,
+      storeId: true,
+      posProductId: true,
+      productId: true,
+      variationId: true,
+      posWarehouseRef: true,
+    },
+  });
+  const origProfile =
+    candidateProfiles.find((profile) => profile.storeId === unit.storeId)
+    ?? candidateProfiles[0]
+    ?? null;
+  if (!origProfile) {
+    return null;
+  }
+
+  await client.wmsInventoryUnit.update({
+    where: { id: unit.id },
+    data: {
+      storeId: origProfile.storeId,
+      posProductId: origProfile.posProductId,
+      productProfileId: origProfile.id,
+      productId: origProfile.productId,
+      variationId: origProfile.variationId,
+      posWarehouseRef:
+        unit.storeId === origProfile.storeId
+          ? null
+          : origProfile.posWarehouseRef ?? null,
+      updatedById: params.actorId ?? undefined,
+    },
+  });
+
+  await client.wmsInventoryMovement.create({
+    data: {
+      tenantId: unit.tenantId,
+      inventoryUnitId: unit.id,
+      warehouseId: unit.warehouseId,
+      fromLocationId: unit.currentLocationId,
+      toLocationId: unit.currentLocationId,
+      fromStatus: unit.status,
+      toStatus: unit.status,
+      movementType: WmsInventoryMovementType.ADJUSTMENT,
+      referenceType: 'SHARED_STOCK_POOL_PUTAWAY_REVERT',
+      referenceCode: unit.barcode,
+      notes: `Restored returned bin unit to pre-pool variant (${unit.variationId} -> ${origProfile.variationId})`,
+      actorId: params.actorId ?? null,
+      createdAt: params.now ?? new Date(),
+    },
+  });
+
+  return { restoredVariationId: origProfile.variationId };
+}
+
 

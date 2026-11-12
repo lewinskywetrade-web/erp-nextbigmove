@@ -37,6 +37,7 @@ import {
 import {
   EMPTY_STOCK_POOL_INDEX,
   loadTenantStockPoolIndex,
+  restoreUnitPrePoolVariantOnPutawayTx,
   type TenantStockPoolIndex,
 } from './wms-stock-pool.util';
 
@@ -3191,6 +3192,12 @@ export class WmsFulfillmentSyncService {
     });
 
     if (inventoryUpdate.count === 1) {
+      if (targetStatus === WmsInventoryUnitStatus.PUTAWAY) {
+        await restoreUnitPrePoolVariantOnPutawayTx(tx, {
+          inventoryUnitId: params.inventoryUnitId,
+          actorId: params.actorId,
+        });
+      }
       return true;
     }
 
@@ -4058,7 +4065,7 @@ export class WmsFulfillmentSyncService {
                 referenceType: 'SHARED_STOCK_POOL',
                 referenceId: order.id,
                 referenceCode: order.posOrderId,
-                notes: `Auto-assigned from shared stock pool for order ${order.posOrderId}`,
+                notes: `Auto-assigned from shared stock pool for order ${order.posOrderId} (${unit.variationId} -> ${targetPoolMember.variationId})`,
                 actorId,
               },
             });
