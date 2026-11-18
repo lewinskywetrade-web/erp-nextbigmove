@@ -2324,9 +2324,17 @@ export class WmsFulfillmentOpsService {
       }
     }
 
+    const retainedAssignedPickedByVariation = new Map<string, number>();
     const openPickedUnitsByVariation = new Map<string, typeof basket.basketUnits>();
     for (const basketUnit of activeBasketUnits) {
-      if (basketUnit.status !== WmsBasketUnitStatus.PICKED || basketUnit.fulfillmentOrderId) {
+      if (basketUnit.status !== WmsBasketUnitStatus.PICKED) {
+        continue;
+      }
+      if (basketUnit.fulfillmentOrderId && retainedOrderIdSet.has(basketUnit.fulfillmentOrderId)) {
+        retainedAssignedPickedByVariation.set(
+          basketUnit.variationId,
+          (retainedAssignedPickedByVariation.get(basketUnit.variationId) ?? 0) + 1,
+        );
         continue;
       }
 
@@ -2336,14 +2344,34 @@ export class WmsFulfillmentOpsService {
     }
 
     const releasedPickedUnits: typeof basket.basketUnits = [];
+    const retainedPoolUnitIdsToUnlink: string[] = [];
     for (const [variationId, pickedUnits] of openPickedUnitsByVariation.entries()) {
-      const retainedNeed = retainedOpenDemandByVariation.get(variationId) ?? 0;
-      const surplus = Math.max(pickedUnits.length - retainedNeed, 0);
-      if (surplus <= 0) {
-        continue;
+      const totalRetainedNeed = retainedOpenDemandByVariation.get(variationId) ?? 0;
+      const alreadyAssignedRetained = retainedAssignedPickedByVariation.get(variationId) ?? 0;
+      const unassignedRetainedNeed = Math.max(totalRetainedNeed - alreadyAssignedRetained, 0);
+      const keptUnits = pickedUnits.slice(0, unassignedRetainedNeed);
+      for (const keptUnit of keptUnits) {
+        if (keptUnit.fulfillmentOrderId) {
+          retainedPoolUnitIdsToUnlink.push(keptUnit.id);
+        }
       }
+      const surplusUnits = pickedUnits.slice(unassignedRetainedNeed);
+      if (surplusUnits.length > 0) {
+        releasedPickedUnits.push(...surplusUnits);
+      }
+    }
 
-      releasedPickedUnits.push(...pickedUnits.slice(0, surplus));
+    if (retainedPoolUnitIdsToUnlink.length > 0) {
+      await tx.wmsBasketUnit.updateMany({
+        where: {
+          id: { in: retainedPoolUnitIdsToUnlink },
+          status: WmsBasketUnitStatus.PICKED,
+        },
+        data: {
+          fulfillmentOrderId: null,
+          fulfillmentLineId: null,
+        },
+      });
     }
 
     const unitsToRestore = [...selectedPackedUnits, ...releasedPickedUnits];

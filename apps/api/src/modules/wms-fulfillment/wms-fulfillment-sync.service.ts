@@ -3548,28 +3548,54 @@ export class WmsFulfillmentSyncService {
       });
     }
 
+    const totalRequired = params.lines.reduce(
+      (sum, line) => sum + Math.max(line.quantityRequired, 0),
+      0,
+    );
+    const finalAllocated = Math.min(totalAllocated, totalRequired);
+    const finalPicked = Math.min(totalPicked, totalRequired);
+    const currentBasket = typeof tx.wmsBasket?.findUnique === 'function'
+      ? await tx.wmsBasket.findUnique({
+          where: { id: basketId },
+          select: {
+            status: true,
+            assignedPackerId: true,
+          },
+        })
+      : null;
+
+    const isFullyPickedWithoutRework =
+      params.amendment.changeState === WmsFulfillmentChangeState.NONE
+      && totalRequired > 0
+      && finalPicked >= totalRequired;
+    const nextOrderStatus = isFullyPickedWithoutRework
+      ? params.order.status === WmsFulfillmentOrderStatus.PACKING
+        ? WmsFulfillmentOrderStatus.PACKING
+        : params.order.status === WmsFulfillmentOrderStatus.PICKED
+          || Boolean(currentBasket?.assignedPackerId)
+          || currentBasket?.status === WmsBasketStatus.PACKING
+          ? WmsFulfillmentOrderStatus.PICKED
+          : WmsFulfillmentOrderStatus.READY_FOR_PACK
+      : WmsFulfillmentOrderStatus.IN_PICKING;
+
     // Never put an order into ISSUE status while it is actively being picked in a basket.
-    // Keep it IN_PICKING so the picker sees the automatic revision / rework note above.
+    // Keep it IN_PICKING when rework is needed, or preserve its ready/packing status when already fulfilled.
     await tx.wmsFulfillmentOrder.update({
       where: { id: params.order.id },
       data: {
-        status: WmsFulfillmentOrderStatus.IN_PICKING,
+        status: nextOrderStatus,
         issueReason: null,
-        allocatedQuantity: Math.min(totalAllocated, params.lines.reduce((sum, line) => sum + line.quantityRequired, 0)),
-        pickedQuantity: Math.min(totalPicked, params.lines.reduce((sum, line) => sum + line.quantityRequired, 0)),
+        allocatedQuantity: finalAllocated,
+        pickedQuantity: finalPicked,
         packedById: null,
-        completedAt: null,
+        completedAt:
+          nextOrderStatus === WmsFulfillmentOrderStatus.READY_FOR_PACK
+          || nextOrderStatus === WmsFulfillmentOrderStatus.PICKED
+            ? params.order.completedAt ?? params.now
+            : null,
       },
     });
-    await tx.wmsBasket.update({
-      where: { id: basketId },
-      data: {
-        status: WmsBasketStatus.IN_PICKING,
-        assignedPackerId: null,
-        fullAt: null,
-        readyForPackAt: null,
-      },
-    });
+    await this.refreshDemandBasketStateTx(tx, basketId, params.now);
   }
 
   private async findReworkDemandBinsTx(
@@ -3788,9 +3814,17 @@ export class WmsFulfillmentSyncService {
 
   async resolveFulfillmentAmendmentIfComplete(fulfillmentOrderId: string) {
     return this.prisma.$transaction(async (tx) => {
+      const now = new Date();
       const order = await tx.wmsFulfillmentOrder.findUnique({
         where: { id: fulfillmentOrderId },
         include: {
+          basket: {
+            select: {
+              id: true,
+              status: true,
+              assignedPackerId: true,
+            },
+          },
           basketPickDemands: true,
           lines: {
             include: {
@@ -3837,17 +3871,33 @@ export class WmsFulfillmentSyncService {
         // Keep the order in IN_PICKING with its amendment note until detached or voided from the basket.
         return false;
       }
+      const nextCompletedStatus = order.totalQuantity === 0
+        ? WmsFulfillmentOrderStatus.ISSUE
+        : order.status === WmsFulfillmentOrderStatus.PACKING
+          ? WmsFulfillmentOrderStatus.PACKING
+          : order.status === WmsFulfillmentOrderStatus.PICKED
+            || Boolean(order.basket?.assignedPackerId)
+            || order.basket?.status === WmsBasketStatus.PACKING
+            ? WmsFulfillmentOrderStatus.PICKED
+            : order.status === WmsFulfillmentOrderStatus.IN_PICKING
+              || order.status === WmsFulfillmentOrderStatus.READY_FOR_PACK
+              ? WmsFulfillmentOrderStatus.READY_FOR_PACK
+              : order.status;
       await tx.wmsFulfillmentAmendment.update({
         where: { id: amendment.id },
-        data: { status: WmsFulfillmentAmendmentStatus.RESOLVED, resolvedAt: new Date() },
+        data: { status: WmsFulfillmentAmendmentStatus.RESOLVED, resolvedAt: now },
       });
       await tx.wmsFulfillmentOrder.update({
         where: { id: order.id },
         data: {
           changeState: WmsFulfillmentChangeState.NONE,
+          status: nextCompletedStatus,
+          ...(nextCompletedStatus === WmsFulfillmentOrderStatus.READY_FOR_PACK
+            || nextCompletedStatus === WmsFulfillmentOrderStatus.PICKED
+            ? { completedAt: order.completedAt ?? now }
+            : {}),
           ...(order.totalQuantity === 0
             ? {
-                status: WmsFulfillmentOrderStatus.ISSUE,
                 issueReason:
                   order.issueReason
                   ?? 'All pickable items were removed from this order in Pancake POS — no units remain to pick.',
@@ -3855,6 +3905,9 @@ export class WmsFulfillmentSyncService {
             : {}),
         },
       });
+      if (order.basketId && order.assignmentMode === WmsFulfillmentAssignmentMode.BASKET_DEMAND) {
+        await this.refreshDemandBasketStateTx(tx, order.basketId, now);
+      }
       return true;
     });
   }

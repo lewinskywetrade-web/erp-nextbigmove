@@ -4339,9 +4339,18 @@ export class WmsMobileService {
       this.assertOrderHasTracking(scopedOrder);
       this.assertNoOtherDemandPackOrderInProgress(scopedBasket, scopedOrder.id);
 
+      const isReadyPickedInBasket =
+        scopedOrder.status === WmsFulfillmentOrderStatus.READY_FOR_PACK
+        || (
+          scopedOrder.status === WmsFulfillmentOrderStatus.IN_PICKING
+          && scopedOrder.changeState === WmsFulfillmentChangeState.NONE
+          && Math.max(scopedOrder.totalQuantity ?? 0, 0) > 0
+          && (scopedOrder.pickedQuantity ?? 0) >= Math.max(scopedOrder.totalQuantity ?? 0, 0)
+        );
       if (
         scopedOrder.status !== WmsFulfillmentOrderStatus.PICKED
         && scopedOrder.status !== WmsFulfillmentOrderStatus.PACKING
+        && !isReadyPickedInBasket
       ) {
         throw new BadRequestException(`Order ${scopedOrder.posOrderId} is ${this.formatEnumLabel(scopedOrder.status)} and cannot be packed`);
       }
@@ -4868,8 +4877,16 @@ export class WmsMobileService {
       select: {
         tenantId: true,
         storeId: true,
+        basketId: true,
         posOrderId: true,
         status: true,
+        changeState: true,
+        amendments: {
+          where: { status: WmsFulfillmentAmendmentStatus.OPEN },
+          orderBy: { detectedAt: 'desc' },
+          take: 1,
+          select: { requiredActions: true },
+        },
         lines: {
           where: {
             variationId: allowedVariationIds.length === 1
@@ -4878,7 +4895,7 @@ export class WmsMobileService {
             status: { not: WmsFulfillmentLineStatus.CANCELED },
             quantityRequired: { gt: 0 },
           },
-          select: { id: true, variationId: true },
+          select: { id: true, variationId: true, quantityRequired: true },
         },
       },
     });
@@ -4894,16 +4911,20 @@ export class WmsMobileService {
         `Unit ${params.unitCode} is not available for order ${params.targetOrderCode}`,
       );
     }
-    if (
+
+    const hasExplicitBasketMismatch =
+      Boolean(sourceOrder && 'basketId' in sourceOrder && sourceOrder.basketId !== undefined)
+      && sourceOrder!.basketId !== params.basketId;
+    const isSourceOrderInactiveInBasket =
       !sourceOrder
-      || (
-        sourceOrder.status !== WmsFulfillmentOrderStatus.PICKED
-        && sourceOrder.status !== WmsFulfillmentOrderStatus.PACKING
-      )
-    ) {
-      throw new ConflictException(
-        `Unit ${params.unitCode} belongs to completed or unavailable order ${sourceOrderCode}`,
-      );
+      || hasExplicitBasketMismatch
+      || sourceOrder.status === WmsFulfillmentOrderStatus.PACKED
+      || sourceOrder.status === WmsFulfillmentOrderStatus.CANCELED;
+    if (isSourceOrderInactiveInBasket) {
+      return {
+        sourceOrderId,
+        replacementUnitId: null,
+      };
     }
 
     const sourceLine =
@@ -4912,10 +4933,34 @@ export class WmsMobileService {
       ?? sourceOrder.lines[0]
       ?? null;
     const sourceLineId = sourceLine?.id ?? params.basketUnit.fulfillmentLineId ?? null;
-    if (!sourceLineId) {
+    const allowedVarSet = new Set(allowedVariationIds);
+    const rawRequiredActions = Array.isArray(sourceOrder.amendments)
+      ? sourceOrder.amendments[0]?.requiredActions
+      : null;
+    const parsedActions = rawRequiredActions && typeof rawRequiredActions === 'object' && !Array.isArray(rawRequiredActions)
+      ? (rawRequiredActions as Record<string, unknown>)
+      : null;
+    const rawReturnList = Array.isArray(parsedActions?.return) ? parsedActions!.return : [];
+    const sourcePendingReturns = rawReturnList.reduce((sum: number, entry: unknown) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        return sum;
+      }
+      const record = entry as Record<string, unknown>;
+      const varId = typeof record.variationId === 'string' ? record.variationId : '';
+      const qty = typeof record.quantity === 'number' ? Math.max(record.quantity, 0) : 0;
+      return allowedVarSet.has(varId) ? sum + qty : sum;
+    }, 0);
+
+    if (!sourceLineId && sourceOrder.lines.length > 0) {
       throw new ConflictException(
         `Unit ${params.unitCode} has no valid order line in basket ${params.basketCode}`,
       );
+    }
+    if (!sourceLine && sourceOrder.lines.length === 0 && sourcePendingReturns === 0) {
+      return {
+        sourceOrderId,
+        replacementUnitId: null,
+      };
     }
 
     const replacementWhere: Prisma.WmsBasketUnitWhereInput = poolMembers.length >= 2
@@ -4977,8 +5022,60 @@ export class WmsMobileService {
       select: replacementSelect,
       orderBy: [{ pickedAt: 'asc' }, { createdAt: 'asc' }],
     });
+    replacementUnit ??= await tx.wmsBasketUnit.findFirst({
+      where: {
+        ...replacementWhere,
+        fulfillmentOrderId: {
+          notIn: [params.targetOrderId, sourceOrderId],
+        },
+        fulfillmentOrder: {
+          is: {
+            OR: [
+              { basketId: null },
+              { basketId: { not: params.basketId } },
+              {
+                status: {
+                  in: [
+                    WmsFulfillmentOrderStatus.PACKED,
+                    WmsFulfillmentOrderStatus.CANCELED,
+                  ],
+                },
+              },
+            ],
+          },
+        },
+      },
+      select: replacementSelect,
+      orderBy: [{ pickedAt: 'asc' }, { createdAt: 'asc' }],
+    });
 
     if (!replacementUnit) {
+      const hasQuantifiedLines = sourceOrder.lines.every(
+        (line) => typeof line.quantityRequired === 'number',
+      );
+      if (hasQuantifiedLines && typeof tx.wmsBasketUnit.count === 'function') {
+        const sourceRequiredUnits = sourceOrder.lines.reduce(
+          (sum, line) => sum + Math.max(line.quantityRequired ?? 0, 0),
+          0,
+        );
+        const assignedSourceUnits = await tx.wmsBasketUnit.count({
+          where: {
+            basketId: params.basketId,
+            fulfillmentOrderId: sourceOrderId,
+            status: { in: [...ACTIVE_BASKET_UNIT_STATUSES] },
+            variationId: allowedVariationIds.length === 1
+              ? allowedVariationIds[0]!
+              : { in: allowedVariationIds },
+          },
+        });
+        if (assignedSourceUnits > sourceRequiredUnits + sourcePendingReturns) {
+          return {
+            sourceOrderId,
+            replacementUnitId: null,
+          };
+        }
+      }
+
       throw new ConflictException(
         `Unit ${params.unitCode} is allocated to order ${sourceOrderCode}. Scan a matching unpacked serial allocated to order ${params.targetOrderCode}.`,
       );
@@ -12323,7 +12420,19 @@ export class WmsMobileService {
   }
 
   private assertPackingTaskReadyToStart(order: any) {
-    if (order.status !== WmsFulfillmentOrderStatus.PICKED && order.status !== WmsFulfillmentOrderStatus.PACKING) {
+    const isReadyPickedInBasket =
+      order.status === WmsFulfillmentOrderStatus.READY_FOR_PACK
+      || (
+        order.status === WmsFulfillmentOrderStatus.IN_PICKING
+        && order.changeState === WmsFulfillmentChangeState.NONE
+        && Math.max(order.totalQuantity ?? 0, 0) > 0
+        && (order.pickedQuantity ?? 0) >= Math.max(order.totalQuantity ?? 0, 0)
+      );
+    if (
+      order.status !== WmsFulfillmentOrderStatus.PICKED
+      && order.status !== WmsFulfillmentOrderStatus.PACKING
+      && !isReadyPickedInBasket
+    ) {
       throw new BadRequestException(`Order ${order.posOrderId} is ${this.formatEnumLabel(order.status)} and cannot start packing`);
     }
 
@@ -12397,6 +12506,8 @@ export class WmsMobileService {
     if (
       order.status !== WmsFulfillmentOrderStatus.PICKED
       && order.status !== WmsFulfillmentOrderStatus.PACKING
+      && order.status !== WmsFulfillmentOrderStatus.READY_FOR_PACK
+      && order.status !== WmsFulfillmentOrderStatus.IN_PICKING
     ) {
       throw new BadRequestException(`Order ${order.posOrderId} is ${this.formatEnumLabel(order.status)} and cannot be voided from PACK`);
     }
@@ -15381,6 +15492,17 @@ export class WmsMobileService {
       },
       select: {
         id: true,
+      },
+    });
+
+    await tx.wmsBasketUnit.updateMany({
+      where: {
+        fulfillmentOrderId,
+        status: WmsBasketUnitStatus.PICKED,
+      },
+      data: {
+        fulfillmentOrderId: null,
+        fulfillmentLineId: null,
       },
     });
 

@@ -9213,8 +9213,219 @@ async function ensureFamcoProfilesRemainUnpooled() {
   }
 }
 
+async function reconcileStaleDemandBasketUnitOrderLinksOnStartup() {
+  try {
+    const now = new Date();
+    const inspectDailyDevotionTarget = async (label: string) => {
+      const [targetUnit, targetOrders] = await Promise.all([
+        prisma.wmsInventoryUnit.findFirst({
+          where: {
+            OR: [
+              { code: 'PLC0100103107' },
+              { barcode: 'PLC0100103107' },
+              { barcode: '0100103107' },
+            ],
+          },
+          select: {
+            id: true,
+            code: true,
+            barcode: true,
+            status: true,
+            variationId: true,
+            basketUnits: {
+              where: {
+                status: { in: [WmsBasketUnitStatus.PICKED, WmsBasketUnitStatus.PACKED] },
+              },
+              select: {
+                id: true,
+                status: true,
+                basketId: true,
+                fulfillmentOrderId: true,
+                fulfillmentLineId: true,
+                basket: { select: { barcode: true, status: true, assignedPackerId: true } },
+                fulfillmentOrder: {
+                  select: { posOrderId: true, status: true, basketId: true, changeState: true },
+                },
+              },
+            },
+          },
+        }),
+        prisma.wmsFulfillmentOrder.findMany({
+          where: {
+            posOrderId: { in: ['44254', '44341'] },
+          },
+          select: {
+            id: true,
+            posOrderId: true,
+            status: true,
+            basketId: true,
+            totalQuantity: true,
+            allocatedQuantity: true,
+            pickedQuantity: true,
+            changeState: true,
+            changeSummary: true,
+            store: { select: { name: true, shopName: true } },
+            posOrder: { select: { status: true, isVoid: true, tracking: true } },
+            basket: { select: { id: true, barcode: true, status: true, assignedPackerId: true } },
+            lines: {
+              select: {
+                id: true,
+                variationId: true,
+                productName: true,
+                quantityRequired: true,
+                quantityPicked: true,
+                status: true,
+              },
+            },
+          },
+        }),
+      ]);
+      console.log(label, JSON.stringify({ targetUnit, targetOrders }));
+    };
+
+    await inspectDailyDevotionTarget('[DAILY_DEVOTION_PACK_DIAG_BEFORE]');
+
+    // 1. Unlink PICKED basket units whose assigned fulfillmentOrder already completed, canceled,
+    //    or moved out of that basket so remaining orders in the basket can pack them cleanly.
+    const candidatePickedBasketUnits = await prisma.wmsBasketUnit.findMany({
+      where: {
+        status: WmsBasketUnitStatus.PICKED,
+        fulfillmentOrderId: { not: null },
+      },
+      select: {
+        id: true,
+        basketId: true,
+        fulfillmentOrderId: true,
+        fulfillmentOrder: {
+          select: {
+            id: true,
+            posOrderId: true,
+            status: true,
+            basketId: true,
+          },
+        },
+      },
+    });
+
+    const staleLinkedBasketUnitIds = candidatePickedBasketUnits
+      .filter((bu) => {
+        const fo = bu.fulfillmentOrder;
+        if (!fo) return true;
+        if (
+          fo.status === WmsFulfillmentOrderStatus.PACKED
+          || fo.status === WmsFulfillmentOrderStatus.CANCELED
+        ) {
+          return true;
+        }
+        if (fo.basketId !== bu.basketId) {
+          return true;
+        }
+        return false;
+      })
+      .map((bu) => bu.id);
+
+    let unlinkedStaleBasketUnitCount = 0;
+    if (staleLinkedBasketUnitIds.length > 0) {
+      const res = await prisma.wmsBasketUnit.updateMany({
+        where: {
+          id: { in: staleLinkedBasketUnitIds },
+          status: WmsBasketUnitStatus.PICKED,
+        },
+        data: {
+          fulfillmentOrderId: null,
+          fulfillmentLineId: null,
+        },
+      });
+      unlinkedStaleBasketUnitCount = res.count;
+    }
+
+    // 2. Promote any fully-picked BASKET_DEMAND order inside a packing/handed-off basket
+    //    (status READY_FOR_PACK, or IN_PICKING with changeState=NONE and picked>=total>0)
+    //    to PICKED so waybill scan and unit reassignment both treat it as ready to pack.
+    const packingBasketOrders = await prisma.wmsFulfillmentOrder.findMany({
+      where: {
+        assignmentMode: WmsFulfillmentAssignmentMode.BASKET_DEMAND,
+        basketId: { not: null },
+        status: {
+          in: [
+            WmsFulfillmentOrderStatus.READY_FOR_PACK,
+            WmsFulfillmentOrderStatus.IN_PICKING,
+          ],
+        },
+        basket: {
+          is: {
+            OR: [
+              { status: WmsBasketStatus.PACKING },
+              {
+                status: WmsBasketStatus.FULL_HELD,
+                assignedPackerId: { not: null },
+              },
+            ],
+          },
+        },
+      },
+      select: {
+        id: true,
+        posOrderId: true,
+        status: true,
+        changeState: true,
+        totalQuantity: true,
+        pickedQuantity: true,
+        completedAt: true,
+      },
+    });
+
+    const promotableOrderIds = packingBasketOrders
+      .filter(
+        (o) =>
+          o.changeState === WmsFulfillmentChangeState.NONE
+          && (
+            o.status === WmsFulfillmentOrderStatus.READY_FOR_PACK
+            || (o.totalQuantity > 0 && o.pickedQuantity >= o.totalQuantity)
+          ),
+      )
+      .map((o) => o.id);
+
+    let promotedPackingOrderCount = 0;
+    if (promotableOrderIds.length > 0) {
+      const promoted = await prisma.wmsFulfillmentOrder.updateMany({
+        where: {
+          id: { in: promotableOrderIds },
+          status: {
+            in: [
+              WmsFulfillmentOrderStatus.READY_FOR_PACK,
+              WmsFulfillmentOrderStatus.IN_PICKING,
+            ],
+          },
+          changeState: WmsFulfillmentChangeState.NONE,
+        },
+        data: {
+          status: WmsFulfillmentOrderStatus.PICKED,
+          completedAt: now,
+        },
+      });
+      promotedPackingOrderCount = promoted.count;
+    }
+
+    console.log(
+      '[DEMAND_BASKET_PACK_HEAL]',
+      JSON.stringify({
+        checkedPickedBasketUnits: candidatePickedBasketUnits.length,
+        unlinkedStaleBasketUnitCount,
+        checkedPackingBasketOrders: packingBasketOrders.length,
+        promotedPackingOrderCount,
+      }),
+    );
+
+    await inspectDailyDevotionTarget('[DAILY_DEVOTION_PACK_DIAG_AFTER]');
+  } catch (err: any) {
+    console.error('Warning during demand basket pack startup heal:', err?.message || err);
+  }
+}
+
 async function main() {
   console.log('Starting database seed...');
+  await reconcileStaleDemandBasketUnitOrderLinksOnStartup();
   await reconcileFamcoSharedStockPoolsAndQueue();
   await ensureSuperAdmin();
   await normalizeUserEmails();

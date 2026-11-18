@@ -182,7 +182,7 @@ describe('WmsMobileService demand packing serial reassignment', () => {
       reassignDemandPackingUnitIfNeeded: (
         transaction: Prisma.TransactionClient,
         input: typeof params,
-      ) => Promise<{ sourceOrderId: string; replacementUnitId: string } | null>;
+      ) => Promise<{ sourceOrderId: string; replacementUnitId: string | null } | null>;
     }).reassignDemandPackingUnitIfNeeded(tx as Prisma.TransactionClient, {
       ...params,
       ...overrides,
@@ -280,6 +280,92 @@ describe('WmsMobileService demand packing serial reassignment', () => {
       'Unit SERIAL-001 is allocated to order 1001. Scan a matching unpacked serial allocated to order 2002.',
     );
     expect(tx.wmsBasketUnit.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('exchanges serials when the sibling order in the same basket is READY_FOR_PACK or IN_PICKING', async () => {
+    const tx = {
+      wmsFulfillmentOrder: {
+        findUnique: asyncMock({
+          basketId: 'basket-1',
+          posOrderId: '44254',
+          status: WmsFulfillmentOrderStatus.READY_FOR_PACK,
+          lines: [{ id: 'source-line', variationId: 'variation-1', quantityRequired: 1 }],
+        }),
+      },
+      wmsBasketUnit: {
+        findFirst: asyncMock({
+          id: 'replacement-unit',
+          fulfillmentOrderId: params.targetOrderId,
+        }),
+        updateMany: asyncMock({ count: 1 }),
+      },
+    };
+
+    await expect(callReassignment(tx)).resolves.toEqual({
+      sourceOrderId: 'source-order',
+      replacementUnitId: 'replacement-unit',
+    });
+  });
+
+  it('claims a picked basket unit directly when its prior order left the basket or already completed', async () => {
+    const txDifferentBasket = {
+      wmsFulfillmentOrder: {
+        findUnique: asyncMock({
+          basketId: 'other-basket',
+          posOrderId: '44254',
+          status: WmsFulfillmentOrderStatus.PICKED,
+          lines: [{ id: 'source-line', variationId: 'variation-1', quantityRequired: 1 }],
+        }),
+      },
+      wmsBasketUnit: { findFirst: jest.fn(), updateMany: jest.fn() },
+    };
+
+    await expect(callReassignment(txDifferentBasket)).resolves.toEqual({
+      sourceOrderId: 'source-order',
+      replacementUnitId: null,
+    });
+    expect(txDifferentBasket.wmsBasketUnit.findFirst).not.toHaveBeenCalled();
+
+    const txCompleted = {
+      wmsFulfillmentOrder: {
+        findUnique: asyncMock({
+          basketId: null,
+          posOrderId: '44254',
+          status: WmsFulfillmentOrderStatus.PACKED,
+          lines: [{ id: 'source-line', variationId: 'variation-1', quantityRequired: 1 }],
+        }),
+      },
+      wmsBasketUnit: { findFirst: jest.fn(), updateMany: jest.fn() },
+    };
+
+    await expect(callReassignment(txCompleted)).resolves.toEqual({
+      sourceOrderId: 'source-order',
+      replacementUnitId: null,
+    });
+  });
+
+  it('claims a surplus picked unit on a sibling order whose required quantity decreased', async () => {
+    const tx = {
+      wmsFulfillmentOrder: {
+        findUnique: asyncMock({
+          basketId: 'basket-1',
+          posOrderId: '44341',
+          status: WmsFulfillmentOrderStatus.PICKED,
+          amendments: [],
+          lines: [{ id: 'source-line', variationId: 'variation-1', quantityRequired: 1 }],
+        }),
+      },
+      wmsBasketUnit: {
+        findFirst: asyncMock(null),
+        count: asyncMock(2),
+        updateMany: jest.fn(),
+      },
+    };
+
+    await expect(callReassignment(tx)).resolves.toEqual({
+      sourceOrderId: 'source-order',
+      replacementUnitId: null,
+    });
   });
 });
 
