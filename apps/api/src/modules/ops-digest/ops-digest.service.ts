@@ -671,6 +671,7 @@ export class OpsDigestService {
           },
           outboundAndRtsInWindow: [],
           dailyInventoryEmailHealth: [],
+          warehouseDailyInventoryEmailHealth: null,
         },
         async () => {
           const [
@@ -686,6 +687,7 @@ export class OpsDigestService {
             purchasingAttentionGroups,
             outboundGroups,
             emailSubscriptions,
+            warehouseEmailSubscription,
           ] = await Promise.all([
             this.prisma.wmsInventoryMovement.groupBy({
               by: ['tenantId', 'movementType'],
@@ -813,6 +815,9 @@ export class OpsDigestService {
             tenants.length > 0
               ? this.wmsReportsService.getSubscriptionsForTenants(tenants.map((t) => t.id))
               : Promise.resolve([]),
+            this.wmsReportsService.getWarehouseDailyEmailSubscription
+              ? this.wmsReportsService.getWarehouseDailyEmailSubscription()
+              : Promise.resolve(null),
           ]);
 
           const profileIds = Array.from(
@@ -957,6 +962,16 @@ export class OpsDigestService {
                 lastDeliveryStatus: sub.lastDeliveryStatus,
                 lastError: sanitizeText(sub.lastError, 160),
               })),
+            warehouseDailyInventoryEmailHealth: warehouseEmailSubscription
+              ? {
+                  enabled: warehouseEmailSubscription.enabled,
+                  recipientCount: warehouseEmailSubscription.effectiveRecipients.length,
+                  sendTimeManila: warehouseEmailSubscription.sendTimeManila,
+                  lastSentDate: warehouseEmailSubscription.lastSentDate,
+                  lastDeliveryStatus: warehouseEmailSubscription.lastDeliveryStatus,
+                  lastError: sanitizeText(warehouseEmailSubscription.lastError, 160),
+                }
+              : null,
           };
         },
       ),

@@ -215,3 +215,146 @@ describe('Read-only View As identity lifecycle', () => {
     expect(prisma.tenantMembership.findMany).not.toHaveBeenCalled();
   });
 });
+
+describe('Cross-client live portal View As (lewinsky.wetrade@gmail.com only)', () => {
+  const originTenantId = '11111111-1111-4111-8111-111111111111';
+  const clientTenantId = '22222222-2222-4222-8222-222222222222';
+  const config = { get: (key: string) => ({
+    'jwt.secret': 'unit-test-only-access-secret',
+    'jwt.refreshSecret': 'unit-test-only-refresh-secret',
+    'jwt.expiresIn': '15m',
+    'jwt.refreshExpiresIn': '7d',
+  })[key] };
+
+  function buildCrossClientFixture() {
+    const users = new Map<string, any>([
+      ['lewinsky', {
+        id: 'lewinsky', email: 'lewinsky.wetrade@gmail.com', firstName: 'Lewinsky', lastName: 'Candido',
+        role: 'SUPER_ADMIN', status: 'ACTIVE', tenantId: originTenantId, defaultTeamId: null,
+        permissions: [], password: 'never-return',
+      }],
+      ['other-super', {
+        id: 'other-super', email: 'other-super@wetrade.com',
+        role: 'SUPER_ADMIN', status: 'ACTIVE', tenantId: originTenantId, defaultTeamId: null,
+        permissions: ['user.impersonate'], password: 'never-return',
+      }],
+      ['tenant-admin', {
+        id: 'tenant-admin', email: 'admin@famco.com',
+        role: 'ADMIN', status: 'ACTIVE', tenantId: originTenantId, defaultTeamId: null,
+        permissions: ['user.impersonate'], password: 'never-return',
+      }],
+      ['famco-lead', {
+        id: 'famco-lead', email: 'lead@famco.com', firstName: 'Famco', lastName: 'Lead',
+        role: 'USER', status: 'ACTIVE', tenantId: clientTenantId, defaultTeamId: 'famco-team-1',
+        permissions: ['stock_request.read'], password: 'never-return',
+        userRoleAssignments: [{ role: { name: 'Team Lead', key: 'TEAM_LEAD' }, team: { name: 'Famco Team 1' } }],
+        teamMemberships: [{ team: { name: 'Famco Team 1' } }],
+      }],
+    ]);
+    const tenants = new Map<string, any>([
+      [originTenantId, { id: originTenantId, name: 'Next Big Move', slug: 'nbm', status: 'ACTIVE', encryptionKey: 'sec' }],
+      [clientTenantId, { id: clientTenantId, name: 'FAMCO', slug: 'famco', status: 'ACTIVE', encryptionKey: 'sec' }],
+    ]);
+    const prisma: any = {
+      user: {
+        findUnique: jest.fn(async ({ where }: any) => users.get(where.id) ?? null),
+        findMany: jest.fn(async () => [users.get('famco-lead')]),
+      },
+      tenant: {
+        findUnique: jest.fn(async ({ where }: any) => tenants.get(where.id) ?? null),
+        findMany: jest.fn(async () => Array.from(tenants.values())),
+      },
+      tenantMembership: {
+        findUnique: jest.fn(async () => null),
+        findMany: jest.fn(async () => []),
+      },
+      auditLog: { create: jest.fn(async () => ({})) },
+    };
+    const access: any = {
+      resolveUserAccess: jest.fn(async ({ basePermissions }: any) => ({ permissions: basePermissions ?? [], roles: [] })),
+    };
+    const jwt = new JwtService();
+    const service = new AuthService(prisma, jwt, config as never, { recordFromRequest: jest.fn() } as never, access);
+    const strategy = new JwtStrategy(config as never, service);
+    return { service, strategy, jwt, prisma, users };
+  }
+
+  it('allows only active SUPER_ADMIN lewinsky.wetrade@gmail.com to enable and list cross-client previews', async () => {
+    const { service, users } = buildCrossClientFixture();
+
+    await expect(service.canUserPreviewAllClients({ userId: 'lewinsky' })).resolves.toBe(true);
+    await expect(service.canUserPreviewAllClients({ userId: 'other-super' })).resolves.toBe(false);
+    await expect(service.canUserPreviewAllClients({ userId: 'tenant-admin' })).resolves.toBe(false);
+    await expect(service.canUserPreviewAllClients({ userId: 'lewinsky', impersonatedBy: 'other' })).resolves.toBe(false);
+
+    const clients = await service.listClientPreviewTenants({ userId: 'lewinsky' });
+    expect(clients.map((t: any) => t.name)).toEqual(['Next Big Move', 'FAMCO']);
+
+    const clientUsers = await service.listClientPreviewTenantUsers({ userId: 'lewinsky' }, clientTenantId);
+    expect(clientUsers.users).toHaveLength(1);
+    expect(clientUsers.users[0]).toMatchObject({
+      email: 'lead@famco.com',
+      roles: ['Team Lead'],
+      teams: ['Famco Team 1'],
+    });
+
+    await expect(service.listClientPreviewTenants({ userId: 'other-super' })).rejects.toThrow('designated owner');
+    await expect(service.listClientPreviewTenantUsers({ userId: 'tenant-admin' }, clientTenantId)).rejects.toThrow('designated owner');
+
+    users.get('lewinsky').role = 'USER';
+    await expect(service.canUserPreviewAllClients({ userId: 'lewinsky' })).resolves.toBe(false);
+    await expect(service.listClientPreviewTenants({ userId: 'lewinsky' })).rejects.toThrow('designated owner');
+  });
+
+  it('mints read-only preview session in another client tenant for lewinsky.wetrade@gmail.com and returns cleanly to original tenant on stop', async () => {
+    const { service, strategy, jwt, prisma } = buildCrossClientFixture();
+    const actor = { userId: 'lewinsky', tenantId: originTenantId, sessionId: 'orig-session' };
+
+    const previewSession = await service.impersonateClientUser(actor, clientTenantId, 'famco-lead');
+    expect(previewSession.impersonationReadOnly).toBe(true);
+    expect(previewSession.tenant.id).toBe(clientTenantId);
+    expect(previewSession.user.email).toBe('lead@famco.com');
+    expect(previewSession.user.tenantId).toBe(clientTenantId);
+    expect(previewSession.memberships).toEqual([{ tenantId: clientTenantId, name: 'FAMCO', slug: 'famco', status: 'ACTIVE' }]);
+
+    const claims = jwt.decode(previewSession.accessToken) as Record<string, any>;
+    expect(claims).toMatchObject({
+      userId: 'famco-lead',
+      tenantId: clientTenantId,
+      impersonatedBy: 'lewinsky',
+      originalTenantId: originTenantId,
+    });
+    expect(prisma.auditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        tenantId: clientTenantId,
+        userId: 'lewinsky',
+        action: 'IMPERSONATION_STARTED',
+        resourceId: 'famco-lead',
+      }),
+    }));
+
+    // Refresh preserves client tenantId and originalTenantId
+    const refreshed = await service.refreshToken({ refreshToken: previewSession.refreshToken });
+    const refreshedClaims = jwt.decode(refreshed.accessToken) as Record<string, any>;
+    expect(refreshedClaims.tenantId).toBe(clientTenantId);
+    expect(refreshedClaims.originalTenantId).toBe(originTenantId);
+
+    // Stopping preview returns Lewinsky cleanly back to originTenantId (Next Big Move), not FAMCO
+    const stopUser = await strategy.validate({ [IMPERSONATION_STOP_REQUEST]: true }, claims);
+    const restored = await service.stopImpersonation(stopUser);
+    const restoredClaims = jwt.decode(restored.accessToken) as Record<string, any>;
+    expect(restoredClaims).toMatchObject({ userId: 'lewinsky', tenantId: originTenantId });
+    expect(restoredClaims.impersonatedBy).toBeUndefined();
+    expect(restored.tenant?.id).toBe(originTenantId);
+  });
+
+  it('rejects cross-client impersonateClientUser for any other user even with SUPER_ADMIN or user.impersonate', async () => {
+    const { service } = buildCrossClientFixture();
+    await expect(
+      service.impersonateClientUser({ userId: 'other-super', tenantId: originTenantId, sessionId: 's1' }, clientTenantId, 'famco-lead'),
+    ).rejects.toThrow('designated owner');
+    await expect(
+      service.impersonateClientUser({ userId: 'tenant-admin', tenantId: originTenantId, sessionId: 's2' }, clientTenantId, 'famco-lead'),
+    ).rejects.toThrow('designated owner');
+  });
+});

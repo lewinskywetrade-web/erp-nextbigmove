@@ -7,10 +7,16 @@ import * as timezone from 'dayjs/plugin/timezone';
 import * as net from 'net';
 import * as tls from 'tls';
 import { PrismaService } from '../../common/prisma/prisma.service';
-import { SendWmsDailyInventoryEmailDto } from './dto/wms-daily-inventory-email.dto';
 import {
+  SendWmsDailyInventoryEmailDto,
+  SendWmsWarehouseDailyInventoryEmailDto,
+} from './dto/wms-daily-inventory-email.dto';
+import {
+  ClientDailyInventorySummary,
   DailyInventoryMovementRow,
   DailyInventoryMovementsReportTotals,
+  DailyInventoryReportScopeOptions,
+  WarehouseDailyInventoryEmailSubscription,
   WmsReportsService,
 } from './wms-reports.service';
 
@@ -127,13 +133,204 @@ export class WmsDailyInventoryEmailService implements OnModuleInit {
           );
         }
       }
+
+      await this.processScheduledWarehouseDailyEmail(todayManila, currentHm);
     } finally {
       this.isCronRunning = false;
     }
   }
 
-  async sendNow(dto: SendWmsDailyInventoryEmailDto) {
-    const targetTenantId = this.wmsReportsService.resolveTargetTenantId(dto.tenantId);
+  private async processScheduledWarehouseDailyEmail(
+    todayManila: string,
+    currentHm: string,
+  ) {
+    try {
+      const sub = await this.wmsReportsService.getWarehouseDailyEmailSubscription();
+      if (!sub.enabled) {
+        return;
+      }
+      if (sub.lastSentDate === todayManila) {
+        return;
+      }
+      if (currentHm < sub.sendTimeManila) {
+        return;
+      }
+      if (sub.effectiveRecipients.length === 0) {
+        return;
+      }
+
+      await this.sendWarehouseSummary({
+        startDate: todayManila,
+        endDate: todayManila,
+        tenantIds: [],
+        recipients: sub.effectiveRecipients,
+        bypassClsForCron: true,
+        subscription: sub,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `Daily warehouse inventory summary email failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  async previewWarehouseNow(query: {
+    date?: string;
+    startDate?: string;
+    endDate?: string;
+    tenantIds?: string[];
+  }) {
+    this.wmsReportsService.assertGlobalWmsAccess();
+    const window = this.wmsReportsService.normalizeDateWindow({
+      date: query.date,
+      startDate: query.startDate,
+      endDate: query.endDate,
+    });
+    const [reportData, subscription] = await Promise.all([
+      this.wmsReportsService.getWarehouseDailyInventoryData({
+        startDate: window.startDate,
+        endDate: window.endDate,
+        tenantIds: query.tenantIds ?? [],
+        storeIds: [],
+      }),
+      this.wmsReportsService.getWarehouseDailyEmailSubscription(),
+    ]);
+
+    const content = this.buildWarehouseEmailContent({
+      startDate: window.startDate,
+      endDate: window.endDate,
+      totals: reportData.totals,
+      rows: reportData.rows,
+      clientSummaries: reportData.clientSummaries,
+      generatedAt: reportData.report.generatedAt,
+      sendTimeManila: subscription.sendTimeManila,
+    });
+
+    return {
+      ...content,
+      totals: reportData.totals,
+      clientCount: reportData.clientSummaries.length,
+      subscription,
+    };
+  }
+
+  async sendWarehouseNow(dto: SendWmsWarehouseDailyInventoryEmailDto) {
+    this.wmsReportsService.assertGlobalWmsAccess();
+    const window = this.wmsReportsService.normalizeDateWindow({
+      date: dto.date,
+      startDate: dto.startDate,
+      endDate: dto.endDate,
+    });
+    const sub = await this.wmsReportsService.getWarehouseDailyEmailSubscription();
+    const recipients =
+      dto.recipients && dto.recipients.length > 0
+        ? dto.recipients
+        : sub.effectiveRecipients;
+
+    if (recipients.length === 0) {
+      throw new BadRequestException(
+        'No recipient email address is configured for the warehouse daily report. Please enter at least one email address.',
+      );
+    }
+
+    return this.sendWarehouseSummary({
+      startDate: window.startDate,
+      endDate: window.endDate,
+      tenantIds: dto.tenantIds ?? [],
+      recipients,
+      bypassClsForCron: false,
+      subscription: sub,
+    });
+  }
+
+  private async sendWarehouseSummary(params: {
+    startDate: string;
+    endDate: string;
+    tenantIds: string[];
+    recipients: string[];
+    bypassClsForCron: boolean;
+    subscription: WarehouseDailyInventoryEmailSubscription;
+  }) {
+    const reportData = await this.wmsReportsService.getWarehouseDailyInventoryData(
+      {
+        startDate: params.startDate,
+        endDate: params.endDate,
+        tenantIds: params.tenantIds,
+        storeIds: [],
+      },
+      { bypassClsForCron: params.bypassClsForCron },
+    );
+
+    const content = this.buildWarehouseEmailContent({
+      startDate: params.startDate,
+      endDate: params.endDate,
+      totals: reportData.totals,
+      rows: reportData.rows,
+      clientSummaries: reportData.clientSummaries,
+      generatedAt: reportData.report.generatedAt,
+      sendTimeManila: params.subscription.sendTimeManila,
+    });
+
+    const outcome = await this.deliverEmail({
+      from: this.resolveFromAddress(),
+      to: params.recipients,
+      subject: content.subject,
+      html: content.html,
+      text: content.text,
+      csvFilename: content.csvFilename,
+      csvContent: content.csvContent,
+    });
+
+    const sentAt = new Date().toISOString();
+    const nowManila = dayjs().tz(MANILA_TZ);
+    const todayManila = nowManila.format('YYYY-MM-DD');
+    const currentHm = nowManila.format('HH:mm');
+    const shouldMarkScheduledDay =
+      params.bypassClsForCron
+      || (params.endDate === todayManila && currentHm >= params.subscription.sendTimeManila);
+
+    await this.wmsReportsService.recordWarehouseDailyEmailDeliveryResult({
+      sentDate: shouldMarkScheduledDay ? params.endDate : null,
+      sentAt,
+      status: outcome.status,
+      mode: outcome.mode,
+      error: outcome.error ?? null,
+    });
+
+    const updatedSubscription = await this.wmsReportsService.getWarehouseDailyEmailSubscription();
+
+    this.logger.log(
+      `Warehouse daily inventory report (${content.dateLabel}, ${reportData.clientSummaries.length} clients) -> [${params.recipients.join(
+        ', ',
+      )}] status=${outcome.status} mode=${outcome.mode}`,
+    );
+
+    return {
+      dateLabel: content.dateLabel,
+      recipients: params.recipients,
+      subject: content.subject,
+      sentAt,
+      delivery: outcome,
+      clientCount: reportData.clientSummaries.length,
+      subscription: updatedSubscription,
+      preview: {
+        subject: content.subject,
+        html: content.html,
+        text: content.text,
+        csvFilename: content.csvFilename,
+        csvContent: content.csvContent,
+      },
+    };
+  }
+
+  async sendNow(
+    dto: SendWmsDailyInventoryEmailDto,
+    options?: DailyInventoryReportScopeOptions,
+  ) {
+    const targetTenantId = this.wmsReportsService.resolveTargetTenantId(dto.tenantId, options);
+    await this.wmsReportsService.assertCanManageClientPortalEmail(targetTenantId, options);
     const window = this.wmsReportsService.normalizeDateWindow({
       date: dto.date,
       startDate: dto.startDate,
@@ -162,6 +359,7 @@ export class WmsDailyInventoryEmailService implements OnModuleInit {
       endDate: window.endDate,
       recipients,
       bypassClsForCron: false,
+      enforceClientPortalScope: options?.enforceClientPortalScope,
     });
   }
 
@@ -171,6 +369,7 @@ export class WmsDailyInventoryEmailService implements OnModuleInit {
     endDate: string;
     recipients: string[];
     bypassClsForCron: boolean;
+    enforceClientPortalScope?: boolean;
   }) {
     const reportData = await this.wmsReportsService.getDailyInventoryMovementsReport(
       {
@@ -179,7 +378,10 @@ export class WmsDailyInventoryEmailService implements OnModuleInit {
         tenantIds: [params.tenantId],
         storeIds: [],
       },
-      { bypassClsForCron: params.bypassClsForCron },
+      {
+        bypassClsForCron: params.bypassClsForCron,
+        enforceClientPortalScope: params.enforceClientPortalScope,
+      },
     );
 
     const clientName =
@@ -209,11 +411,7 @@ export class WmsDailyInventoryEmailService implements OnModuleInit {
       rows: reportData.rows,
     });
 
-    const fromAddress =
-      process.env.DAILY_REPORT_EMAIL_FROM
-      || process.env.SMTP_FROM
-      || process.env.EMAIL_FROM
-      || 'WeTrade WMS <wms-inventory-update@wetrade.com.ph>';
+    const fromAddress = this.resolveFromAddress();
 
     const outcome = await this.deliverEmail({
       from: fromAddress,
@@ -601,6 +799,393 @@ export class WmsDailyInventoryEmailService implements OnModuleInit {
     return lines.join('\n');
   }
 
+  private resolveFromAddress(): string {
+    return (
+      process.env.DAILY_REPORT_EMAIL_FROM
+      || process.env.SMTP_FROM
+      || process.env.EMAIL_FROM
+      || 'WeTrade WMS <wms-inventory-update@wetrade.com.ph>'
+    );
+  }
+
+  private escapeHtml(value: string): string {
+    return value
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  private formatSigned(value: number): string {
+    return value >= 0 ? `+${value.toLocaleString()}` : value.toLocaleString();
+  }
+
+  private renderKpiCardsHtml(totals: DailyInventoryMovementsReportTotals): string {
+    return `<table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:20px;">
+        <tr>
+          <td width="24%" style="padding:12px;background:#ecfdf5;border-radius:12px;border:1px solid #a7f3d0;">
+            <div style="font-size:11px;color:#047857;font-weight:600;text-transform:uppercase;">Stock In</div>
+            <div style="font-size:21px;font-weight:700;color:#065f46;margin-top:4px;">+${totals.totalInQty.toLocaleString()}</div>
+            <div style="font-size:11px;color:#047857;margin-top:2px;">Rcv: ${totals.receivedInQty.toLocaleString()} • Man: ${totals.manualInQty.toLocaleString()} • Rts: ${totals.restockedInQty.toLocaleString()}</div>
+          </td>
+          <td width="1.3%"></td>
+          <td width="24%" style="padding:12px;background:#fff1f2;border-radius:12px;border:1px solid #fecdd3;">
+            <div style="font-size:11px;color:#be123c;font-weight:600;text-transform:uppercase;">Stock Out</div>
+            <div style="font-size:21px;font-weight:700;color:#9f1239;margin-top:4px;">-${totals.totalOutQty.toLocaleString()}</div>
+            <div style="font-size:11px;color:#be123c;margin-top:2px;">Ship: ${totals.dispatchedOutQty.toLocaleString()} • Pack: ${totals.packedOutQty.toLocaleString()} • Adj: ${totals.adjustedOutQty.toLocaleString()}</div>
+          </td>
+          <td width="1.3%"></td>
+          <td width="24%" style="padding:12px;background:#f8fafc;border-radius:12px;border:1px solid #e2e8f0;">
+            <div style="font-size:11px;color:#475569;font-weight:600;text-transform:uppercase;">Net &amp; Put-Away</div>
+            <div style="font-size:21px;font-weight:700;color:#0f172a;margin-top:4px;">${this.formatSigned(totals.netChangeQty)}</div>
+            <div style="font-size:11px;color:#64748b;margin-top:2px;">Put-away: ${totals.putAwayMovedQty.toLocaleString()} • Moved SKUs: ${totals.activeMovedVariantCount.toLocaleString()}</div>
+          </td>
+          <td width="1.3%"></td>
+          <td width="24%" style="padding:12px;background:#eff6ff;border-radius:12px;border:1px solid #bfdbfe;">
+            <div style="font-size:11px;color:#1d4ed8;font-weight:600;text-transform:uppercase;">Closing Stock</div>
+            <div style="font-size:21px;font-weight:700;color:#1e3a8a;margin-top:4px;">${totals.onHandQty.toLocaleString()}</div>
+            <div style="font-size:11px;color:#1d4ed8;margin-top:2px;">Bin: ${totals.inBinQty.toLocaleString()} • Stg: ${totals.awaitingPutAwayQty.toLocaleString()} • Res: ${totals.reservedQty.toLocaleString()}</div>
+          </td>
+        </tr>
+      </table>`;
+  }
+
+  private buildWarehouseEmailContent(params: {
+    startDate: string;
+    endDate: string;
+    totals: DailyInventoryMovementsReportTotals;
+    rows: DailyInventoryMovementRow[];
+    clientSummaries: ClientDailyInventorySummary[];
+    generatedAt: string;
+    sendTimeManila?: string;
+  }) {
+    const dateLabel =
+      params.startDate === params.endDate
+        ? params.startDate
+        : `${params.startDate} to ${params.endDate}`;
+    const subject = `[Warehouse Daily Inventory Ins & Outs] All Clients — ${dateLabel}`;
+    const csvFilename = `warehouse-inventory-ins-outs-all-clients-${params.startDate}${
+      params.endDate !== params.startDate ? `-to-${params.endDate}` : ''
+    }.csv`;
+
+    const sortedRowsForCsv = [...params.rows].sort((left, right) => {
+      const leftMoved = left.totalInQty + left.totalOutQty + left.putAwayMovedQty > 0 ? 1 : 0;
+      const rightMoved = right.totalInQty + right.totalOutQty + right.putAwayMovedQty > 0 ? 1 : 0;
+      const tenantCmp = left.tenantName.localeCompare(right.tenantName);
+      if (tenantCmp !== 0) return tenantCmp;
+      if (leftMoved !== rightMoved) return rightMoved - leftMoved;
+      return left.storeName.localeCompare(right.storeName) || left.variantName.localeCompare(right.variantName);
+    });
+
+    const csvContent = this.buildCsvContent(sortedRowsForCsv, params.startDate, params.endDate);
+    const html = this.buildWarehouseHtmlEmail({
+      dateLabel,
+      totals: params.totals,
+      clientSummaries: params.clientSummaries,
+      sendTimeManila: params.sendTimeManila || '20:00',
+    });
+    const text = this.buildWarehousePlainTextEmail({
+      dateLabel,
+      totals: params.totals,
+      clientSummaries: params.clientSummaries,
+    });
+
+    return {
+      dateLabel,
+      subject,
+      html,
+      text,
+      csvFilename,
+      csvContent,
+    };
+  }
+
+  private buildWarehousePlainTextEmail(params: {
+    dateLabel: string;
+    totals: DailyInventoryMovementsReportTotals;
+    clientSummaries: ClientDailyInventorySummary[];
+  }): string {
+    const { dateLabel, totals, clientSummaries } = params;
+    const lines: string[] = [
+      'WAREHOUSE DAILY INVENTORY INS & OUTS REPORT — ALL CLIENTS (BY CLIENT)',
+      `Date: ${dateLabel} (Asia/Manila)`,
+      `Active Clients: ${clientSummaries.length}`,
+      '',
+      'WAREHOUSE TOTALS',
+      `- Total Stock In: +${totals.totalInQty} (Received: ${totals.receivedInQty}, Manual: ${totals.manualInQty}, Restocked: ${totals.restockedInQty})`,
+      `- Put Away to Bins: ${totals.putAwayMovedQty}`,
+      `- Total Stock Out: -${totals.totalOutQty} (Dispatched: ${totals.dispatchedOutQty}, Packed/Picked: ${totals.packedOutQty}, Adjusted: ${totals.adjustedOutQty})`,
+      `- Net Inventory Change: ${this.formatSigned(totals.netChangeQty)}`,
+      `- Closing On-Hand Stock: ${totals.onHandQty} (In Bin: ${totals.inBinQty}, Awaiting Put-Away: ${totals.awaitingPutAwayQty}, Reserved: ${totals.reservedQty})`,
+      '',
+      'SUMMARY BY CLIENT',
+      ...clientSummaries.map(
+        (client) =>
+          `• ${client.tenantName} (${client.storeCount} stores): IN +${client.totalInQty} | Put-Away ${client.putAwayMovedQty} | OUT -${client.totalOutQty} | Net ${this.formatSigned(
+            client.netChangeQty,
+          )} | Closing On-Hand ${client.onHandQty} (Bin ${client.inBinQty})`,
+      ),
+      '',
+      'DETAILED BREAKDOWN PER CLIENT',
+    ];
+
+    for (const client of clientSummaries) {
+      lines.push('');
+      lines.push(
+        `=== ${client.tenantName.toUpperCase()} | IN +${client.totalInQty} | Put-Away ${client.putAwayMovedQty} | OUT -${client.totalOutQty} | Net ${this.formatSigned(
+          client.netChangeQty,
+        )} | On-Hand ${client.onHandQty} ===`,
+      );
+
+      if (client.activityBreakdown.length > 0) {
+        const topActivity = client.activityBreakdown
+          .slice(0, 8)
+          .map(
+            (item) =>
+              `${item.direction} ${item.movementType}${item.referenceCode ? ` (${item.referenceCode})` : ''}: ${item.unitCount}`,
+          )
+          .join(' • ');
+        lines.push(`Activity: ${topActivity}`);
+      }
+
+      const relevantRows = client.rows.filter(
+        (row) =>
+          row.totalInQty > 0
+          || row.totalOutQty > 0
+          || row.putAwayMovedQty > 0
+          || row.onHandQty > 0,
+      );
+
+      if (relevantRows.length === 0) {
+        lines.push('  No stock movements or on-hand stock for this client.');
+        continue;
+      }
+
+      for (const row of relevantRows) {
+        const sku = row.variantCode || row.variantDisplayId || row.variationId || '—';
+        lines.push(
+          `  - [${row.storeName}] ${row.variantName} (${sku}): IN +${row.totalInQty} (Rcv ${row.receivedInQty}, Man ${row.manualInQty}, Rts ${row.restockedInQty}) | Put-Away ${row.putAwayMovedQty} | OUT -${row.totalOutQty} (Ship ${row.dispatchedOutQty}, Pack ${row.packedOutQty}, Adj ${row.adjustedOutQty}) | Net ${this.formatSigned(
+            row.netChangeQty,
+          )} | On-Hand ${row.onHandQty} (Bin ${row.inBinQty}, Stg ${row.awaitingPutAwayQty}, Res ${row.reservedQty})`,
+        );
+      }
+    }
+
+    return lines.join('\n');
+  }
+
+  private buildWarehouseHtmlEmail(params: {
+    dateLabel: string;
+    totals: DailyInventoryMovementsReportTotals;
+    clientSummaries: ClientDailyInventorySummary[];
+    sendTimeManila: string;
+  }): string {
+    const { dateLabel, totals, clientSummaries, sendTimeManila } = params;
+    const esc = (v: string) => this.escapeHtml(v);
+
+    const formatInBreakdown = (item: {
+      receivedInQty: number;
+      manualInQty: number;
+      restockedInQty: number;
+    }) => {
+      const parts: string[] = [];
+      if (item.receivedInQty > 0) parts.push(`Rcv ${item.receivedInQty.toLocaleString()}`);
+      if (item.manualInQty > 0) parts.push(`Man ${item.manualInQty.toLocaleString()}`);
+      if (item.restockedInQty > 0) parts.push(`Rts ${item.restockedInQty.toLocaleString()}`);
+      return parts.join(' • ');
+    };
+
+    const formatOutBreakdown = (item: {
+      dispatchedOutQty: number;
+      packedOutQty: number;
+      adjustedOutQty: number;
+    }) => {
+      const parts: string[] = [];
+      if (item.dispatchedOutQty > 0) parts.push(`Ship ${item.dispatchedOutQty.toLocaleString()}`);
+      if (item.packedOutQty > 0) parts.push(`Pack ${item.packedOutQty.toLocaleString()}`);
+      if (item.adjustedOutQty > 0) parts.push(`Adj ${item.adjustedOutQty.toLocaleString()}`);
+      return parts.join(' • ');
+    };
+
+    const summaryRowsHtml = clientSummaries
+      .map((client) => {
+        const inSub = formatInBreakdown(client);
+        const outSub = formatOutBreakdown(client);
+        const hasActivity = client.totalInQty > 0 || client.totalOutQty > 0 || client.putAwayMovedQty > 0;
+        const rowBg = hasActivity ? '#ffffff' : '#fafbfc';
+        return `<tr style="background:${rowBg};">
+<td style="padding:8px 10px;border-bottom:1px solid #e2e8f0;font-size:12px;color:#0f172a;font-weight:700;">${esc(client.tenantName)}<div style="font-size:10px;color:#64748b;font-weight:400;">${client.storeCount} store(s) • ${client.movedVariantCount}/${client.variantCount} moved SKUs</div></td>
+<td style="padding:8px 10px;border-bottom:1px solid #e2e8f0;font-size:12px;text-align:right;color:${client.totalInQty > 0 ? '#059669' : '#64748b'};font-weight:700;">${client.totalInQty > 0 ? `+${client.totalInQty.toLocaleString()}` : '0'}${inSub ? `<div style="font-size:10px;color:#64748b;font-weight:400;">${inSub}</div>` : ''}</td>
+<td style="padding:8px 10px;border-bottom:1px solid #e2e8f0;font-size:12px;text-align:right;color:#475569;">${client.putAwayMovedQty.toLocaleString()}</td>
+<td style="padding:8px 10px;border-bottom:1px solid #e2e8f0;font-size:12px;text-align:right;color:${client.totalOutQty > 0 ? '#e11d48' : '#64748b'};font-weight:700;">${client.totalOutQty > 0 ? `-${client.totalOutQty.toLocaleString()}` : '0'}${outSub ? `<div style="font-size:10px;color:#64748b;font-weight:400;">${outSub}</div>` : ''}</td>
+<td style="padding:8px 10px;border-bottom:1px solid #e2e8f0;font-size:12px;text-align:right;color:#0f172a;font-weight:600;">${this.formatSigned(client.netChangeQty)}</td>
+<td style="padding:8px 10px;border-bottom:1px solid #e2e8f0;font-size:12px;text-align:right;color:#0f172a;font-weight:700;">${client.onHandQty.toLocaleString()}<div style="font-size:10px;color:#64748b;font-weight:400;">Bin ${client.inBinQty.toLocaleString()} • Stg ${client.awaitingPutAwayQty.toLocaleString()} • Res ${client.reservedQty.toLocaleString()}</div></td>
+</tr>`;
+      })
+      .join('');
+
+    const grandTotalRowHtml = `<tr style="background:#f1f5f9;">
+<td style="padding:9px 10px;font-size:12px;color:#0f172a;font-weight:700;">WAREHOUSE TOTAL (${clientSummaries.length} Clients)</td>
+<td style="padding:9px 10px;font-size:12px;text-align:right;color:#065f46;font-weight:700;">+${totals.totalInQty.toLocaleString()}</td>
+<td style="padding:9px 10px;font-size:12px;text-align:right;color:#334155;font-weight:700;">${totals.putAwayMovedQty.toLocaleString()}</td>
+<td style="padding:9px 10px;font-size:12px;text-align:right;color:#9f1239;font-weight:700;">-${totals.totalOutQty.toLocaleString()}</td>
+<td style="padding:9px 10px;font-size:12px;text-align:right;color:#0f172a;font-weight:700;">${this.formatSigned(totals.netChangeQty)}</td>
+<td style="padding:9px 10px;font-size:12px;text-align:right;color:#1e3a8a;font-weight:700;">${totals.onHandQty.toLocaleString()}</td>
+</tr>`;
+
+    const renderProductRowHtml = (row: DailyInventoryMovementRow) => {
+      const sku = row.variantCode || row.variantDisplayId || row.variationId || '—';
+      const inSub = formatInBreakdown(row);
+      const outSub = formatOutBreakdown(row);
+      return `<tr>
+<td style="padding:7px 10px;border-bottom:1px solid #edf2f7;font-size:12px;color:#0f172a;font-weight:600;">${esc(row.variantName)}<div style="font-size:10px;color:#64748b;font-weight:400;">${esc(row.storeName)} • ${esc(sku)}</div></td>
+<td style="padding:7px 10px;border-bottom:1px solid #edf2f7;font-size:12px;text-align:right;color:${row.totalInQty > 0 ? '#059669' : '#94a3b8'};font-weight:600;">${row.totalInQty > 0 ? `+${row.totalInQty.toLocaleString()}` : '0'}${inSub ? `<div style="font-size:10px;color:#64748b;font-weight:400;">${inSub}</div>` : ''}</td>
+<td style="padding:7px 10px;border-bottom:1px solid #edf2f7;font-size:12px;text-align:right;color:${row.putAwayMovedQty > 0 ? '#334155' : '#94a3b8'};">${row.putAwayMovedQty.toLocaleString()}</td>
+<td style="padding:7px 10px;border-bottom:1px solid #edf2f7;font-size:12px;text-align:right;color:${row.totalOutQty > 0 ? '#e11d48' : '#94a3b8'};font-weight:600;">${row.totalOutQty > 0 ? `-${row.totalOutQty.toLocaleString()}` : '0'}${outSub ? `<div style="font-size:10px;color:#64748b;font-weight:400;">${outSub}</div>` : ''}</td>
+<td style="padding:7px 10px;border-bottom:1px solid #edf2f7;font-size:12px;text-align:right;color:#334155;font-weight:600;">${this.formatSigned(row.netChangeQty)}</td>
+<td style="padding:7px 10px;border-bottom:1px solid #edf2f7;font-size:12px;text-align:right;color:#0f172a;font-weight:700;">${row.onHandQty.toLocaleString()}<div style="font-size:10px;color:#64748b;font-weight:400;">Bin ${row.inBinQty.toLocaleString()}${row.awaitingPutAwayQty > 0 ? ` • Stg ${row.awaitingPutAwayQty.toLocaleString()}` : ''}${row.reservedQty > 0 ? ` • Res ${row.reservedQty.toLocaleString()}` : ''}</div></td>
+</tr>`;
+    };
+
+    const movedRowsCount = clientSummaries.reduce(
+      (sum, c) => sum + c.rows.filter((r) => r.totalInQty > 0 || r.totalOutQty > 0 || r.putAwayMovedQty > 0).length,
+      0,
+    );
+    // Keep total HTML safely below Gmail's 102 KB clipping threshold while always showing 100% of moved rows.
+    const approxFixedBytes = 8000 + summaryRowsHtml.length + movedRowsCount * 750 + clientSummaries.length * 1100;
+    const stockedRowAllowance = Math.max(0, Math.floor((90000 - approxFixedBytes) / 750));
+    let remainingStockedSlots = stockedRowAllowance;
+
+    const clientSectionsHtml = clientSummaries
+      .map((client) => {
+        const movedRows = client.rows.filter(
+          (r) => r.totalInQty > 0 || r.totalOutQty > 0 || r.putAwayMovedQty > 0,
+        );
+        const stockedOnlyRows = client.rows
+          .filter(
+            (r) =>
+              r.totalInQty === 0
+              && r.totalOutQty === 0
+              && r.putAwayMovedQty === 0
+              && r.onHandQty > 0,
+          )
+          .sort((a, b) => b.onHandQty - a.onHandQty || a.variantName.localeCompare(b.variantName));
+
+        const includedStocked =
+          remainingStockedSlots > 0 ? stockedOnlyRows.slice(0, remainingStockedSlots) : [];
+        remainingStockedSlots = Math.max(0, remainingStockedSlots - includedStocked.length);
+        const omittedStockedCount = stockedOnlyRows.length - includedStocked.length;
+        const displayRows = [...movedRows, ...includedStocked];
+
+        const activityText =
+          client.activityBreakdown.length > 0
+            ? client.activityBreakdown
+                .slice(0, 8)
+                .map((item) => {
+                  const sign = item.direction === 'IN' ? '+' : item.direction === 'OUT' ? '-' : '';
+                  const ref = item.referenceCode ? ` (${esc(item.referenceCode)})` : '';
+                  return `${esc(item.movementType)}${ref}: ${sign}${item.unitCount.toLocaleString()}`;
+                })
+                .join(' • ')
+            : '';
+
+        const headerHtml = `<div style="padding:12px 14px;background:#1e293b;color:#ffffff;">
+<table width="100%" cellpadding="0" cellspacing="0"><tr>
+<td style="font-size:14px;font-weight:700;color:#ffffff;">${esc(client.tenantName)}<div style="font-size:11px;color:#cbd5e1;font-weight:400;margin-top:2px;">${client.storeCount} store(s) • ${movedRows.length} moved SKU(s) • ${client.variantCount} total SKU(s)</div></td>
+<td style="text-align:right;font-size:11px;color:#e2e8f0;white-space:nowrap;">
+<span style="color:#6ee7b7;font-weight:700;">IN +${client.totalInQty.toLocaleString()}</span> &nbsp;|&nbsp;
+<span style="color:#fda4af;font-weight:700;">OUT -${client.totalOutQty.toLocaleString()}</span> &nbsp;|&nbsp;
+<span style="font-weight:700;">Net ${this.formatSigned(client.netChangeQty)}</span> &nbsp;|&nbsp;
+<span style="color:#93c5fd;font-weight:700;">On-Hand ${client.onHandQty.toLocaleString()}</span>
+</td>
+</tr></table>
+${activityText ? `<div style="margin-top:6px;padding-top:6px;border-top:1px solid #334155;font-size:11px;color:#e2e8f0;"><strong>Activity:</strong> ${activityText}${client.activityBreakdown.length > 8 ? ` • +${client.activityBreakdown.length - 8} more` : ''}</div>` : ''}
+</div>`;
+
+        if (displayRows.length === 0) {
+          return `<div style="margin-top:16px;border:1px solid #cbd5e1;border-radius:12px;overflow:hidden;">
+${headerHtml}
+<div style="padding:10px 14px;background:#ffffff;font-size:12px;color:#64748b;">No stock movements or on-hand inventory recorded for this client in this period${client.variantCount > 0 ? ` (${client.variantCount} inactive catalog SKUs included in CSV)` : ''}.</div>
+</div>`;
+        }
+
+        const rowsHtml = displayRows.map(renderProductRowHtml).join('');
+        const omittedNoteRow =
+          omittedStockedCount > 0
+            ? `<tr style="background:#f8fafc;"><td colspan="6" style="padding:7px 10px;border-bottom:1px solid #edf2f7;font-size:11px;color:#475569;font-style:italic;">+ ${omittedStockedCount.toLocaleString()} additional unmoved stocked SKUs included in the attached CSV.</td></tr>`
+            : '';
+        const subtotalRow = `<tr style="background:#f8fafc;">
+<td style="padding:8px 10px;font-size:11px;color:#0f172a;font-weight:700;">Client Subtotal (${esc(client.tenantName)})</td>
+<td style="padding:8px 10px;font-size:11px;text-align:right;color:#065f46;font-weight:700;">+${client.totalInQty.toLocaleString()}</td>
+<td style="padding:8px 10px;font-size:11px;text-align:right;color:#334155;font-weight:700;">${client.putAwayMovedQty.toLocaleString()}</td>
+<td style="padding:8px 10px;font-size:11px;text-align:right;color:#9f1239;font-weight:700;">-${client.totalOutQty.toLocaleString()}</td>
+<td style="padding:8px 10px;font-size:11px;text-align:right;color:#0f172a;font-weight:700;">${this.formatSigned(client.netChangeQty)}</td>
+<td style="padding:8px 10px;font-size:11px;text-align:right;color:#1e3a8a;font-weight:700;">${client.onHandQty.toLocaleString()}</td>
+</tr>`;
+
+        return `<div style="margin-top:16px;border:1px solid #cbd5e1;border-radius:12px;overflow:hidden;">
+${headerHtml}
+<table width="100%" cellpadding="0" cellspacing="0">
+<thead><tr style="background:#f1f5f9;">
+<th style="padding:7px 10px;text-align:left;font-size:10px;text-transform:uppercase;color:#475569;">Product / Store</th>
+<th style="padding:7px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:#475569;">In (+)</th>
+<th style="padding:7px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:#475569;">Put Away</th>
+<th style="padding:7px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:#475569;">Out (-)</th>
+<th style="padding:7px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:#475569;">Net</th>
+<th style="padding:7px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:#475569;">On-Hand</th>
+</tr></thead>
+<tbody>${rowsHtml}${omittedNoteRow}${subtotalRow}</tbody>
+</table>
+</div>`;
+      })
+      .join('');
+
+    return `<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:20px;background-color:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#0f172a;">
+  <div style="max-width:840px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;">
+    <div style="padding:22px 24px;background:#17324b;color:#ffffff;">
+      <div style="font-size:11px;letter-spacing:0.16em;text-transform:uppercase;color:#93c5fd;font-weight:600;">Daily Warehouse Inventory Report • All Clients</div>
+      <h1 style="margin:6px 0 4px;font-size:21px;font-weight:700;">Warehouse Stock Ins &amp; Outs (By Client)</h1>
+      <div style="font-size:13px;color:#cbd5e1;">Report Date: ${esc(dateLabel)} (Asia/Manila) • ${clientSummaries.length} Active Clients • ${totals.activeMovedVariantCount.toLocaleString()} Moved Products</div>
+    </div>
+    <div style="padding:20px 24px;">
+      ${this.renderKpiCardsHtml(totals)}
+
+      <h3 style="margin:0 0 10px;font-size:15px;color:#0f172a;">Summary by Client</h3>
+      <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;margin-bottom:22px;">
+        <thead>
+          <tr style="background:#f1f5f9;">
+            <th style="padding:8px 10px;text-align:left;font-size:10px;text-transform:uppercase;color:#475569;">Client</th>
+            <th style="padding:8px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:#475569;">In (+)</th>
+            <th style="padding:8px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:#475569;">Put Away</th>
+            <th style="padding:8px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:#475569;">Out (-)</th>
+            <th style="padding:8px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:#475569;">Net</th>
+            <th style="padding:8px 10px;text-align:right;font-size:10px;text-transform:uppercase;color:#475569;">Closing On-Hand</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${
+            summaryRowsHtml
+            || '<tr><td colspan="6" style="padding:18px;text-align:center;color:#64748b;font-size:12px;">No active clients found.</td></tr>'
+          }
+          ${summaryRowsHtml ? grandTotalRowHtml : ''}
+        </tbody>
+      </table>
+
+      <h3 style="margin:0 0 4px;font-size:15px;color:#0f172a;">Detailed Stock Ins &amp; Outs Per Client</h3>
+      <div style="font-size:12px;color:#64748b;margin-bottom:8px;">Clients with warehouse activity today are listed first, followed by remaining active clients.</div>
+      ${clientSectionsHtml}
+
+      <div style="margin-top:18px;font-size:12px;color:#64748b;">
+        The complete all-clients CSV report is attached to this email. This consolidated report is automatically sent daily at ${esc(sendTimeManila)} (Asia/Manila).
+      </div>
+    </div>
+  </div>
+</body>
+</html>`;
+  }
+
   private buildHtmlEmail(params: {
     clientName: string;
     dateLabel: string;
@@ -612,20 +1197,13 @@ export class WmsDailyInventoryEmailService implements OnModuleInit {
     const movedRows = rows.filter((r) => r.totalInQty > 0 || r.totalOutQty > 0);
     const displayRows = (movedRows.length > 0 ? movedRows : rows).slice(0, 50);
 
-    const escapeHtml = (value: string) =>
-      value
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
-
     const rowHtml = displayRows
       .map(
         (row) => `
         <tr>
           <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:13px;color:#0f172a;font-weight:600;">
-            ${escapeHtml(row.variantName)}
-            <div style="font-size:11px;color:#64748b;font-weight:400;">${escapeHtml(row.storeName)} • ${escapeHtml(row.variantCode || row.variationId || '—')}</div>
+            ${this.escapeHtml(row.variantName)}
+            <div style="font-size:11px;color:#64748b;font-weight:400;">${this.escapeHtml(row.storeName)} • ${this.escapeHtml(row.variantCode || row.variationId || '—')}</div>
           </td>
           <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:13px;text-align:right;color:#059669;font-weight:600;">
             +${row.totalInQty.toLocaleString()}
@@ -634,7 +1212,7 @@ export class WmsDailyInventoryEmailService implements OnModuleInit {
             -${row.totalOutQty.toLocaleString()}
           </td>
           <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:13px;text-align:right;color:#334155;font-weight:600;">
-            ${row.netChangeQty >= 0 ? `+${row.netChangeQty.toLocaleString()}` : row.netChangeQty.toLocaleString()}
+            ${this.formatSigned(row.netChangeQty)}
           </td>
           <td style="padding:10px 12px;border-bottom:1px solid #e2e8f0;font-size:13px;text-align:right;color:#0f172a;font-weight:700;">
             ${row.onHandQty.toLocaleString()}
@@ -650,41 +1228,11 @@ export class WmsDailyInventoryEmailService implements OnModuleInit {
   <div style="max-width:720px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;">
     <div style="padding:24px;background:#17324b;color:#ffffff;">
       <div style="font-size:11px;letter-spacing:0.16em;text-transform:uppercase;color:#93c5fd;font-weight:600;">Daily Automated Inventory Report</div>
-      <h1 style="margin:6px 0 4px;font-size:22px;font-weight:700;">${escapeHtml(clientName)} — Inventory Ins &amp; Outs</h1>
-      <div style="font-size:13px;color:#cbd5e1;">Report Date: ${escapeHtml(dateLabel)} (Manila Time)</div>
+      <h1 style="margin:6px 0 4px;font-size:22px;font-weight:700;">${this.escapeHtml(clientName)} — Inventory Ins &amp; Outs</h1>
+      <div style="font-size:13px;color:#cbd5e1;">Report Date: ${this.escapeHtml(dateLabel)} (Manila Time)</div>
     </div>
     <div style="padding:24px;">
-      <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:24px;">
-        <tr>
-          <td width="25%" style="padding:12px;background:#ecfdf5;border-radius:12px;border:1px solid #a7f3d0;">
-            <div style="font-size:11px;color:#047857;font-weight:600;text-transform:uppercase;">Stock In</div>
-            <div style="font-size:22px;font-weight:700;color:#065f46;margin-top:4px;">+${totals.totalInQty.toLocaleString()}</div>
-            <div style="font-size:11px;color:#047857;margin-top:2px;">Rcv: ${totals.receivedInQty} • Man: ${totals.manualInQty}</div>
-          </td>
-          <td width="2%"></td>
-          <td width="25%" style="padding:12px;background:#fff1f2;border-radius:12px;border:1px solid #fecdd3;">
-            <div style="font-size:11px;color:#be123c;font-weight:600;text-transform:uppercase;">Stock Out</div>
-            <div style="font-size:22px;font-weight:700;color:#9f1239;margin-top:4px;">-${totals.totalOutQty.toLocaleString()}</div>
-            <div style="font-size:11px;color:#be123c;margin-top:2px;">Ship: ${totals.dispatchedOutQty} • Pack: ${totals.packedOutQty}</div>
-          </td>
-          <td width="2%"></td>
-          <td width="21%" style="padding:12px;background:#f8fafc;border-radius:12px;border:1px solid #e2e8f0;">
-            <div style="font-size:11px;color:#475569;font-weight:600;text-transform:uppercase;">Net Change</div>
-            <div style="font-size:22px;font-weight:700;color:#0f172a;margin-top:4px;">${
-              totals.netChangeQty >= 0
-                ? `+${totals.netChangeQty.toLocaleString()}`
-                : totals.netChangeQty.toLocaleString()
-            }</div>
-            <div style="font-size:11px;color:#64748b;margin-top:2px;">Put-away: ${totals.putAwayMovedQty}</div>
-          </td>
-          <td width="2%"></td>
-          <td width="23%" style="padding:12px;background:#eff6ff;border-radius:12px;border:1px solid #bfdbfe;">
-            <div style="font-size:11px;color:#1d4ed8;font-weight:600;text-transform:uppercase;">Closing Stock</div>
-            <div style="font-size:22px;font-weight:700;color:#1e3a8a;margin-top:4px;">${totals.onHandQty.toLocaleString()}</div>
-            <div style="font-size:11px;color:#1d4ed8;margin-top:2px;">In Bin: ${totals.inBinQty.toLocaleString()}</div>
-          </td>
-        </tr>
-      </table>
+      ${this.renderKpiCardsHtml(totals)}
 
       <h3 style="margin:0 0 12px;font-size:15px;color:#0f172a;">Product Ins &amp; Outs Summary</h3>
       <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">

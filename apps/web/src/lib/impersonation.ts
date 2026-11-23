@@ -80,10 +80,36 @@ export async function startImpersonation(userId: string): Promise<void> {
   window.location.href = '/dashboard';
 }
 
+/**
+ * Swap the session into a target client tenant & user in read-only View As
+ * mode (designated owner account only, enforced server-side).
+ */
+export async function startClientPortalPreview(params: {
+  tenantId: string;
+  userId: string;
+  destination?: string;
+}): Promise<void> {
+  const { data } = await apiClient.post('/auth/impersonate/client', {
+    tenantId: params.tenantId,
+    userId: params.userId,
+  });
+  if (data?.impersonationReadOnly !== true || !data?.impersonatedBy) {
+    throw new Error('Read-only client preview is not available. Reload and try again.');
+  }
+  applySession(data);
+  window.localStorage.setItem(IMPERSONATION_KEY, JSON.stringify({
+    name: [data.user?.firstName, data.user?.lastName].filter(Boolean).join(' ') || data.user?.email,
+    email: data.user?.email ?? '',
+  }));
+  window.location.href = params.destination || '/daily-inventory';
+}
+
 /** Hand the session back to the admin who started it. */
 export async function stopImpersonation(): Promise<void> {
+  let returnedTenantId: string | null = null;
   try {
     const { data } = await apiClient.post('/auth/impersonate/stop');
+    returnedTenantId = data?.tenant?.id ?? null;
     applySession(data);
   } catch (error: any) {
     // 400 here means the server looked at the token and found no impersonation
@@ -99,5 +125,5 @@ export async function stopImpersonation(): Promise<void> {
     throw error;
   }
   clearImpersonation();
-  window.location.href = '/settings/users';
+  window.location.href = returnedTenantId ? '/settings/users' : '/dashboard';
 }

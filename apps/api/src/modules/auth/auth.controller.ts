@@ -1,6 +1,12 @@
 import { Controller, Post, Body, HttpCode, HttpStatus, Get, UseGuards, Request, Patch, BadRequestException, UnauthorizedException, Query, Param, ParseUUIDPipe } from '@nestjs/common';
 import { AuthService } from './auth.service';
-import { RegisterDto, LoginDto, RefreshTokenDto, UpdateProfileDto } from './dto';
+import {
+  ImpersonateClientDto,
+  LoginDto,
+  RefreshTokenDto,
+  RegisterDto,
+  UpdateProfileDto,
+} from './dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { PermissionsGuard } from '../../common/guards/permissions.guard';
 import { Permissions } from '../../common/decorators/permissions.decorator';
@@ -71,11 +77,16 @@ export class AuthController {
   @Get('me')
   @UseGuards(JwtAuthGuard)
   async getProfile(@Request() req) {
-    return {
-      user: req.user,
-      memberships: await this.authService.listSessionMemberships({
+    const [memberships, canPreviewClients] = await Promise.all([
+      this.authService.listSessionMemberships({
         ...req.user, userId: req.user.userId || req.user.id,
       }),
+      this.authService.canUserPreviewAllClients(req.user),
+    ]);
+    return {
+      user: req.user,
+      memberships,
+      canPreviewClients,
     };
   }
 
@@ -228,6 +239,39 @@ export class AuthController {
   @UseGuards(JwtAuthGuard)
   async stopImpersonation(@Request() req) {
     return this.authService.stopImpersonation(req.user, req);
+  }
+
+  /**
+   * List active client workspaces available for cross-client live preview
+   * (restricted server-side exclusively to the designated owner account).
+   */
+  @Get('client-preview/tenants')
+  @UseGuards(JwtAuthGuard)
+  async listClientPreviewTenants(@Request() req) {
+    return this.authService.listClientPreviewTenants(req.user);
+  }
+
+  /**
+   * List active ERP user accounts inside a target client workspace for
+   * cross-client View As selection.
+   */
+  @Get('client-preview/tenants/:tenantId/users')
+  @UseGuards(JwtAuthGuard)
+  async listClientPreviewTenantUsers(
+    @Param('tenantId', ParseUUIDPipe) tenantId: string,
+    @Request() req,
+  ) {
+    return this.authService.listClientPreviewTenantUsers(req.user, tenantId);
+  }
+
+  /**
+   * Launch a read-only cross-client View As session for the designated owner account.
+   * Declared BEFORE impersonate/:userId so Nest matches 'client' explicitly.
+   */
+  @Post('impersonate/client')
+  @UseGuards(JwtAuthGuard)
+  async impersonateClient(@Body() dto: ImpersonateClientDto, @Request() req) {
+    return this.authService.impersonateClientUser(req.user, dto.tenantId, dto.userId, req);
   }
 
   /**

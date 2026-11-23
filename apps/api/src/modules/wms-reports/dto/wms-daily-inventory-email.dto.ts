@@ -9,6 +9,7 @@ import {
   IsUUID,
   Matches,
 } from 'class-validator';
+import { parseUuidList } from './get-wms-daily-inventory-movements.dto';
 
 function parseEmailList(value: unknown): string[] | undefined {
   if (value === undefined || value === null) {
@@ -25,11 +26,7 @@ function parseEmailList(value: unknown): string[] | undefined {
   );
 }
 
-export class UpdateWmsDailyInventoryEmailSubscriptionDto {
-  @IsOptional()
-  @IsUUID('4')
-  tenantId?: string;
-
+export class UpdateWmsWarehouseDailyInventoryEmailSubscriptionDto {
   @IsOptional()
   @IsBoolean()
   enabled?: boolean;
@@ -49,11 +46,13 @@ export class UpdateWmsDailyInventoryEmailSubscriptionDto {
   sendTimeManila?: string;
 }
 
-export class SendWmsDailyInventoryEmailDto {
+export class UpdateWmsDailyInventoryEmailSubscriptionDto extends UpdateWmsWarehouseDailyInventoryEmailSubscriptionDto {
   @IsOptional()
   @IsUUID('4')
   tenantId?: string;
+}
 
+class BaseSendWmsDailyInventoryEmailDto {
   @IsOptional()
   @IsString()
   @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'date must use YYYY-MM-DD format' })
@@ -75,4 +74,19 @@ export class SendWmsDailyInventoryEmailDto {
   @ArrayMaxSize(25)
   @IsEmail({}, { each: true })
   recipients?: string[];
+}
+
+export class SendWmsDailyInventoryEmailDto extends BaseSendWmsDailyInventoryEmailDto {
+  @IsOptional()
+  @IsUUID('4')
+  tenantId?: string;
+}
+
+export class SendWmsWarehouseDailyInventoryEmailDto extends BaseSendWmsDailyInventoryEmailDto {
+  @IsOptional()
+  @Transform(({ value }) => parseUuidList(value))
+  @IsArray()
+  @ArrayMaxSize(100)
+  @IsUUID('4', { each: true })
+  tenantIds?: string[];
 }

@@ -12,6 +12,8 @@ import {
   RefreshCw,
   Search,
   Send,
+  ShieldCheck,
+  Store,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -23,9 +25,14 @@ import {
   updateErpDailyInventorySubscription,
 } from '../_services/reports-api';
 import type {
+  ErpDailyInventoryMovementEventItem,
   ErpDailyInventoryMovementRow,
   ErpDailyInventoryReportResponse,
 } from '../_types/reports';
+import {
+  canManageClientPortalAutoEmail,
+  pruneSelectedStoreIds,
+} from '../_utils/daily-inventory-helpers';
 
 export function DailyInventoryInsOutsPanel({
   startDate,
@@ -40,6 +47,8 @@ export function DailyInventoryInsOutsPanel({
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [showMovedOnly, setShowMovedOnly] = useState(false);
+  const [selectedStoreId, setSelectedStoreId] = useState('');
+  const [teamScopeVersion, setTeamScopeVersion] = useState(0);
 
   const [emailEnabled, setEmailEnabled] = useState(true);
   const [emailRecipientsText, setEmailRecipientsText] = useState('');
@@ -47,12 +56,40 @@ export function DailyInventoryInsOutsPanel({
   const [isSavingSub, setIsSavingSub] = useState(false);
   const [isSendingEmail, setIsSendingEmail] = useState(false);
 
+  useEffect(() => {
+    const handleTeamScopeChange = () => {
+      setSelectedStoreId('');
+      setTeamScopeVersion((prev) => prev + 1);
+    };
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === 'current_team_ids' || event.key === 'current_team_id') {
+        handleTeamScopeChange();
+      }
+    };
+    window.addEventListener('teamScopeChanged', handleTeamScopeChange as EventListener);
+    window.addEventListener('storage', handleStorage);
+    return () => {
+      window.removeEventListener('teamScopeChanged', handleTeamScopeChange as EventListener);
+      window.removeEventListener('storage', handleStorage);
+    };
+  }, []);
+
   const loadReport = useCallback(async () => {
     setIsLoading(true);
     setError(null);
     try {
-      const response = await fetchErpDailyInventoryReport({ startDate, endDate });
+      const response = await fetchErpDailyInventoryReport({
+        startDate,
+        endDate,
+        storeIds: selectedStoreId ? [selectedStoreId] : undefined,
+      });
       setData(response);
+      if (selectedStoreId) {
+        const validIds = pruneSelectedStoreIds([selectedStoreId], response.filters.stores);
+        if (validIds.length === 0) {
+          setSelectedStoreId('');
+        }
+      }
       const sub = response.subscriptions?.[0];
       if (sub) {
         setEmailEnabled(sub.enabled);
@@ -67,7 +104,7 @@ export function DailyInventoryInsOutsPanel({
     } finally {
       setIsLoading(false);
     }
-  }, [startDate, endDate]);
+  }, [endDate, selectedStoreId, startDate, teamScopeVersion]);
 
   useEffect(() => {
     void loadReport();
@@ -90,6 +127,26 @@ export function DailyInventoryInsOutsPanel({
       ].some((v) => v?.toLowerCase().includes(needle));
     });
   }, [data?.rows, search, showMovedOnly]);
+
+  const filteredRecentMovements = useMemo(() => {
+    const events = data?.recentMovements ?? [];
+    const needle = search.trim().toLowerCase();
+    if (!needle) {
+      return events.slice(0, 50);
+    }
+    return events
+      .filter((event: ErpDailyInventoryMovementEventItem) =>
+        [
+          event.storeName,
+          event.variantName,
+          event.variantCode,
+          event.unitCode,
+          event.movementType,
+          event.referenceCode,
+        ].some((val) => val?.toLowerCase().includes(needle)),
+      )
+      .slice(0, 50);
+  }, [data?.recentMovements, search]);
 
   const handleSaveSubscription = async () => {
     setIsSavingSub(true);
@@ -204,6 +261,8 @@ export function DailyInventoryInsOutsPanel({
 
   const totals = data?.totals;
   const sub = data?.subscriptions?.[0];
+  const accessibleStores = data?.filters.stores ?? [];
+  const showAutoEmailSettings = canManageClientPortalAutoEmail(data);
 
   if (isLoading) {
     return <LoadingCard label="Loading daily inventory ins & outs..." />;
@@ -212,6 +271,58 @@ export function DailyInventoryInsOutsPanel({
   return (
     <div className="space-y-5">
       {error ? <AlertBanner tone="error" message={error} /> : null}
+
+      {accessibleStores.length === 0 && !error ? (
+        <AlertBanner
+          tone="info"
+          message="No active stores are assigned to your current team or client account scope."
+        />
+      ) : null}
+
+      {/* Scope & Store Filter Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 dark:border-border bg-surface px-4 py-3">
+        <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600 dark:text-slate-300">
+          <span className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-50 dark:bg-emerald-950/40 px-2.5 py-1 font-semibold text-emerald-700 dark:text-emerald-300">
+            <ShieldCheck className="h-3.5 w-3.5" />
+            {data?.filters.isTeamScoped
+              ? 'Team-scoped view: only products from your assigned store(s)'
+              : 'Account-scoped view: only products from your active store(s)'}
+          </span>
+          <span>
+            {accessibleStores.length} accessible store{accessibleStores.length === 1 ? '' : 's'}
+          </span>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          {accessibleStores.length > 0 ? (
+            <label className="flex items-center gap-2 text-xs font-semibold text-slate-600 dark:text-slate-300">
+              <Store className="h-3.5 w-3.5 text-slate-400" />
+              <select
+                value={selectedStoreId}
+                onChange={(e) => setSelectedStoreId(e.target.value)}
+                aria-label="Filter by store"
+                className="h-9 rounded-xl border border-slate-200 dark:border-border bg-surface px-3 text-xs font-semibold text-foreground focus:border-primary focus:outline-none"
+              >
+                <option value="">All My Stores ({accessibleStores.length})</option>
+                {accessibleStores.map((store) => (
+                  <option key={store.id} value={store.id}>
+                    {store.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+          <Button
+            variant="outline"
+            size="sm"
+            iconLeft={<RefreshCw className="h-3.5 w-3.5" />}
+            onClick={() => void loadReport()}
+            disabled={isLoading}
+          >
+            Refresh
+          </Button>
+        </div>
+      </div>
 
       {/* 4 Summary Cards */}
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -225,7 +336,8 @@ export function DailyInventoryInsOutsPanel({
           </p>
           <p className="mt-1 text-xs text-emerald-800 dark:text-slate-300">
             Received: {(totals?.receivedInQty ?? 0).toLocaleString()} • Manual:{' '}
-            {(totals?.manualInQty ?? 0).toLocaleString()}
+            {(totals?.manualInQty ?? 0).toLocaleString()} • Restocked:{' '}
+            {(totals?.restockedInQty ?? 0).toLocaleString()}
           </p>
         </Card>
 
@@ -239,7 +351,8 @@ export function DailyInventoryInsOutsPanel({
           </p>
           <p className="mt-1 text-xs text-rose-800 dark:text-slate-300">
             Dispatched: {(totals?.dispatchedOutQty ?? 0).toLocaleString()} • Packed:{' '}
-            {(totals?.packedOutQty ?? 0).toLocaleString()}
+            {(totals?.packedOutQty ?? 0).toLocaleString()} • Adjusted:{' '}
+            {(totals?.adjustedOutQty ?? 0).toLocaleString()}
           </p>
         </Card>
 
@@ -273,80 +386,82 @@ export function DailyInventoryInsOutsPanel({
         </Card>
       </div>
 
-      {/* Automated Daily Email Settings */}
-      <Card className="p-5">
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 dark:border-border pb-3">
-          <div className="flex items-center gap-2">
-            <Mail className="h-4 w-4 text-primary" />
-            <h3 className="text-sm font-semibold text-foreground">
-              Daily Automated Inventory Email to Client
-            </h3>
-          </div>
-          <span className="text-xs text-slate-500">
-            {sub?.lastSentAt
-              ? `Last emailed: ${new Date(sub.lastSentAt).toLocaleString()}`
-              : 'Automatically emailed every day at your scheduled Manila time'}
-          </span>
-        </div>
-
-        <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(240px,1.5fr)_150px_auto]">
-          <div>
-            <label className="mb-1 block text-xs font-semibold text-slate-600 dark:text-slate-300">
-              Recipient Email Addresses (comma-separated)
-            </label>
-            <input
-              type="text"
-              value={emailRecipientsText}
-              onChange={(e) => setEmailRecipientsText(e.target.value)}
-              placeholder={sub?.defaultRecipients.join(', ') || 'you@company.com'}
-              className="h-10 w-full rounded-xl border border-slate-200 bg-surface px-3 text-sm text-foreground focus:border-primary focus:outline-none"
-            />
+      {/* Automated Daily Email Settings (tenant-wide admin without team filter only) */}
+      {showAutoEmailSettings ? (
+        <Card className="p-5">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 dark:border-border pb-3">
+            <div className="flex items-center gap-2">
+              <Mail className="h-4 w-4 text-primary" />
+              <h3 className="text-sm font-semibold text-foreground">
+                Daily Automated Inventory Email to Client
+              </h3>
+            </div>
+            <span className="text-xs text-slate-500">
+              {sub?.lastSentAt
+                ? `Last emailed: ${new Date(sub.lastSentAt).toLocaleString()}`
+                : 'Automatically emailed every day at your scheduled Manila time'}
+            </span>
           </div>
 
-          <div>
-            <label className="mb-1 block text-xs font-semibold text-slate-600 dark:text-slate-300">
-              Daily Time (Manila)
-            </label>
-            <div className="relative">
-              <Clock className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(240px,1.5fr)_150px_auto]">
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-slate-600 dark:text-slate-300">
+                Recipient Email Addresses (comma-separated)
+              </label>
               <input
-                type="time"
-                value={sendTimeManila}
-                onChange={(e) => setSendTimeManila(e.target.value || '20:00')}
-                className="h-10 w-full rounded-xl border border-slate-200 bg-surface pl-9 pr-3 text-sm text-foreground focus:border-primary focus:outline-none"
+                type="text"
+                value={emailRecipientsText}
+                onChange={(e) => setEmailRecipientsText(e.target.value)}
+                placeholder={sub?.defaultRecipients.join(', ') || 'you@company.com'}
+                className="h-10 w-full rounded-xl border border-slate-200 bg-surface px-3 text-sm text-foreground focus:border-primary focus:outline-none"
               />
             </div>
-          </div>
 
-          <div className="flex flex-wrap items-end gap-2">
-            <label className="flex h-10 cursor-pointer items-center gap-2 rounded-xl border border-slate-200 bg-surface px-3 text-xs font-semibold text-foreground">
-              <input
-                type="checkbox"
-                checked={emailEnabled}
-                onChange={(e) => setEmailEnabled(e.target.checked)}
-                className="h-4 w-4"
-              />
-              Daily Auto-Email
-            </label>
-            <Button
-              variant="outline"
-              iconLeft={<CheckCircle2 className="h-4 w-4" />}
-              onClick={() => void handleSaveSubscription()}
-              loading={isSavingSub}
-            >
-              Save Schedule
-            </Button>
-            <Button
-              variant="primary"
-              iconLeft={<Send className="h-4 w-4" />}
-              onClick={() => void handleSendEmailNow()}
-              loading={isSendingEmail}
-            >
-              Email Report Now
-            </Button>
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-slate-600 dark:text-slate-300">
+                Daily Time (Manila)
+              </label>
+              <div className="relative">
+                <Clock className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="time"
+                  value={sendTimeManila}
+                  onChange={(e) => setSendTimeManila(e.target.value || '20:00')}
+                  className="h-10 w-full rounded-xl border border-slate-200 bg-surface pl-9 pr-3 text-sm text-foreground focus:border-primary focus:outline-none"
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-end gap-2">
+              <label className="flex h-10 cursor-pointer items-center gap-2 rounded-xl border border-slate-200 bg-surface px-3 text-xs font-semibold text-foreground">
+                <input
+                  type="checkbox"
+                  checked={emailEnabled}
+                  onChange={(e) => setEmailEnabled(e.target.checked)}
+                  className="h-4 w-4"
+                />
+                Daily Auto-Email
+              </label>
+              <Button
+                variant="outline"
+                iconLeft={<CheckCircle2 className="h-4 w-4" />}
+                onClick={() => void handleSaveSubscription()}
+                loading={isSavingSub}
+              >
+                Save Schedule
+              </Button>
+              <Button
+                variant="primary"
+                iconLeft={<Send className="h-4 w-4" />}
+                onClick={() => void handleSendEmailNow()}
+                loading={isSendingEmail}
+              >
+                Email Report Now
+              </Button>
+            </div>
           </div>
-        </div>
-      </Card>
+        </Card>
+      ) : null}
 
       {/* Product Ins & Outs Table */}
       <Card className="overflow-hidden p-0">
@@ -393,12 +508,13 @@ export function DailyInventoryInsOutsPanel({
         </div>
 
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[780px] border-collapse text-left text-sm">
+          <table className="w-full min-w-[820px] border-collapse text-left text-sm">
             <thead className="bg-slate-50 dark:bg-background-secondary text-xs font-semibold uppercase text-slate-500">
               <tr>
                 <th className="px-4 py-3">Store</th>
                 <th className="px-4 py-3">Product Variant</th>
                 <th className="px-4 py-3 text-right">Stock In (+)</th>
+                <th className="px-4 py-3 text-right">Put Away</th>
                 <th className="px-4 py-3 text-right">Stock Out (-)</th>
                 <th className="px-4 py-3 text-right">Net Change</th>
                 <th className="px-4 py-3 text-right">In Bin</th>
@@ -406,37 +522,146 @@ export function DailyInventoryInsOutsPanel({
               </tr>
             </thead>
             <tbody>
-              {filteredRows.map((row) => (
-                <tr
-                  key={row.rowId}
-                  className="border-t border-slate-200/80 dark:border-border text-foreground"
-                >
-                  <td className="px-4 py-3 font-medium">{row.storeName}</td>
-                  <td className="px-4 py-3">
-                    <span className="block font-semibold">{row.variantName}</span>
-                    <span className="block text-xs text-slate-500">
-                      {row.variantCode || row.variationId || '—'}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 text-right font-semibold tabular-nums text-emerald-600">
-                    {row.totalInQty > 0 ? `+${row.totalInQty.toLocaleString()}` : '0'}
-                  </td>
-                  <td className="px-4 py-3 text-right font-semibold tabular-nums text-rose-600">
-                    {row.totalOutQty > 0 ? `-${row.totalOutQty.toLocaleString()}` : '0'}
-                  </td>
-                  <td className="px-4 py-3 text-right font-semibold tabular-nums">
-                    {row.netChangeQty > 0
-                      ? `+${row.netChangeQty.toLocaleString()}`
-                      : row.netChangeQty.toLocaleString()}
-                  </td>
-                  <td className="px-4 py-3 text-right font-semibold tabular-nums text-emerald-700">
-                    {row.inBinQty.toLocaleString()}
-                  </td>
-                  <td className="px-4 py-3 text-right font-bold tabular-nums">
-                    {row.onHandQty.toLocaleString()}
+              {filteredRows.length === 0 ? (
+                <tr>
+                  <td colSpan={8} className="px-4 py-8 text-center text-sm text-slate-500">
+                    No product movements match your current filter and date range.
                   </td>
                 </tr>
-              ))}
+              ) : (
+                filteredRows.map((row) => (
+                  <tr
+                    key={row.rowId}
+                    className="border-t border-slate-200/80 dark:border-border text-foreground"
+                  >
+                    <td className="px-4 py-3 font-medium">{row.storeName}</td>
+                    <td className="px-4 py-3">
+                      <span className="block font-semibold">{row.variantName}</span>
+                      <span className="block text-xs text-slate-500">
+                        {row.variantCode || row.variationId || '—'}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-right tabular-nums">
+                      <span className="block font-semibold text-emerald-600">
+                        {row.totalInQty > 0 ? `+${row.totalInQty.toLocaleString()}` : '0'}
+                      </span>
+                      <span className="block text-[11px] text-slate-500">
+                        Rec {row.receivedInQty} • Man {row.manualInQty} • Restock {row.restockedInQty}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-right font-medium tabular-nums text-sky-700 dark:text-sky-300">
+                      {row.putAwayMovedQty.toLocaleString()}
+                    </td>
+                    <td className="px-4 py-3 text-right tabular-nums">
+                      <span className="block font-semibold text-rose-600">
+                        {row.totalOutQty > 0 ? `-${row.totalOutQty.toLocaleString()}` : '0'}
+                      </span>
+                      <span className="block text-[11px] text-slate-500">
+                        Disp {row.dispatchedOutQty} • Pack {row.packedOutQty} • Adj {row.adjustedOutQty}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-right font-semibold tabular-nums">
+                      {row.netChangeQty > 0
+                        ? `+${row.netChangeQty.toLocaleString()}`
+                        : row.netChangeQty.toLocaleString()}
+                    </td>
+                    <td className="px-4 py-3 text-right tabular-nums">
+                      <span className="block font-semibold text-emerald-700 dark:text-emerald-300">
+                        {row.inBinQty.toLocaleString()}
+                      </span>
+                      {row.reservedQty > 0 ? (
+                        <span className="block text-[11px] text-amber-600">
+                          Res: {row.reservedQty.toLocaleString()}
+                        </span>
+                      ) : null}
+                    </td>
+                    <td className="px-4 py-3 text-right font-bold tabular-nums">
+                      {row.onHandQty.toLocaleString()}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
+      {/* Recent Stock Movements Log */}
+      <Card className="overflow-hidden p-0">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 dark:border-border px-4 py-3">
+          <div>
+            <h3 className="text-sm font-semibold text-foreground">
+              Recent Stock Movements (Ins & Outs Log)
+            </h3>
+            <p className="text-xs text-slate-500">
+              Showing {filteredRecentMovements.length.toLocaleString()} movement event
+              {filteredRecentMovements.length === 1 ? '' : 's'} for your scoped store(s)
+            </p>
+          </div>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[780px] border-collapse text-left text-xs">
+            <thead className="bg-slate-50 dark:bg-background-secondary font-semibold uppercase text-slate-500">
+              <tr>
+                <th className="px-4 py-2.5">Time</th>
+                <th className="px-4 py-2.5">Store</th>
+                <th className="px-4 py-2.5">Product Variant</th>
+                <th className="px-4 py-2.5">Direction</th>
+                <th className="px-4 py-2.5">Type</th>
+                <th className="px-4 py-2.5">Location</th>
+                <th className="px-4 py-2.5">Unit / Ref</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredRecentMovements.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="px-4 py-6 text-center text-sm text-slate-500">
+                    No individual stock movement events recorded for this date range.
+                  </td>
+                </tr>
+              ) : (
+                filteredRecentMovements.map((event) => (
+                  <tr
+                    key={event.id}
+                    className="border-t border-slate-200/80 dark:border-border text-foreground"
+                  >
+                    <td className="px-4 py-2.5 whitespace-nowrap text-slate-600 dark:text-slate-300">
+                      {new Date(event.createdAt).toLocaleString()}
+                    </td>
+                    <td className="px-4 py-2.5 font-medium">{event.storeName}</td>
+                    <td className="px-4 py-2.5">
+                      <span className="block font-semibold">{event.variantName}</span>
+                      {event.variantCode ? (
+                        <span className="block text-[11px] text-slate-500">{event.variantCode}</span>
+                      ) : null}
+                    </td>
+                    <td className="px-4 py-2.5">
+                      <span
+                        className={`inline-flex rounded-full px-2 py-0.5 text-[11px] font-semibold ${
+                          event.direction === 'IN'
+                            ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300'
+                            : event.direction === 'OUT'
+                              ? 'bg-rose-100 text-rose-700 dark:bg-rose-950/60 dark:text-rose-300'
+                              : 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300'
+                        }`}
+                      >
+                        {event.direction}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2.5 font-medium">{event.movementType}</td>
+                    <td className="px-4 py-2.5 text-slate-600 dark:text-slate-300">
+                      {event.fromLocationCode || '—'} → {event.toLocationCode || '—'}
+                    </td>
+                    <td className="px-4 py-2.5 text-slate-600 dark:text-slate-300">
+                      <span className="block font-mono">{event.unitCode}</span>
+                      {event.referenceCode ? (
+                        <span className="block text-[11px] text-slate-500">{event.referenceCode}</span>
+                      ) : null}
+                    </td>
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
         </div>

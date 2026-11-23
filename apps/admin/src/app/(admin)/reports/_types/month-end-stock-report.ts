@@ -150,6 +150,26 @@ export type ClientDailyInventoryEmailSubscription = {
   lastError: string | null;
 };
 
+export type WarehouseDailyInventoryMatchedUser = {
+  id: string;
+  name: string;
+  email: string;
+};
+
+export type WarehouseDailyInventoryEmailSubscription = {
+  enabled: boolean;
+  recipients: string[];
+  defaultRecipients: string[];
+  effectiveRecipients: string[];
+  matchedDefaultUsers: WarehouseDailyInventoryMatchedUser[];
+  sendTimeManila: string;
+  lastSentAt: string | null;
+  lastSentDate: string | null;
+  lastDeliveryStatus: string | null;
+  lastDeliveryMode: string | null;
+  lastError: string | null;
+};
+
 export type DailyInventoryMovementsReportResponse = {
   report: {
     key: 'DAILY_INVENTORY_INS_OUTS';
@@ -170,6 +190,7 @@ export type DailyInventoryMovementsReportResponse = {
   rows: DailyInventoryMovementRow[];
   recentMovements: DailyInventoryMovementEventItem[];
   subscriptions: ClientDailyInventoryEmailSubscription[];
+  warehouseSubscription?: WarehouseDailyInventoryEmailSubscription | null;
 };
 
 export type SendDailyInventoryEmailResponse = {
@@ -186,6 +207,40 @@ export type SendDailyInventoryEmailResponse = {
     error?: string | null;
   };
   subscription: ClientDailyInventoryEmailSubscription;
+  preview: {
+    subject: string;
+    html: string;
+    text: string;
+    csvFilename: string;
+    csvContent: string;
+  };
+};
+
+export type WarehouseDailyInventoryPreviewResponse = {
+  dateLabel: string;
+  subject: string;
+  html: string;
+  text: string;
+  csvFilename: string;
+  csvContent: string;
+  totals: DailyInventoryMovementsTotals;
+  clientCount: number;
+  subscription: WarehouseDailyInventoryEmailSubscription;
+};
+
+export type SendWarehouseDailyInventoryEmailResponse = {
+  dateLabel: string;
+  recipients: string[];
+  subject: string;
+  sentAt: string;
+  delivery: {
+    delivered: boolean;
+    status: string;
+    mode: string;
+    error?: string | null;
+  };
+  clientCount: number;
+  subscription: WarehouseDailyInventoryEmailSubscription;
   preview: {
     subject: string;
     html: string;

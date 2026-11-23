@@ -15,6 +15,7 @@ import { Card } from '@/components/ui/card';
 import { AlertBanner, LoadingCard } from '@/components/ui/feedback';
 import { PageHeader } from '@/components/ui/page-header';
 import { useToast } from '@/components/ui/toast';
+import { usePermissions } from '@/hooks/use-permissions';
 import { useAnalyticsDateRange } from '../analytics/_hooks/use-analytics-date-range';
 import { DailyInventoryInsOutsPanel } from './_components/daily-inventory-ins-outs-panel';
 import { ReportsSummaryTable } from './_components/reports-summary-table';
@@ -25,14 +26,23 @@ import {
   exportPosOrdersReportXlsx,
 } from './_utils/reports-export';
 import { buildPosOrdersReportTotals } from './_utils/reports-format';
+import {
+  hasDailyInventoryReadPermission,
+  hasPosOrdersReportPermission,
+  resolveInitialReportsTab,
+} from './_utils/daily-inventory-helpers';
 
 const Datepicker = dynamic(() => import('react-tailwindcss-datepicker'), { ssr: false });
 
 export default function ReportsPage() {
   const { addToast } = useToast();
+  const { data: permissions = [], isFetched: permissionsLoaded } = usePermissions();
+  const canViewPosOrders = hasPosOrdersReportPermission(permissions);
+  const canViewDailyInventory = hasDailyInventoryReadPermission(permissions);
   const { today, range, startDate, endDate, handleDateRangeChange, syncDateRangeFromApi } =
     useAnalyticsDateRange();
   const [activeTab, setActiveTab] = useState<'pos-orders' | 'daily-inventory'>('pos-orders');
+  const [tabInitialized, setTabInitialized] = useState(false);
   const [report, setReport] = useState<PosOrdersReportResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isExportingCsv, setIsExportingCsv] = useState(false);
@@ -78,8 +88,21 @@ export default function ReportsPage() {
   );
 
   useEffect(() => {
+    if (!permissionsLoaded || tabInitialized) return;
+    const requestedTab =
+      typeof window !== 'undefined'
+        ? new URLSearchParams(window.location.search).get('tab')
+        : null;
+    setActiveTab(resolveInitialReportsTab({ requestedTab, permissions }));
+    setTabInitialized(true);
+  }, [permissions, permissionsLoaded, tabInitialized]);
+
+  useEffect(() => {
+    if (!permissionsLoaded || !tabInitialized || !canViewPosOrders || activeTab !== 'pos-orders') {
+      return;
+    }
     void fetchReport();
-  }, [fetchReport]);
+  }, [activeTab, canViewPosOrders, fetchReport, permissionsLoaded, tabInitialized]);
 
   const hasRows = (report?.items.length || 0) > 0;
   const totals = useMemo(
@@ -139,7 +162,7 @@ export default function ReportsPage() {
         title="Client Reports"
         description="Client-wide POS order exports and Daily Inventory Ins & Outs automated email reports."
         actions={
-          activeTab === 'pos-orders' ? (
+          activeTab === 'pos-orders' && canViewPosOrders ? (
             <>
               <Button
                 variant="outline"
@@ -166,33 +189,44 @@ export default function ReportsPage() {
         }
       />
 
+      {permissionsLoaded && !canViewPosOrders && !canViewDailyInventory ? (
+        <AlertBanner
+          tone="error"
+          message="You do not have permission to view client reports."
+        />
+      ) : null}
+
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div className="flex flex-wrap items-center gap-3">
           <div className="flex items-center rounded-xl border border-slate-200 dark:border-border bg-surface p-1 gap-1">
-            <button
-              type="button"
-              onClick={() => setActiveTab('pos-orders')}
-              className={`inline-flex items-center gap-2 rounded-lg px-3.5 py-1.5 text-xs font-semibold transition ${
-                activeTab === 'pos-orders'
-                  ? 'bg-primary text-primary-foreground shadow-sm'
-                  : 'text-slate-600 dark:text-slate-300 hover:text-foreground'
-              }`}
-            >
-              <FileSpreadsheet className="h-3.5 w-3.5" />
-              POS Orders Summary
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveTab('daily-inventory')}
-              className={`inline-flex items-center gap-2 rounded-lg px-3.5 py-1.5 text-xs font-semibold transition ${
-                activeTab === 'daily-inventory'
-                  ? 'bg-primary text-primary-foreground shadow-sm'
-                  : 'text-slate-600 dark:text-slate-300 hover:text-foreground'
-              }`}
-            >
-              <ArrowLeftRight className="h-3.5 w-3.5" />
-              Daily Inventory Ins & Outs (Auto-Email)
-            </button>
+            {canViewPosOrders ? (
+              <button
+                type="button"
+                onClick={() => setActiveTab('pos-orders')}
+                className={`inline-flex items-center gap-2 rounded-lg px-3.5 py-1.5 text-xs font-semibold transition ${
+                  activeTab === 'pos-orders'
+                    ? 'bg-primary text-primary-foreground shadow-sm'
+                    : 'text-slate-600 dark:text-slate-300 hover:text-foreground'
+                }`}
+              >
+                <FileSpreadsheet className="h-3.5 w-3.5" />
+                POS Orders Summary
+              </button>
+            ) : null}
+            {canViewDailyInventory ? (
+              <button
+                type="button"
+                onClick={() => setActiveTab('daily-inventory')}
+                className={`inline-flex items-center gap-2 rounded-lg px-3.5 py-1.5 text-xs font-semibold transition ${
+                  activeTab === 'daily-inventory'
+                    ? 'bg-primary text-primary-foreground shadow-sm'
+                    : 'text-slate-600 dark:text-slate-300 hover:text-foreground'
+                }`}
+              >
+                <ArrowLeftRight className="h-3.5 w-3.5" />
+                Daily Inventory Ins & Outs
+              </button>
+            ) : null}
           </div>
 
           <div className="relative">
@@ -232,7 +266,7 @@ export default function ReportsPage() {
           </div>
         </div>
 
-        {activeTab === 'pos-orders' ? (
+        {activeTab === 'pos-orders' && canViewPosOrders ? (
           <div className="flex flex-wrap items-center gap-3 text-sm text-slate-600 dark:text-slate-300">
             <div>
               Stores: <span className="font-semibold text-foreground">{report?.row_count ?? 0}</span>
@@ -254,7 +288,9 @@ export default function ReportsPage() {
         ) : null}
       </div>
 
-      {activeTab === 'pos-orders' ? (
+      {!permissionsLoaded ? (
+        <LoadingCard label="Loading report permissions..." />
+      ) : activeTab === 'pos-orders' && canViewPosOrders ? (
         <>
           <div className="mt-4">
             <AlertBanner

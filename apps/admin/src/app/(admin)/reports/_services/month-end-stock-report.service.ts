@@ -4,6 +4,9 @@ import type {
   DailyInventoryMovementsReportResponse,
   MonthEndStockReportResponse,
   SendDailyInventoryEmailResponse,
+  SendWarehouseDailyInventoryEmailResponse,
+  WarehouseDailyInventoryEmailSubscription,
+  WarehouseDailyInventoryPreviewResponse,
 } from '../_types/month-end-stock-report';
 
 export async function fetchMonthEndStockReport(params: {
@@ -56,4 +59,38 @@ export async function sendDailyInventoryEmailNow(input: {
 }) {
   const response = await apiClient.post('/wms/reports/daily-inventory-send', input);
   return response.data as SendDailyInventoryEmailResponse;
+}
+
+export async function updateWarehouseDailyInventoryEmailSubscription(input: {
+  enabled?: boolean;
+  recipients?: string[];
+  sendTimeManila?: string;
+}) {
+  const response = await apiClient.patch('/wms/reports/daily-inventory-warehouse-subscription', input);
+  return response.data as { subscription: WarehouseDailyInventoryEmailSubscription };
+}
+
+export async function fetchWarehouseDailyInventoryEmailPreview(params: {
+  startDate?: string;
+  endDate?: string;
+  tenantIds?: string[];
+}) {
+  const response = await apiClient.get('/wms/reports/daily-inventory-warehouse-preview', {
+    params: {
+      ...(params.startDate ? { startDate: params.startDate } : {}),
+      ...(params.endDate ? { endDate: params.endDate } : {}),
+      ...(params.tenantIds?.length ? { tenantIds: params.tenantIds.join(',') } : {}),
+    },
+  });
+  return response.data as WarehouseDailyInventoryPreviewResponse;
+}
+
+export async function sendWarehouseDailyInventoryEmailNow(input: {
+  startDate?: string;
+  endDate?: string;
+  recipients?: string[];
+  tenantIds?: string[];
+}) {
+  const response = await apiClient.post('/wms/reports/daily-inventory-warehouse-send', input);
+  return response.data as SendWarehouseDailyInventoryEmailResponse;
 }

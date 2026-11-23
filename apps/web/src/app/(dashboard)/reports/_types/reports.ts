@@ -102,6 +102,27 @@ export type ErpDailyInventorySubscription = {
   lastError: string | null;
 };
 
+export type ErpDailyInventoryMovementEventItem = {
+  id: string;
+  createdAt: string;
+  tenantId: string;
+  tenantName: string;
+  storeId: string;
+  storeName: string;
+  variantName: string;
+  variantCode: string | null;
+  unitCode: string;
+  movementType: string;
+  direction: 'IN' | 'OUT' | 'INTERNAL';
+  fromStatus: string | null;
+  toStatus: string | null;
+  fromLocationCode: string | null;
+  toLocationCode: string | null;
+  referenceCode: string | null;
+  notes: string | null;
+  actorName: string | null;
+};
+
 export type ErpDailyInventoryReportResponse = {
   report: {
     key: 'DAILY_INVENTORY_INS_OUTS';
@@ -121,6 +142,8 @@ export type ErpDailyInventoryReportResponse = {
     }>;
     selectedStoreIds: string[];
     effectiveStoreIds: string[];
+    isTeamScoped?: boolean;
+    canManageEmailSubscription?: boolean;
   };
   totals: {
     variantCount: number;
@@ -144,5 +167,6 @@ export type ErpDailyInventoryReportResponse = {
     onHandQty: number;
   };
   rows: ErpDailyInventoryMovementRow[];
+  recentMovements?: ErpDailyInventoryMovementEventItem[];
   subscriptions: ErpDailyInventorySubscription[];
 };

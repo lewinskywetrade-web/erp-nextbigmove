@@ -1,7 +1,7 @@
 import { Transform } from 'class-transformer';
 import { ArrayMaxSize, IsArray, IsOptional, IsString, IsUUID, Matches } from 'class-validator';
 
-function parseUuidList(value: unknown) {
+export function parseUuidList(value: unknown) {
   const values = Array.isArray(value) ? value : typeof value === 'string' ? [value] : [];
 
   return Array.from(

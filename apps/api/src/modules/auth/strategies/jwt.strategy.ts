@@ -34,6 +34,9 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
           sessionId: payload.sessionId ?? null,
           impersonatedBy: preview.actor.id,
           originalSessionId: payload.originalSessionId ?? null,
+          ...(payload.originalTenantId !== undefined
+            ? { originalTenantId: payload.originalTenantId ?? null }
+            : {}),
           impersonationExpiresAt: preview.expiresAt,
           impersonationReadOnly: true,
         };

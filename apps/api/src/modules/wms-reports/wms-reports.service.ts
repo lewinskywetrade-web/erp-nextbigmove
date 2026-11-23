@@ -3,6 +3,7 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import {
   IntegrationStatus,
@@ -20,14 +21,23 @@ import * as dayjs from 'dayjs';
 import * as utc from 'dayjs/plugin/utc';
 import * as timezone from 'dayjs/plugin/timezone';
 import { PrismaService } from '../../common/prisma/prisma.service';
+import { TeamContextService } from '../../common/services/team-context.service';
+import {
+  isBusinessReportExcludedStore,
+  isSuperAdminOnlyTeamId,
+} from '../../common/utils/super-admin-only-teams';
 import { GetWmsMonthEndStockReportDto } from './dto/get-wms-month-end-stock-report.dto';
 import { GetWmsDailyInventoryMovementsDto } from './dto/get-wms-daily-inventory-movements.dto';
-import { UpdateWmsDailyInventoryEmailSubscriptionDto } from './dto/wms-daily-inventory-email.dto';
+import {
+  UpdateWmsDailyInventoryEmailSubscriptionDto,
+  UpdateWmsWarehouseDailyInventoryEmailSubscriptionDto,
+} from './dto/wms-daily-inventory-email.dto';
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
 
 const MANILA_TZ = 'Asia/Manila';
+const WAREHOUSE_DAILY_INVENTORY_EMAIL_SETTING_KEY = 'warehouse_daily_inventory_email';
 const ACTIVE_TENANT_STATUSES = [TenantStatus.ACTIVE, TenantStatus.TRIAL] as const;
 const NON_PHYSICAL_BIN_STATUSES = new Set<WmsInventoryUnitStatus>([
   WmsInventoryUnitStatus.DISPATCHED,
@@ -84,6 +94,52 @@ export type ClientDailyInventoryEmailSubscription = DailyInventoryEmailSubscript
   tenantName: string;
   defaultRecipients: string[];
   effectiveRecipients: string[];
+};
+
+export type WarehouseDailyInventoryMatchedUser = {
+  id: string;
+  name: string;
+  email: string;
+};
+
+export type WarehouseDailyInventoryEmailSubscription = DailyInventoryEmailSubscriptionConfig & {
+  defaultRecipients: string[];
+  effectiveRecipients: string[];
+  matchedDefaultUsers: WarehouseDailyInventoryMatchedUser[];
+};
+
+export type ClientDailyInventoryActivitySummary = {
+  direction: 'IN' | 'OUT' | 'INTERNAL';
+  movementType: WmsInventoryMovementType;
+  referenceCode: string | null;
+  unitCount: number;
+};
+
+export type ClientDailyInventorySummary = {
+  tenantId: string;
+  tenantName: string;
+  storeCount: number;
+  variantCount: number;
+  movedVariantCount: number;
+  receivedInQty: number;
+  manualInQty: number;
+  restockedInQty: number;
+  totalInQty: number;
+  putAwayMovedQty: number;
+  dispatchedOutQty: number;
+  packedOutQty: number;
+  adjustedOutQty: number;
+  totalOutQty: number;
+  netChangeQty: number;
+  receivedQty: number;
+  stagedQty: number;
+  awaitingPutAwayQty: number;
+  putAwayQty: number;
+  reservedQty: number;
+  inBinQty: number;
+  onHandQty: number;
+  rows: DailyInventoryMovementRow[];
+  activityBreakdown: ClientDailyInventoryActivitySummary[];
 };
 
 export type DailyInventoryMovementRow = {
@@ -161,11 +217,17 @@ export type DailyInventoryMovementsReportTotals = {
   onHandQty: number;
 };
 
+export interface DailyInventoryReportScopeOptions {
+  bypassClsForCron?: boolean;
+  enforceClientPortalScope?: boolean;
+}
+
 @Injectable()
 export class WmsReportsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly cls: ClsService,
+    @Optional() private readonly teamContext?: TeamContextService,
   ) {}
 
   getManilaTodayDateString(): string {
@@ -315,30 +377,79 @@ export class WmsReportsService {
 
   async getDailyInventoryMovementsReport(
     query: GetWmsDailyInventoryMovementsDto,
-    options?: { bypassClsForCron?: boolean },
+    options?: DailyInventoryReportScopeOptions,
+  ) {
+    const { response } = await this.collectDailyInventoryMovementsData(query, options);
+    return response;
+  }
+
+  async getWarehouseDailyInventoryData(
+    query: GetWmsDailyInventoryMovementsDto,
+    options?: DailyInventoryReportScopeOptions,
+  ) {
+    const { response, scope, movements } = await this.collectDailyInventoryMovementsData(
+      query,
+      options,
+    );
+    const clientSummaries = this.buildClientDailySummaries(
+      scope,
+      response.rows,
+      movements,
+    );
+    return {
+      ...response,
+      clientSummaries,
+    };
+  }
+
+  private async collectDailyInventoryMovementsData(
+    query: GetWmsDailyInventoryMovementsDto,
+    options?: DailyInventoryReportScopeOptions,
   ) {
     const scope = await this.resolveScope(query, options);
     const window = this.normalizeDateWindow(query);
     const reportStoreIds = scope.reportStores.map((store) => store.id);
-    const subscriptions = await this.getSubscriptionsForTenants(
-      scope.partners.map((partner) => partner.id),
-    );
+    const reportTenantIds = Array.from(new Set(scope.reportStores.map((store) => store.tenantId)));
+    const subscriptions =
+      !options?.enforceClientPortalScope || scope.clientPortalAccess?.canManageEmailSubscription
+        ? await this.getSubscriptionsForTenants(scope.partners.map((partner) => partner.id))
+        : [];
+    const warehouseSubscription =
+      !options?.bypassClsForCron && !options?.enforceClientPortalScope && this.hasGlobalWmsAccess()
+        ? await this.getWarehouseDailyEmailSubscription()
+        : undefined;
 
     if (reportStoreIds.length === 0) {
-      return this.buildDailyMovementsResponse(
+      return {
         scope,
-        window,
-        [],
-        [],
-        subscriptions,
-        new Date(),
-      );
+        movements: [] as Array<{
+          id: string;
+          tenantId: string;
+          movementType: WmsInventoryMovementType;
+          fromStatus: WmsInventoryUnitStatus | null;
+          toStatus: WmsInventoryUnitStatus | null;
+          referenceCode: string | null;
+          inventoryUnit: { id: string; storeId: string };
+        }>,
+        response: this.buildDailyMovementsResponse(
+          scope,
+          window,
+          [],
+          [],
+          subscriptions,
+          new Date(),
+          warehouseSubscription,
+        ),
+      };
     }
 
     const [products, groupedUnits, inBinGroups, movements] = await Promise.all([
       this.prisma.posProduct.findMany({
         where: {
           storeId: { in: reportStoreIds },
+          store: {
+            is: { tenantId: { in: reportTenantIds } },
+          },
           wmsProductProfile: {
             is: { status: { not: WmsProductProfileStatus.ARCHIVED } },
           },
@@ -356,12 +467,16 @@ export class WmsReportsService {
       }),
       this.prisma.wmsInventoryUnit.groupBy({
         by: ['posProductId', 'status'],
-        where: { storeId: { in: reportStoreIds } },
+        where: {
+          tenantId: { in: reportTenantIds },
+          storeId: { in: reportStoreIds },
+        },
         _count: { _all: true },
       }),
       this.prisma.wmsInventoryUnit.groupBy({
         by: ['posProductId'],
         where: {
+          tenantId: { in: reportTenantIds },
           storeId: { in: reportStoreIds },
           currentLocation: { is: { kind: WmsLocationKind.BIN } },
           status: { notIn: Array.from(NON_PHYSICAL_BIN_STATUSES) },
@@ -370,12 +485,14 @@ export class WmsReportsService {
       }),
       this.prisma.wmsInventoryMovement.findMany({
         where: {
+          tenantId: { in: reportTenantIds },
           createdAt: {
             gte: window.startUtc,
             lte: window.endUtc,
           },
           inventoryUnit: {
             is: {
+              tenantId: { in: reportTenantIds },
               storeId: { in: reportStoreIds },
             },
           },
@@ -385,6 +502,7 @@ export class WmsReportsService {
             select: {
               id: true,
               code: true,
+              tenantId: true,
               storeId: true,
               posProductId: true,
               productId: true,
@@ -392,9 +510,11 @@ export class WmsReportsService {
               posProduct: {
                 select: {
                   id: true,
+                  storeId: true,
                   name: true,
                   customId: true,
                   productSnapshot: true,
+                  store: { select: { tenantId: true } },
                 },
               },
             },
@@ -464,11 +584,19 @@ export class WmsReportsService {
       lastMovementAt: Date | null;
     };
 
+    const storeById = new Map(scope.reportStores.map((store) => [store.id, store]));
+    const scopedMovements = movements.filter((movement) =>
+      this.isMovementInScopedStores(movement, storeById),
+    );
     const movementBucketsByProduct = new Map<string, MovementUnitBuckets>();
     const productById = new Map(products.map((product) => [product.id, product]));
 
-    for (const movement of movements) {
+    for (const movement of scopedMovements) {
       const unit = movement.inventoryUnit;
+      const unitStore = storeById.get(unit.storeId);
+      if (!unitStore) {
+        continue;
+      }
       const posProductId = unit.posProductId;
 
       if (!productById.has(posProductId) && unit.posProduct) {
@@ -535,7 +663,6 @@ export class WmsReportsService {
       }
     }
 
-    const storeById = new Map(scope.reportStores.map((store) => [store.id, store]));
     const rows: DailyInventoryMovementRow[] = [];
 
     for (const product of productById.values()) {
@@ -627,7 +754,7 @@ export class WmsReportsService {
       );
     });
 
-    const recentMovements: DailyInventoryMovementEventItem[] = movements
+    const recentMovements: DailyInventoryMovementEventItem[] = scopedMovements
       .slice(0, 150)
       .map((movement) => {
         const store = storeById.get(movement.inventoryUnit.storeId);
@@ -657,14 +784,154 @@ export class WmsReportsService {
         };
       });
 
-    return this.buildDailyMovementsResponse(
+    return {
       scope,
-      window,
-      rows,
-      recentMovements,
-      subscriptions,
-      new Date(),
-    );
+      movements: scopedMovements,
+      response: this.buildDailyMovementsResponse(
+        scope,
+        window,
+        rows,
+        recentMovements,
+        subscriptions,
+        new Date(),
+        warehouseSubscription,
+      ),
+    };
+  }
+
+  private buildClientDailySummaries(
+    scope: Awaited<ReturnType<WmsReportsService['resolveScope']>>,
+    rows: DailyInventoryMovementRow[],
+    movements: Array<{
+      tenantId: string;
+      movementType: WmsInventoryMovementType;
+      fromStatus: WmsInventoryUnitStatus | null;
+      toStatus: WmsInventoryUnitStatus | null;
+      referenceCode: string | null;
+      inventoryUnit: { id: string };
+    }>,
+  ): ClientDailyInventorySummary[] {
+    const storeIdsByTenant = new Map<string, Set<string>>();
+    for (const store of scope.reportStores) {
+      const set = storeIdsByTenant.get(store.tenantId) ?? new Set<string>();
+      set.add(store.id);
+      storeIdsByTenant.set(store.tenantId, set);
+    }
+
+    const rowsByTenant = new Map<string, DailyInventoryMovementRow[]>();
+    for (const row of rows) {
+      const list = rowsByTenant.get(row.tenantId) ?? [];
+      list.push(row);
+      rowsByTenant.set(row.tenantId, list);
+    }
+
+    const activityGroupsByTenant = new Map<
+      string,
+      Map<
+        string,
+        {
+          direction: 'IN' | 'OUT' | 'INTERNAL';
+          movementType: WmsInventoryMovementType;
+          referenceCode: string | null;
+          unitIds: Set<string>;
+        }
+      >
+    >();
+
+    for (const movement of movements) {
+      const direction = this.classifyMovementDirection(movement);
+      if (direction === 'INTERNAL' && movement.movementType !== WmsInventoryMovementType.PUTAWAY) {
+        continue;
+      }
+
+      let tenantGroups = activityGroupsByTenant.get(movement.tenantId);
+      if (!tenantGroups) {
+        tenantGroups = new Map();
+        activityGroupsByTenant.set(movement.tenantId, tenantGroups);
+      }
+
+      const ref = movement.referenceCode?.trim() || null;
+      const key = `${direction}::${movement.movementType}::${ref ?? ''}`;
+      let group = tenantGroups.get(key);
+      if (!group) {
+        group = {
+          direction,
+          movementType: movement.movementType,
+          referenceCode: ref,
+          unitIds: new Set<string>(),
+        };
+        tenantGroups.set(key, group);
+      }
+      group.unitIds.add(movement.inventoryUnit.id);
+    }
+
+    const selectedTenantSet = new Set(scope.selectedTenantIds);
+    const targetPartners =
+      selectedTenantSet.size > 0
+        ? scope.partners.filter((partner) => selectedTenantSet.has(partner.id))
+        : scope.partners;
+
+    const summaries = targetPartners.map((partner) => {
+      const clientRows = rowsByTenant.get(partner.id) ?? [];
+      const totals = this.aggregateDailyRowsTotals(clientRows);
+      const tenantActivityMap = activityGroupsByTenant.get(partner.id);
+      const activityBreakdown: ClientDailyInventoryActivitySummary[] = tenantActivityMap
+        ? Array.from(tenantActivityMap.values())
+            .map((entry) => ({
+              direction: entry.direction,
+              movementType: entry.movementType,
+              referenceCode: entry.referenceCode,
+              unitCount: entry.unitIds.size,
+            }))
+            .sort((a, b) => {
+              const order = { IN: 0, OUT: 1, INTERNAL: 2 };
+              if (order[a.direction] !== order[b.direction]) {
+                return order[a.direction] - order[b.direction];
+              }
+              return b.unitCount - a.unitCount;
+            })
+        : [];
+
+      return {
+        tenantId: partner.id,
+        tenantName: partner.name,
+        storeCount: storeIdsByTenant.get(partner.id)?.size ?? 0,
+        variantCount: totals.variantCount,
+        movedVariantCount: totals.activeMovedVariantCount,
+        receivedInQty: totals.receivedInQty,
+        manualInQty: totals.manualInQty,
+        restockedInQty: totals.restockedInQty,
+        totalInQty: totals.totalInQty,
+        putAwayMovedQty: totals.putAwayMovedQty,
+        dispatchedOutQty: totals.dispatchedOutQty,
+        packedOutQty: totals.packedOutQty,
+        adjustedOutQty: totals.adjustedOutQty,
+        totalOutQty: totals.totalOutQty,
+        netChangeQty: totals.netChangeQty,
+        receivedQty: totals.receivedQty,
+        stagedQty: totals.stagedQty,
+        awaitingPutAwayQty: totals.awaitingPutAwayQty,
+        putAwayQty: totals.putAwayQty,
+        reservedQty: totals.reservedQty,
+        inBinQty: totals.inBinQty,
+        onHandQty: totals.onHandQty,
+        rows: clientRows,
+        activityBreakdown,
+      };
+    });
+
+    // Put clients with movement today first (highest movement activity first), then alphabetical
+    summaries.sort((left, right) => {
+      const leftActivity = left.totalInQty + left.totalOutQty + left.putAwayMovedQty;
+      const rightActivity = right.totalInQty + right.totalOutQty + right.putAwayMovedQty;
+      const leftActive = leftActivity > 0 ? 1 : 0;
+      const rightActive = rightActivity > 0 ? 1 : 0;
+      if (leftActive !== rightActive) return rightActive - leftActive;
+      if (leftActivity !== rightActivity) return rightActivity - leftActivity;
+      return left.tenantName.localeCompare(right.tenantName);
+    });
+
+    return summaries;
   }
 
   classifyMovementDirection(movement: {
@@ -774,17 +1041,20 @@ export class WmsReportsService {
   extractSubscriptionFromSettings(
     settingsValue: Prisma.JsonValue | null | undefined,
   ): DailyInventoryEmailSubscriptionConfig {
-    const root =
-      settingsValue && typeof settingsValue === 'object' && !Array.isArray(settingsValue)
-        ? (settingsValue as Record<string, unknown>)
-        : {};
-    const raw =
-      root.dailyInventoryReport
-      && typeof root.dailyInventoryReport === 'object'
-      && !Array.isArray(root.dailyInventoryReport)
-        ? (root.dailyInventoryReport as Record<string, unknown>)
-        : {};
+    const root = this.asRecord(settingsValue);
+    const raw = this.asRecord(root.dailyInventoryReport);
+    return this.parseSubscriptionConfigRecord(raw);
+  }
 
+  private asRecord(value: unknown): Record<string, unknown> {
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  }
+
+  private parseSubscriptionConfigRecord(
+    raw: Record<string, unknown>,
+  ): DailyInventoryEmailSubscriptionConfig {
     const enabled = typeof raw.enabled === 'boolean' ? raw.enabled : true;
     const recipients = Array.isArray(raw.recipients)
       ? Array.from(
@@ -813,8 +1083,198 @@ export class WmsReportsService {
     };
   }
 
-  async updateDailyEmailSubscription(dto: UpdateWmsDailyInventoryEmailSubscriptionDto) {
-    const targetTenantId = this.resolveTargetTenantId(dto.tenantId);
+  hasGlobalWmsAccess(): boolean {
+    const userRole = this.cls.get('userRole') as string | undefined;
+    return userRole === 'SUPER_ADMIN' || this.cls.get('wmsGlobalAccess') === true;
+  }
+
+  assertGlobalWmsAccess(): void {
+    if (!this.hasGlobalWmsAccess()) {
+      throw new ForbiddenException('Global WMS staff access is required for warehouse-wide reports');
+    }
+  }
+
+  private async resolveWarehouseDefaultRecipients(): Promise<{
+    defaultRecipients: string[];
+    matchedDefaultUsers: WarehouseDailyInventoryMatchedUser[];
+  }> {
+    const envRecipients = (process.env.WMS_WAREHOUSE_DAILY_INVENTORY_RECIPIENTS || '')
+      .split(/[,;\n]+/)
+      .map((entry) => entry.trim().toLowerCase())
+      .filter(Boolean);
+
+    const candidateUsers = this.prisma.user?.findMany
+      ? await this.prisma.user.findMany({
+          where: {
+            status: UserStatus.ACTIVE,
+            OR: [
+              {
+                firstName: { contains: 'stessey', mode: 'insensitive' },
+                lastName: { contains: 'soriano', mode: 'insensitive' },
+              },
+              {
+                firstName: { contains: 'stessey', mode: 'insensitive' },
+              },
+              {
+                email: { contains: 'stessey', mode: 'insensitive' },
+              },
+            ],
+          },
+          select: {
+            id: true,
+            email: true,
+            firstName: true,
+            lastName: true,
+            tenantId: true,
+          },
+          orderBy: [{ createdAt: 'asc' }],
+        })
+      : [];
+
+    const scoredUsers = candidateUsers
+      .map((user) => {
+        const first = (user.firstName || '').trim().toLowerCase();
+        const last = (user.lastName || '').trim().toLowerCase();
+        const email = (user.email || '').trim().toLowerCase();
+        const hasStessey = first.includes('stessey') || email.includes('stessey');
+        const hasSoriano = last.includes('soriano') || email.includes('soriano');
+        const score =
+          (hasStessey && hasSoriano ? 10 : hasStessey ? 5 : 0) + (!user.tenantId ? 2 : 0);
+        return { user, email, score };
+      })
+      .filter((item) => item.email && item.score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    const exactMatches = scoredUsers.filter((item) => item.score >= 10);
+    const selectedUsers = exactMatches.length > 0 ? exactMatches : scoredUsers;
+
+    const matchedDefaultUsers: WarehouseDailyInventoryMatchedUser[] = [];
+    const seenEmails = new Set<string>();
+    for (const item of selectedUsers) {
+      if (seenEmails.has(item.email)) continue;
+      seenEmails.add(item.email);
+      const name =
+        [item.user.firstName, item.user.lastName].filter(Boolean).join(' ').trim() || item.email;
+      matchedDefaultUsers.push({
+        id: item.user.id,
+        name,
+        email: item.email,
+      });
+    }
+
+    const defaultRecipients = Array.from(
+      new Set([
+        ...envRecipients,
+        ...matchedDefaultUsers.map((user) => user.email),
+      ]),
+    );
+
+    return {
+      defaultRecipients,
+      matchedDefaultUsers,
+    };
+  }
+
+  async getWarehouseDailyEmailSubscription(): Promise<WarehouseDailyInventoryEmailSubscription> {
+    const [setting, resolvedDefaults] = await Promise.all([
+      this.prisma.wmsSystemSetting?.findUnique
+        ? this.prisma.wmsSystemSetting.findUnique({
+            where: { key: WAREHOUSE_DAILY_INVENTORY_EMAIL_SETTING_KEY },
+            select: { value: true },
+          })
+        : Promise.resolve(null),
+      this.resolveWarehouseDefaultRecipients(),
+    ]);
+
+    const parsed = this.parseSubscriptionConfigRecord(this.asRecord(setting?.value));
+    const effectiveRecipients =
+      parsed.recipients.length > 0 ? parsed.recipients : resolvedDefaults.defaultRecipients;
+
+    return {
+      ...parsed,
+      defaultRecipients: resolvedDefaults.defaultRecipients,
+      effectiveRecipients,
+      matchedDefaultUsers: resolvedDefaults.matchedDefaultUsers,
+    };
+  }
+
+  async updateWarehouseDailyEmailSubscription(
+    dto: UpdateWmsWarehouseDailyInventoryEmailSubscriptionDto,
+  ) {
+    this.assertGlobalWmsAccess();
+
+    const existing = await this.prisma.wmsSystemSetting.findUnique({
+      where: { key: WAREHOUSE_DAILY_INVENTORY_EMAIL_SETTING_KEY },
+      select: { value: true },
+    });
+    const current = this.parseSubscriptionConfigRecord(this.asRecord(existing?.value));
+
+    const nextConfig: DailyInventoryEmailSubscriptionConfig = {
+      ...current,
+      ...(dto.enabled !== undefined ? { enabled: dto.enabled } : {}),
+      ...(dto.recipients !== undefined ? { recipients: dto.recipients } : {}),
+      ...(dto.sendTimeManila !== undefined ? { sendTimeManila: dto.sendTimeManila } : {}),
+    };
+
+    await this.prisma.wmsSystemSetting.upsert({
+      where: { key: WAREHOUSE_DAILY_INVENTORY_EMAIL_SETTING_KEY },
+      create: {
+        key: WAREHOUSE_DAILY_INVENTORY_EMAIL_SETTING_KEY,
+        value: nextConfig as unknown as Prisma.InputJsonValue,
+      },
+      update: {
+        value: nextConfig as unknown as Prisma.InputJsonValue,
+      },
+    });
+
+    const subscription = await this.getWarehouseDailyEmailSubscription();
+    return { subscription };
+  }
+
+  async recordWarehouseDailyEmailDeliveryResult(result: {
+    sentDate: string | null;
+    sentAt: string;
+    status: string;
+    mode: string;
+    error?: string | null;
+  }) {
+    if (!this.prisma.wmsSystemSetting?.findUnique || !this.prisma.wmsSystemSetting?.upsert) {
+      return;
+    }
+
+    const existing = await this.prisma.wmsSystemSetting.findUnique({
+      where: { key: WAREHOUSE_DAILY_INVENTORY_EMAIL_SETTING_KEY },
+      select: { value: true },
+    });
+    const current = this.parseSubscriptionConfigRecord(this.asRecord(existing?.value));
+
+    const nextConfig: DailyInventoryEmailSubscriptionConfig = {
+      ...current,
+      lastSentAt: result.sentAt,
+      lastSentDate: result.sentDate ?? current.lastSentDate,
+      lastDeliveryStatus: result.status,
+      lastDeliveryMode: result.mode,
+      lastError: result.error ?? null,
+    };
+
+    await this.prisma.wmsSystemSetting.upsert({
+      where: { key: WAREHOUSE_DAILY_INVENTORY_EMAIL_SETTING_KEY },
+      create: {
+        key: WAREHOUSE_DAILY_INVENTORY_EMAIL_SETTING_KEY,
+        value: nextConfig as unknown as Prisma.InputJsonValue,
+      },
+      update: {
+        value: nextConfig as unknown as Prisma.InputJsonValue,
+      },
+    });
+  }
+
+  async updateDailyEmailSubscription(
+    dto: UpdateWmsDailyInventoryEmailSubscriptionDto,
+    options?: DailyInventoryReportScopeOptions,
+  ) {
+    const targetTenantId = this.resolveTargetTenantId(dto.tenantId, options);
+    await this.assertCanManageClientPortalEmail(targetTenantId, options);
 
     const tenant = await this.prisma.tenant.findUnique({
       where: { id: targetTenantId },
@@ -893,10 +1353,12 @@ export class WmsReportsService {
     });
   }
 
-  resolveTargetTenantId(requestedTenantId?: string): string {
+  resolveTargetTenantId(
+    requestedTenantId?: string,
+    options?: DailyInventoryReportScopeOptions,
+  ): string {
     const clsTenantId = this.cls.get('tenantId') as string | undefined;
-    const userRole = this.cls.get('userRole') as string | undefined;
-    const isGlobalUser = userRole === 'SUPER_ADMIN' || this.cls.get('wmsGlobalAccess') === true;
+    const isGlobalUser = !options?.enforceClientPortalScope && this.hasGlobalWmsAccess();
 
     if (!isGlobalUser) {
       if (!clsTenantId) {
@@ -915,16 +1377,184 @@ export class WmsReportsService {
     return target;
   }
 
+  async assertCanManageClientPortalEmail(
+    tenantId: string,
+    options?: DailyInventoryReportScopeOptions,
+  ): Promise<void> {
+    if (!options?.enforceClientPortalScope) {
+      return;
+    }
+    const clientPortalAccess = await this.resolveClientPortalAccess(tenantId);
+    if (!clientPortalAccess.canManageEmailSubscription) {
+      throw new ForbiddenException(
+        'Tenant-wide admin access without a team filter is required to manage daily inventory email settings',
+      );
+    }
+  }
+
+  private async resolveClientPortalAccess(tenantId: string): Promise<{
+    isTeamScoped: boolean;
+    restrictedToZeroStores: boolean;
+    allowedTeamIds: string[];
+    canManageEmailSubscription: boolean;
+    userRole?: string;
+  }> {
+    const userRole = this.cls.get('userRole') as string | undefined;
+    const isSuperAdmin = userRole === UserRole.SUPER_ADMIN;
+
+    if (this.teamContext) {
+      const ctx = await this.teamContext.getContext();
+      const rawSelectedTeamIds =
+        ctx.teamIds && ctx.teamIds.length > 0
+          ? ctx.teamIds
+          : ctx.teamId
+            ? [ctx.teamId]
+            : [];
+      const selectedOrAssignedTeams = ctx.isAdmin
+        ? rawSelectedTeamIds
+        : rawSelectedTeamIds.length > 0
+          ? rawSelectedTeamIds
+          : ctx.userTeams;
+      const allowedTeamIds = Array.from(
+        new Set(
+          selectedOrAssignedTeams.filter(
+            (teamId) => Boolean(teamId) && (isSuperAdmin || !isSuperAdminOnlyTeamId(teamId)),
+          ),
+        ),
+      );
+      const restrictedToZeroStores =
+        !ctx.isAdmin && ctx.tenantHasTeams && allowedTeamIds.length === 0;
+      const isTeamScoped = allowedTeamIds.length > 0 || restrictedToZeroStores || !ctx.isAdmin;
+      const canManageEmailSubscription = ctx.isAdmin && allowedTeamIds.length === 0;
+
+      return {
+        isTeamScoped,
+        restrictedToZeroStores,
+        allowedTeamIds,
+        canManageEmailSubscription,
+        userRole,
+      };
+    }
+
+    const permissions = (this.cls.get('userPermissions') as string[] | undefined) ?? [];
+    const clsTeamIds = (this.cls.get('teamIds') as string[] | undefined) ?? [];
+    const clsTeamId = this.cls.get('teamId') as string | undefined;
+    const rawTeamIds = clsTeamIds.length > 0 ? clsTeamIds : clsTeamId ? [clsTeamId] : [];
+    const allowedTeamIds = Array.from(
+      new Set(
+        rawTeamIds.filter(
+          (teamId) => Boolean(teamId) && (isSuperAdmin || !isSuperAdminOnlyTeamId(teamId)),
+        ),
+      ),
+    );
+    const isAdmin =
+      userRole === UserRole.SUPER_ADMIN
+      || userRole === UserRole.ADMIN
+      || userRole === 'TENANT_ADMIN'
+      || permissions.some((permission) =>
+        ['team.manage', 'permission.assign', 'user.manage', 'team.read_all'].includes(permission),
+      );
+    const hasNoTeamsInTenant = this.prisma.team?.count
+      ? (await this.prisma.team.count({ where: { tenantId } })) === 0
+      : false;
+    const restrictedToZeroStores = !isAdmin && allowedTeamIds.length === 0 && !hasNoTeamsInTenant;
+    const isTeamScoped = allowedTeamIds.length > 0 || restrictedToZeroStores || !isAdmin;
+    const canManageEmailSubscription = isAdmin && allowedTeamIds.length === 0;
+
+    return {
+      isTeamScoped,
+      restrictedToZeroStores,
+      allowedTeamIds,
+      canManageEmailSubscription,
+      userRole,
+    };
+  }
+
+  private isMovementInScopedStores(
+    movement: {
+      tenantId?: string | null;
+      inventoryUnit: {
+        storeId: string;
+        tenantId?: string | null;
+        posProduct?: {
+          storeId?: string | null;
+          store?: { tenantId?: string | null } | null;
+        } | null;
+      };
+    },
+    storeById: Map<string, { id: string; tenantId: string }>,
+  ): boolean {
+    const unit = movement.inventoryUnit;
+    const unitStore = storeById.get(unit.storeId);
+    if (!unitStore) {
+      return false;
+    }
+    if (movement.tenantId && movement.tenantId !== unitStore.tenantId) {
+      return false;
+    }
+    if (unit.tenantId && unit.tenantId !== unitStore.tenantId) {
+      return false;
+    }
+    if (unit.posProduct?.storeId && unit.posProduct.storeId !== unit.storeId) {
+      return false;
+    }
+    if (unit.posProduct?.store?.tenantId && unit.posProduct.store.tenantId !== unitStore.tenantId) {
+      return false;
+    }
+    return true;
+  }
+
+  private isStoreAllowedInClientPortal(
+    store: {
+      id: string;
+      shopId: string;
+      shopName: string;
+      teamId?: string | null;
+      enabled?: boolean | null;
+      integration?: {
+        teamId?: string | null;
+        sharedTeams?: Array<{ teamId: string }> | null;
+      } | null;
+    },
+    access: {
+      allowedTeamIds: string[];
+      userRole?: string;
+    },
+  ): boolean {
+    if (store.enabled === false) {
+      return false;
+    }
+    if (access.userRole !== UserRole.SUPER_ADMIN) {
+      if (isBusinessReportExcludedStore(store)) {
+        return false;
+      }
+      if (isSuperAdminOnlyTeamId(store.teamId) || isSuperAdminOnlyTeamId(store.integration?.teamId)) {
+        return false;
+      }
+    }
+    if (access.allowedTeamIds.length > 0) {
+      const allowedSet = new Set(access.allowedTeamIds);
+      const matchesDirectTeam = Boolean(store.teamId && allowedSet.has(store.teamId));
+      const matchesIntegrationTeam = Boolean(
+        store.integration?.teamId && allowedSet.has(store.integration.teamId),
+      );
+      const matchesSharedTeam = Boolean(
+        store.integration?.sharedTeams?.some((shared) => allowedSet.has(shared.teamId)),
+      );
+      return matchesDirectTeam || matchesIntegrationTeam || matchesSharedTeam;
+    }
+    return true;
+  }
+
   private async resolveScope(
     query: { tenantIds?: string[]; storeIds?: string[] },
-    options?: { bypassClsForCron?: boolean },
+    options?: DailyInventoryReportScopeOptions,
   ) {
     const clsTenantId = this.cls.get('tenantId') as string | undefined;
-    const userRole = this.cls.get('userRole') as string | undefined;
+    const enforceClientPortalScope = options?.enforceClientPortalScope === true;
     const isGlobalUser =
-      options?.bypassClsForCron === true
-      || userRole === 'SUPER_ADMIN'
-      || this.cls.get('wmsGlobalAccess') === true;
+      !enforceClientPortalScope
+      && (options?.bypassClsForCron === true || this.hasGlobalWmsAccess());
     const requestedTenantIds = Array.from(new Set(query.tenantIds ?? []));
     const requestedStoreIds = Array.from(new Set(query.storeIds ?? []));
 
@@ -950,21 +1580,77 @@ export class WmsReportsService {
       throw new ForbiddenException('One or more selected partners are outside your WMS scope');
     }
 
-    const stores = await this.prisma.posStore.findMany({
-      where: {
-        tenantId: { in: partners.map((partner) => partner.id) },
-        status: IntegrationStatus.ACTIVE,
-      },
-      select: {
-        id: true,
-        tenantId: true,
-        shopId: true,
-        name: true,
-        shopName: true,
-        tenant: { select: { name: true } },
-      },
-      orderBy: [{ tenant: { name: 'asc' } }, { shopName: 'asc' }, { name: 'asc' }],
-    });
+    const clientPortalAccess = enforceClientPortalScope && clsTenantId
+      ? await this.resolveClientPortalAccess(clsTenantId)
+      : undefined;
+
+    const rawStores =
+      partners.length === 0 || (enforceClientPortalScope && clientPortalAccess?.restrictedToZeroStores)
+        ? []
+        : await this.prisma.posStore.findMany({
+            where: {
+              tenantId: { in: partners.map((partner) => partner.id) },
+              status: IntegrationStatus.ACTIVE,
+              ...(enforceClientPortalScope
+                ? {
+                    AND: [
+                      { OR: [{ enabled: true }, { enabled: null }] },
+                      ...(clientPortalAccess && clientPortalAccess.allowedTeamIds.length > 0
+                        ? [
+                            {
+                              OR: [
+                                { teamId: { in: clientPortalAccess.allowedTeamIds } },
+                                {
+                                  integration: {
+                                    teamId: { in: clientPortalAccess.allowedTeamIds },
+                                  },
+                                },
+                                {
+                                  integration: {
+                                    sharedTeams: {
+                                      some: { teamId: { in: clientPortalAccess.allowedTeamIds } },
+                                    },
+                                  },
+                                },
+                              ],
+                            },
+                          ]
+                        : []),
+                    ],
+                  }
+                : {}),
+            },
+            select: enforceClientPortalScope
+              ? {
+                  id: true,
+                  tenantId: true,
+                  teamId: true,
+                  shopId: true,
+                  name: true,
+                  shopName: true,
+                  enabled: true,
+                  integration: {
+                    select: {
+                      teamId: true,
+                      sharedTeams: { select: { teamId: true } },
+                    },
+                  },
+                  tenant: { select: { name: true } },
+                }
+              : {
+                  id: true,
+                  tenantId: true,
+                  shopId: true,
+                  name: true,
+                  shopName: true,
+                  tenant: { select: { name: true } },
+                },
+            orderBy: [{ tenant: { name: 'asc' } }, { shopName: 'asc' }, { name: 'asc' }],
+          });
+
+    const stores = enforceClientPortalScope && clientPortalAccess
+      ? rawStores.filter((store) => this.isStoreAllowedInClientPortal(store, clientPortalAccess))
+      : rawStores;
 
     const selectedTenantIds = requestedTenantIds.length > 0
       ? new Set(requestedTenantIds)
@@ -986,6 +1672,7 @@ export class WmsReportsService {
       reportStores: requestedStoreIds.length > 0
         ? requestedStoreIds.map((storeId) => storesInSelectedPartnersById.get(storeId)!)
         : storesInSelectedPartners,
+      clientPortalAccess,
     };
   }
 
@@ -1046,21 +1733,22 @@ export class WmsReportsService {
         selectedTenantIds: scope.selectedTenantIds,
         selectedStoreIds: scope.selectedStoreIds,
         effectiveStoreIds: scope.reportStores.map((store) => store.id),
+        ...(scope.clientPortalAccess
+          ? {
+              isTeamScoped: scope.clientPortalAccess.isTeamScoped,
+              canManageEmailSubscription: scope.clientPortalAccess.canManageEmailSubscription,
+            }
+          : {}),
       },
       totals,
       rows,
     };
   }
 
-  private buildDailyMovementsResponse(
-    scope: Awaited<ReturnType<WmsReportsService['resolveScope']>>,
-    window: { startDate: string; endDate: string; startUtc: Date; endUtc: Date },
+  private aggregateDailyRowsTotals(
     rows: DailyInventoryMovementRow[],
-    recentMovements: DailyInventoryMovementEventItem[],
-    subscriptions: ClientDailyInventoryEmailSubscription[],
-    generatedAt: Date,
-  ) {
-    const totals = rows.reduce<DailyInventoryMovementsReportTotals>(
+  ): DailyInventoryMovementsReportTotals {
+    return rows.reduce<DailyInventoryMovementsReportTotals>(
       (acc, row) => ({
         variantCount: acc.variantCount + 1,
         activeMovedVariantCount:
@@ -1106,6 +1794,18 @@ export class WmsReportsService {
         onHandQty: 0,
       },
     );
+  }
+
+  private buildDailyMovementsResponse(
+    scope: Awaited<ReturnType<WmsReportsService['resolveScope']>>,
+    window: { startDate: string; endDate: string; startUtc: Date; endUtc: Date },
+    rows: DailyInventoryMovementRow[],
+    recentMovements: DailyInventoryMovementEventItem[],
+    subscriptions: ClientDailyInventoryEmailSubscription[],
+    generatedAt: Date,
+    warehouseSubscription?: WarehouseDailyInventoryEmailSubscription,
+  ) {
+    const totals = this.aggregateDailyRowsTotals(rows);
 
     const selectedTenantSet = new Set(scope.selectedTenantIds);
     const relevantSubscriptions =
@@ -1138,11 +1838,18 @@ export class WmsReportsService {
         selectedTenantIds: scope.selectedTenantIds,
         selectedStoreIds: scope.selectedStoreIds,
         effectiveStoreIds: scope.reportStores.map((store) => store.id),
+        ...(scope.clientPortalAccess
+          ? {
+              isTeamScoped: scope.clientPortalAccess.isTeamScoped,
+              canManageEmailSubscription: scope.clientPortalAccess.canManageEmailSubscription,
+            }
+          : {}),
       },
       totals,
       rows,
       recentMovements,
       subscriptions: relevantSubscriptions,
+      ...(warehouseSubscription !== undefined ? { warehouseSubscription } : {}),
     };
   }
 }

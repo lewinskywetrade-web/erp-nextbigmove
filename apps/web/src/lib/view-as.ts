@@ -1,6 +1,9 @@
+export const CLIENT_PORTAL_PREVIEW_ALLOWED_EMAIL = 'lewinsky.wetrade@gmail.com';
+
 type VerifiedIdentity = {
   id?: string;
   userId?: string;
+  email?: string | null;
   role?: string;
   impersonatedBy?: string | null;
 };
@@ -17,6 +20,24 @@ export function viewAsCapabilities(me: VerifiedIdentity | null, permissions: unk
     canImpersonate: Boolean(currentUserId) && !me?.impersonatedBy
       && (isSuperAdmin || keys.includes('user.impersonate')),
   };
+}
+
+/**
+ * Presentation check for cross-client live portal View As.
+ * Always requires both the server-verified flag and the designated owner email.
+ */
+export function canPreviewAllClients(
+  me: VerifiedIdentity | null,
+  serverCanPreviewClients = false,
+): boolean {
+  const currentUserId = me?.userId || me?.id || null;
+  return Boolean(
+    serverCanPreviewClients
+    && currentUserId
+    && !me?.impersonatedBy
+    && me?.role === 'SUPER_ADMIN'
+    && (me?.email ?? '').trim().toLowerCase() === CLIENT_PORTAL_PREVIEW_ALLOWED_EMAIL,
+  );
 }
 
 export function viewAsDisabledReason(

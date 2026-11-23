@@ -21,8 +21,11 @@ import { WmsInlineNotice } from '../../_components/wms-inline-notice';
 import { WmsModal } from '../../_components/wms-modal';
 import {
   fetchDailyInventoryMovementsReport,
+  fetchWarehouseDailyInventoryEmailPreview,
   sendDailyInventoryEmailNow,
+  sendWarehouseDailyInventoryEmailNow,
   updateDailyInventoryEmailSubscription,
+  updateWarehouseDailyInventoryEmailSubscription,
 } from '../_services/month-end-stock-report.service';
 import type {
   ClientDailyInventoryEmailSubscription,
@@ -31,6 +34,24 @@ import type {
 } from '../_types/month-end-stock-report';
 
 const PAGE_SIZE = 25;
+
+function parseEmailRecipients(text: string): string[] {
+  return Array.from(
+    new Set(
+      text
+        .split(/[,;\n]+/)
+        .map((entry) => entry.trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  );
+}
+
+function extractApiErrorMessage(err: unknown, fallback: string): string {
+  const msg =
+    (err as { response?: { data?: { message?: string | string[] } } })?.response?.data?.message;
+  if (Array.isArray(msg)) return msg.join(', ');
+  return msg || (err instanceof Error ? err.message : fallback) || fallback;
+}
 
 function getManilaToday(): string {
   const formatter = new Intl.DateTimeFormat('en-CA', {
@@ -64,7 +85,7 @@ export function DailyInventoryMovementsScreen() {
   const [showMovedOnly, setShowMovedOnly] = useState(false);
   const [page, setPage] = useState(1);
 
-  // Email auto-reporting configuration state
+  // Client email auto-reporting configuration state
   const [selectedEmailTenantId, setSelectedEmailTenantId] = useState<string>('');
   const [emailEnabled, setEmailEnabled] = useState(true);
   const [emailRecipientsText, setEmailRecipientsText] = useState('');
@@ -73,7 +94,24 @@ export function DailyInventoryMovementsScreen() {
   const [isSendingEmail, setIsSendingEmail] = useState(false);
   const [emailActionMessage, setEmailActionMessage] = useState<string | null>(null);
   const [emailActionError, setEmailActionError] = useState<string | null>(null);
-  const [previewHtml, setPreviewHtml] = useState<{ subject: string; html: string } | null>(null);
+
+  // Warehouse consolidated daily email state (all clients in 1 email, grouped by client)
+  const [warehouseEnabled, setWarehouseEnabled] = useState(true);
+  const [warehouseRecipientsText, setWarehouseRecipientsText] = useState('');
+  const [warehouseSendTimeManila, setWarehouseSendTimeManila] = useState('20:00');
+  const [isSavingWarehouseSub, setIsSavingWarehouseSub] = useState(false);
+  const [isSendingWarehouseEmail, setIsSendingWarehouseEmail] = useState(false);
+  const [isLoadingWarehousePreview, setIsLoadingWarehousePreview] = useState(false);
+  const [warehouseActionMessage, setWarehouseActionMessage] = useState<string | null>(null);
+  const [warehouseActionError, setWarehouseActionError] = useState<string | null>(null);
+
+  const [previewHtml, setPreviewHtml] = useState<{
+    subject: string;
+    html: string;
+    recipientsLabel: string;
+    gmailTo: string;
+    description: string;
+  } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -156,6 +194,117 @@ export function DailyInventoryMovementsScreen() {
     setSendTimeManila(activeSubscription.sendTimeManila || '20:00');
   }, [activeSubscription]);
 
+  const warehouseSubscription = data?.warehouseSubscription ?? null;
+
+  useEffect(() => {
+    if (!warehouseSubscription) return;
+    setWarehouseEnabled(warehouseSubscription.enabled);
+    setWarehouseRecipientsText(warehouseSubscription.effectiveRecipients.join(', '));
+    setWarehouseSendTimeManila(warehouseSubscription.sendTimeManila || '20:00');
+  }, [warehouseSubscription]);
+
+  const handleSaveWarehouseSubscription = async () => {
+    setIsSavingWarehouseSub(true);
+    setWarehouseActionMessage(null);
+    setWarehouseActionError(null);
+
+    try {
+      const recipients = parseEmailRecipients(warehouseRecipientsText);
+      const { subscription } = await updateWarehouseDailyInventoryEmailSubscription({
+        enabled: warehouseEnabled,
+        recipients,
+        sendTimeManila: warehouseSendTimeManila,
+      });
+
+      setData((prev) => (prev ? { ...prev, warehouseSubscription: subscription } : prev));
+      setWarehouseActionMessage(
+        `Saved daily warehouse summary settings (${
+          subscription.enabled
+            ? `Daily at ${subscription.sendTimeManila} Manila → ${
+                subscription.effectiveRecipients.join(', ') || 'No recipient yet'
+              }`
+            : 'Paused'
+        }).`,
+      );
+    } catch (err: unknown) {
+      setWarehouseActionError(
+        extractApiErrorMessage(err, 'Failed to save warehouse summary settings.'),
+      );
+    } finally {
+      setIsSavingWarehouseSub(false);
+    }
+  };
+
+  const handleSendWarehouseEmailNow = async () => {
+    setIsSendingWarehouseEmail(true);
+    setWarehouseActionMessage(null);
+    setWarehouseActionError(null);
+
+    try {
+      const recipients = parseEmailRecipients(warehouseRecipientsText);
+      const response = await sendWarehouseDailyInventoryEmailNow({
+        startDate,
+        endDate,
+        recipients: recipients.length > 0 ? recipients : undefined,
+        tenantIds: selectedTenantIds.length > 0 ? selectedTenantIds : undefined,
+      });
+
+      setData((prev) =>
+        prev ? { ...prev, warehouseSubscription: response.subscription } : prev,
+      );
+      setPreviewHtml({
+        subject: response.preview.subject,
+        html: response.preview.html,
+        recipientsLabel: response.recipients.join(', '),
+        gmailTo: response.recipients.join(','),
+        description:
+          'Preview of the consolidated daily HTML email showing warehouse ins & outs per client.',
+      });
+      setWarehouseActionMessage(
+        `Warehouse Daily Inventory Summary (${response.clientCount} clients) prepared and dispatched to ${response.recipients.join(
+          ', ',
+        )}.`,
+      );
+    } catch (err: unknown) {
+      setWarehouseActionError(
+        extractApiErrorMessage(err, 'Failed to send warehouse daily inventory email.'),
+      );
+    } finally {
+      setIsSendingWarehouseEmail(false);
+    }
+  };
+
+  const handlePreviewWarehouseEmail = async () => {
+    setIsLoadingWarehousePreview(true);
+    setWarehouseActionError(null);
+    try {
+      const response = await fetchWarehouseDailyInventoryEmailPreview({
+        startDate,
+        endDate,
+        tenantIds: selectedTenantIds,
+      });
+      const activeRecipients =
+        parseEmailRecipients(warehouseRecipientsText).join(', ')
+        || response.subscription.effectiveRecipients.join(', ');
+      setPreviewHtml({
+        subject: response.subject,
+        html: response.html,
+        recipientsLabel: activeRecipients || 'Stessey Anne Soriano (configure recipient)',
+        gmailTo:
+          parseEmailRecipients(warehouseRecipientsText).join(',')
+          || response.subscription.effectiveRecipients.join(','),
+        description:
+          'Preview of the consolidated daily HTML email showing warehouse ins & outs per client.',
+      });
+    } catch (err: unknown) {
+      setWarehouseActionError(
+        extractApiErrorMessage(err, 'Failed to generate warehouse summary email preview.'),
+      );
+    } finally {
+      setIsLoadingWarehousePreview(false);
+    }
+  };
+
   const handleSaveSubscription = async () => {
     if (!selectedEmailTenantId) return;
     setIsSavingSub(true);
@@ -163,10 +312,7 @@ export function DailyInventoryMovementsScreen() {
     setEmailActionError(null);
 
     try {
-      const recipients = emailRecipientsText
-        .split(/[,;\n]+/)
-        .map((e) => e.trim().toLowerCase())
-        .filter(Boolean);
+      const recipients = parseEmailRecipients(emailRecipientsText);
 
       const { subscription } = await updateDailyInventoryEmailSubscription({
         tenantId: selectedEmailTenantId,
@@ -191,10 +337,8 @@ export function DailyInventoryMovementsScreen() {
         }).`,
       );
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { message?: string | string[] } } })?.response?.data?.message;
       setEmailActionError(
-        Array.isArray(msg) ? msg.join(', ') : msg || 'Failed to save email subscription settings.',
+        extractApiErrorMessage(err, 'Failed to save email subscription settings.'),
       );
     } finally {
       setIsSavingSub(false);
@@ -208,10 +352,7 @@ export function DailyInventoryMovementsScreen() {
     setEmailActionError(null);
 
     try {
-      const recipients = emailRecipientsText
-        .split(/[,;\n]+/)
-        .map((e) => e.trim().toLowerCase())
-        .filter(Boolean);
+      const recipients = parseEmailRecipients(emailRecipientsText);
 
       const response = await sendDailyInventoryEmailNow({
         tenantId: selectedEmailTenantId,
@@ -233,6 +374,9 @@ export function DailyInventoryMovementsScreen() {
       setPreviewHtml({
         subject: response.preview.subject,
         html: response.preview.html,
+        recipientsLabel: response.recipients.join(', '),
+        gmailTo: response.recipients.join(','),
+        description: 'Preview of the automated daily HTML email sent to the client.',
       });
       setEmailActionMessage(
         `Daily Inventory Ins & Outs email prepared and dispatched for ${
@@ -240,11 +384,7 @@ export function DailyInventoryMovementsScreen() {
         } to ${response.recipients.join(', ')}.`,
       );
     } catch (err: unknown) {
-      const msg =
-        (err as { response?: { data?: { message?: string | string[] } } })?.response?.data?.message;
-      setEmailActionError(
-        Array.isArray(msg) ? msg.join(', ') : msg || 'Failed to send daily inventory email.',
-      );
+      setEmailActionError(extractApiErrorMessage(err, 'Failed to send daily inventory email.'));
     } finally {
       setIsSendingEmail(false);
     }
@@ -562,6 +702,113 @@ export function DailyInventoryMovementsScreen() {
         </div>
       </section>
 
+      {/* Warehouse Consolidated Daily Email Card (All Clients Grouped By Client) */}
+      {warehouseSubscription ? (
+        <WmsCompactPanel
+          title="Automated Warehouse Daily Summary (All Clients — Grouped By Client)"
+          icon={<Boxes className="panel-icon" />}
+          meta={
+            warehouseSubscription.lastSentAt
+              ? `Last emailed: ${new Date(warehouseSubscription.lastSentAt).toLocaleString()} (${
+                  warehouseSubscription.lastDeliveryStatus ?? 'SENT'
+                })`
+              : 'Sends one consolidated daily email with all warehouse stock ins & outs organized per client'
+          }
+        >
+          <div className="space-y-3">
+            {warehouseActionMessage ? (
+              <WmsInlineNotice tone="success">{warehouseActionMessage}</WmsInlineNotice>
+            ) : null}
+            {warehouseActionError ? (
+              <WmsInlineNotice tone="error">{warehouseActionError}</WmsInlineNotice>
+            ) : null}
+
+            <div className="grid gap-3 lg:grid-cols-[minmax(280px,1.8fr)_140px_auto]">
+              <div>
+                <label className="mb-1 block text-xs font-semibold text-[#536977]">
+                  Warehouse Summary Recipients (comma-separated)
+                </label>
+                <input
+                  type="text"
+                  value={warehouseRecipientsText}
+                  onChange={(e) => setWarehouseRecipientsText(e.target.value)}
+                  placeholder={
+                    warehouseSubscription.defaultRecipients.join(', ')
+                    || 'stessey@company.com'
+                  }
+                  className="input text-sm"
+                />
+                {warehouseSubscription.matchedDefaultUsers.length > 0 ? (
+                  <p className="mt-1 text-[11px] text-[#5e7483]">
+                    Auto-resolved default:{' '}
+                    {warehouseSubscription.matchedDefaultUsers
+                      .map((u) => `${u.name} (${u.email})`)
+                      .join(', ')}
+                  </p>
+                ) : null}
+              </div>
+
+              <div>
+                <label className="mb-1 block text-xs font-semibold text-[#536977]">
+                  Daily Time (PH)
+                </label>
+                <div className="relative">
+                  <Clock className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#7c8f9b]" />
+                  <input
+                    type="time"
+                    value={warehouseSendTimeManila}
+                    onChange={(e) => setWarehouseSendTimeManila(e.target.value || '20:00')}
+                    className="input pl-8 text-sm"
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-end gap-2">
+                <label className="flex h-10 cursor-pointer items-center gap-2 rounded-xl border border-[#d7e0e7] bg-[#fbfcfc] px-3 text-xs font-semibold text-primary">
+                  <input
+                    type="checkbox"
+                    checked={warehouseEnabled}
+                    onChange={(e) => setWarehouseEnabled(e.target.checked)}
+                    className="h-4 w-4 accent-[#17324b]"
+                  />
+                  Daily Auto-Send
+                </label>
+
+                <button
+                  type="button"
+                  onClick={() => void handleSaveWarehouseSubscription()}
+                  disabled={isSavingWarehouseSub}
+                  className="btn btn-md btn-outline btn-icon"
+                >
+                  <CheckCircle2 className="h-4 w-4" />
+                  {isSavingWarehouseSub ? 'Saving…' : 'Save Settings'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => void handleSendWarehouseEmailNow()}
+                  disabled={isSendingWarehouseEmail}
+                  className="btn btn-md btn-primary btn-icon"
+                >
+                  <Send className="h-4 w-4" />
+                  {isSendingWarehouseEmail ? 'Sending…' : 'Email Summary Now'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => void handlePreviewWarehouseEmail()}
+                  disabled={!data || isLoadingWarehousePreview}
+                  className="btn btn-md btn-secondary btn-icon"
+                >
+                  <Eye className="h-4 w-4" />
+                  {isLoadingWarehousePreview ? 'Loading…' : 'Preview Email'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </WmsCompactPanel>
+      ) : null}
+
       {/* Automated Daily Email to Client Card */}
       <WmsCompactPanel
         title="Automated Daily Email Report to Client"
@@ -697,6 +944,15 @@ export function DailyInventoryMovementsScreen() {
                     .join('');
                   setPreviewHtml({
                     subject: `[Daily Inventory Ins & Outs] ${clientName} — ${dateLabel}`,
+                    recipientsLabel:
+                      emailRecipientsText.trim()
+                      || activeSubscription?.effectiveRecipients.join(', ')
+                      || 'Client default email',
+                    gmailTo:
+                      emailRecipientsText.trim()
+                      || activeSubscription?.effectiveRecipients.join(',')
+                      || '',
+                    description: 'Preview of the automated daily HTML email sent to the client.',
                     html: `<div style="max-width:720px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
                       <div style="padding:20px 24px;background:#17324b;color:#ffffff;">
                         <div style="font-size:11px;letter-spacing:0.16em;text-transform:uppercase;color:#93c5fd;font-weight:600;">Daily Automated Inventory Report</div>
@@ -934,26 +1190,21 @@ export function DailyInventoryMovementsScreen() {
       <WmsModal
         open={Boolean(previewHtml)}
         title={previewHtml?.subject || 'Daily Inventory Email Preview'}
-        description="Preview of the automated daily HTML email sent to the client."
+        description={
+          previewHtml?.description || 'Preview of the automated daily HTML email report.'
+        }
         onClose={() => setPreviewHtml(null)}
-        panelClassName="max-w-3xl"
+        panelClassName="max-w-4xl"
       >
         {previewHtml ? (
           <div className="space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#dce4ea] bg-white px-3 py-2 text-xs">
               <span className="text-[#536977]">
-                Client Recipients:{' '}
-                <strong className="text-primary">
-                  {emailRecipientsText.trim() ||
-                    activeSubscription?.effectiveRecipients.join(', ') ||
-                    'Client default email'}
-                </strong>
+                Recipients: <strong className="text-primary">{previewHtml.recipientsLabel}</strong>
               </span>
               <a
                 href={`https://mail.google.com/mail/?view=cm&fs=1&to=${encodeURIComponent(
-                  emailRecipientsText.trim() ||
-                    activeSubscription?.effectiveRecipients.join(',') ||
-                    '',
+                  previewHtml.gmailTo,
                 )}&su=${encodeURIComponent(previewHtml.subject)}`}
                 target="_blank"
                 rel="noopener noreferrer"

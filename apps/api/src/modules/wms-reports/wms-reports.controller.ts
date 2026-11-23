@@ -6,7 +6,9 @@ import { GetWmsMonthEndStockReportDto } from './dto/get-wms-month-end-stock-repo
 import { GetWmsDailyInventoryMovementsDto } from './dto/get-wms-daily-inventory-movements.dto';
 import {
   SendWmsDailyInventoryEmailDto,
+  SendWmsWarehouseDailyInventoryEmailDto,
   UpdateWmsDailyInventoryEmailSubscriptionDto,
+  UpdateWmsWarehouseDailyInventoryEmailSubscriptionDto,
 } from './dto/wms-daily-inventory-email.dto';
 import { WmsReportsService } from './wms-reports.service';
 import { WmsDailyInventoryEmailService } from './wms-daily-inventory-email.service';
@@ -41,5 +43,32 @@ export class WmsReportsController {
   @Permissions('wms.reports.month_end_stock.read', 'wms.inventory.read', 'wms.partners.read')
   sendDailyInventoryEmail(@Body() dto: SendWmsDailyInventoryEmailDto) {
     return this.wmsDailyInventoryEmailService.sendNow(dto);
+  }
+
+  @Get('daily-inventory-warehouse-subscription')
+  @Permissions('wms.reports.month_end_stock.read', 'wms.inventory.read', 'wms.partners.read')
+  getWarehouseDailyInventorySubscription() {
+    this.wmsReportsService.assertGlobalWmsAccess();
+    return this.wmsReportsService.getWarehouseDailyEmailSubscription();
+  }
+
+  @Patch('daily-inventory-warehouse-subscription')
+  @Permissions('wms.reports.month_end_stock.read', 'wms.inventory.read', 'wms.partners.read')
+  updateWarehouseDailyInventorySubscription(
+    @Body() dto: UpdateWmsWarehouseDailyInventoryEmailSubscriptionDto,
+  ) {
+    return this.wmsReportsService.updateWarehouseDailyEmailSubscription(dto);
+  }
+
+  @Get('daily-inventory-warehouse-preview')
+  @Permissions('wms.reports.month_end_stock.read', 'wms.inventory.read', 'wms.partners.read')
+  previewWarehouseDailyInventoryEmail(@Query() query: GetWmsDailyInventoryMovementsDto) {
+    return this.wmsDailyInventoryEmailService.previewWarehouseNow(query);
+  }
+
+  @Post('daily-inventory-warehouse-send')
+  @Permissions('wms.reports.month_end_stock.read', 'wms.inventory.read', 'wms.partners.read')
+  sendWarehouseDailyInventoryEmail(@Body() dto: SendWmsWarehouseDailyInventoryEmailDto) {
+    return this.wmsDailyInventoryEmailService.sendWarehouseNow(dto);
   }
 }

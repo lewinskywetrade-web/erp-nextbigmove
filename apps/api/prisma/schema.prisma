@@ -3875,6 +3875,15 @@ model WmsLabelPrintLog {
   @@map("wms_label_print_logs")
 }
 
+model WmsSystemSetting {
+  key       String   @id
+  value     Json     @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("wms_system_settings")
+}
+
 model PosProvince {
   id          String        @id
   countryCode Int

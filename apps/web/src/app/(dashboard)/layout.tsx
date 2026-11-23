@@ -1,6 +1,8 @@
 'use client';
 
 import { ImpersonationBanner } from './_components/impersonation-banner';
+import { ClientPortalPreviewDialog } from './_components/client-portal-preview-dialog';
+import { canPreviewAllClients } from '@/lib/view-as';
 import { applySession, getCurrentTenantId, getMemberships, type Membership } from '@/lib/session';
 import { switchTenant } from '@/lib/tenant-switch';
 
@@ -16,6 +18,8 @@ import {
   ClipboardList,
   Package,
   FileSpreadsheet,
+  ArrowLeftRight,
+  Eye,
   Menu,
   X,
   Moon,
@@ -28,6 +32,10 @@ import {
 import apiClient from '@/lib/api-client';
 import { ToastProvider } from '@/components/ui/toast';
 import { filterErpPermissions } from '@/lib/permission-workspace';
+import {
+  hasDailyInventoryReadPermission,
+  hasReportsNavPermission,
+} from './reports/_utils/daily-inventory-helpers';
 import { clearTeamScopeStorage } from './integrations/_utils/team-scope';
 import { useRequestNotificationCount } from './requests/_hooks/use-request-notification-count';
 
@@ -89,6 +97,12 @@ const baseNavigation: NavLink[] = [
     label: 'Stock Requests',
     description: 'Inventory request coordination with WMS',
     icon: <Package className={iconClasses} />,
+  },
+  {
+    href: '/daily-inventory',
+    label: 'Daily Stock Ins & Outs',
+    description: 'Store-isolated daily stock movements',
+    icon: <ArrowLeftRight className={iconClasses} />,
   },
   {
     href: '/performance',
@@ -227,6 +241,8 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
   const [canViewAllTeams, setCanViewAllTeams] = useState(false);
   const [isTeamMenuOpen, setIsTeamMenuOpen] = useState(false);
   const [isProfileMenuOpen, setIsProfileMenuOpen] = useState(false);
+  const [canPreviewClients, setCanPreviewClients] = useState(false);
+  const [isClientPreviewOpen, setIsClientPreviewOpen] = useState(false);
   const [collapsedPopupItem, setCollapsedPopupItem] = useState<string | null>(null);
   const [popupPosition, setPopupPosition] = useState<{ top: number; left: number } | null>(null);
   const [themeMode, setThemeMode] = useState<'light' | 'dark'>(() => {
@@ -296,7 +312,8 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
     const hasUndeliverables =
       permissions.includes('orders.undeliverables.read')
       || permissions.includes('orders.undeliverables.read_all');
-    const hasReports = permissions.includes('reports.pos_orders.read');
+    const hasDailyInventory = hasDailyInventoryReadPermission(permissions);
+    const hasReports = hasReportsNavPermission(permissions);
     const canReadCreative = permissions.includes('creative_agent.read');
     const canReadCreativeAll = permissions.includes('creative_agent.read_all');
     const canReviewCreative = permissions.includes('creative_agent.review')
@@ -329,6 +346,9 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
         }
         if (link.href === '/requests') {
           return hasStockRequests ? [link] : [];
+        }
+        if (link.href === '/daily-inventory') {
+          return hasDailyInventory ? [link] : [];
         }
         if (link.href === '/orders') {
           const children = (link.children || []).filter((child) => {
@@ -500,6 +520,31 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
       }
     };
     void checkAccess();
+  }, [user]);
+
+  useEffect(() => {
+    const uid = user?.userId || user?.id;
+    if (!user || !uid) {
+      setCanPreviewClients(false);
+      return;
+    }
+    let cancelled = false;
+    apiClient
+      .get('/auth/me')
+      .then((res) => {
+        if (cancelled) return;
+        setCanPreviewClients(
+          canPreviewAllClients(res.data?.user ?? null, Boolean(res.data?.canPreviewClients)),
+        );
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setCanPreviewClients(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [user]);
 
   useEffect(() => {
@@ -1202,6 +1247,16 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
             </div>
 
             <div className="flex items-center gap-2">
+              {canPreviewClients ? (
+                <button
+                  type="button"
+                  onClick={() => setIsClientPreviewOpen(true)}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-primary/40 bg-primary/10 px-3 py-1.5 text-xs font-semibold text-primary transition hover:bg-primary/15"
+                >
+                  <Eye className="h-3.5 w-3.5" aria-hidden="true" />
+                  <span>View as Client</span>
+                </button>
+              ) : null}
               <button
                 type="button"
                 onClick={() => setThemeMode((current) => (current === 'dark' ? 'light' : 'dark'))}
@@ -1333,6 +1388,12 @@ export default function DashboardLayout({ children }: { children: ReactNode }) {
         </main>
       </div>
       </div>
+      {canPreviewClients ? (
+        <ClientPortalPreviewDialog
+          open={isClientPreviewOpen}
+          onOpenChange={setIsClientPreviewOpen}
+        />
+      ) : null}
     </ToastProvider>
   );
 }

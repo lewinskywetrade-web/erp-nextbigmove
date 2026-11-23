@@ -12,11 +12,13 @@ import { WmsStaffActivityService } from '../../common/services/wms-staff-activit
 import { EffectiveAccessService } from '../../common/services/effective-access.service';
 
 const IMPERSONATION_MAX_SECONDS = 15 * 60;
+export const CLIENT_PORTAL_PREVIEW_ALLOWED_EMAIL = 'lewinsky.wetrade@gmail.com';
 type ImpersonationClaims = {
   userId: string;
   tenantId: string | null;
   impersonatedBy?: string | null;
   originalSessionId?: string | null;
+  originalTenantId?: string | null;
   sessionId?: string | null;
   impersonationExpiresAt?: number;
   exp?: number;
@@ -282,6 +284,9 @@ export class AuthService {
           {
             impersonatedBy: preview.actor.id,
             originalSessionId: payload.originalSessionId ?? null,
+            ...(payload.originalTenantId !== undefined
+              ? { originalTenantId: payload.originalTenantId ?? null }
+              : {}),
             impersonationExpiresAt: preview.expiresAt,
           },
         );
@@ -402,7 +407,12 @@ export class AuthService {
     tenantId: string | null,
     role: string,
     sessionId: string,
-    impersonation?: { impersonatedBy: string; originalSessionId: string | null; impersonationExpiresAt: number },
+    impersonation?: {
+      impersonatedBy: string;
+      originalSessionId: string | null;
+      originalTenantId?: string | null;
+      impersonationExpiresAt: number;
+    },
   ) {
     const payload = {
       userId,
@@ -496,6 +506,228 @@ export class AuthService {
     };
   }
 
+  private isDesignatedClientPreviewOperator(user: {
+    email?: string | null;
+    role?: string | null;
+    status?: string | null;
+  } | null | undefined): boolean {
+    if (!user) return false;
+    return (
+      user.status === 'ACTIVE'
+      && user.role === 'SUPER_ADMIN'
+      && (user.email ?? '').trim().toLowerCase() === CLIENT_PORTAL_PREVIEW_ALLOWED_EMAIL
+    );
+  }
+
+  /**
+   * Whether the authenticated identity is allowed to launch cross-client live
+   * Client Portal View As previews. Always verified against the DB user row.
+   */
+  async canUserPreviewAllClients(actor: {
+    userId?: string;
+    id?: string;
+    impersonatedBy?: string | null;
+  } | null | undefined): Promise<boolean> {
+    const actorId = actor?.userId || actor?.id;
+    if (!actorId || actor?.impersonatedBy) {
+      return false;
+    }
+    const user = await this.prisma.user.findUnique({
+      where: { id: actorId },
+      select: { id: true, email: true, role: true, status: true },
+    });
+    return this.isDesignatedClientPreviewOperator(user);
+  }
+
+  private async assertClientPortalPreviewOperator(actor: {
+    userId?: string;
+    id?: string;
+    impersonatedBy?: string | null;
+  }) {
+    if (actor.impersonatedBy) {
+      throw new ForbiddenException('Already viewing as another user');
+    }
+    const actorId = actor.userId || actor.id;
+    if (!actorId) {
+      throw new UnauthorizedException();
+    }
+    const user = await this.prisma.user.findUnique({
+      where: { id: actorId },
+      select: { id: true, email: true, role: true, status: true, tenantId: true, defaultTeamId: true },
+    });
+    if (!this.isDesignatedClientPreviewOperator(user)) {
+      throw new ForbiddenException(
+        'Cross-client View As preview is restricted to the designated owner account',
+      );
+    }
+    return user!;
+  }
+
+  /** Active/trial client workspaces available to the designated View As operator. */
+  async listClientPreviewTenants(actor: {
+    userId?: string;
+    id?: string;
+    impersonatedBy?: string | null;
+  }) {
+    await this.assertClientPortalPreviewOperator(actor);
+    return this.prisma.tenant.findMany({
+      where: { status: { in: ['ACTIVE', 'TRIAL'] } },
+      select: { id: true, name: true, slug: true, status: true },
+      orderBy: [{ name: 'asc' }],
+    });
+  }
+
+  /** Active ERP users belonging to a target client tenant for live View As selection. */
+  async listClientPreviewTenantUsers(
+    actor: { userId?: string; id?: string; impersonatedBy?: string | null },
+    tenantId: string,
+  ) {
+    const operator = await this.assertClientPortalPreviewOperator(actor);
+    const tenant = await this.prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { id: true, name: true, slug: true, status: true },
+    });
+    if (!tenant || !['ACTIVE', 'TRIAL'].includes(tenant.status)) {
+      throw new NotFoundException('Client workspace not found or not active');
+    }
+
+    const users = await this.prisma.user.findMany({
+      where: {
+        id: { not: operator.id },
+        status: 'ACTIVE',
+        OR: [
+          { tenantId },
+          { tenantMemberships: { some: { tenantId, status: 'ACTIVE' } } },
+        ],
+        NOT: {
+          OR: [
+            { userRoleAssignments: { some: { workspace: toStoredPermissionWorkspace('wms') } } },
+            { tenantMemberships: { some: { tenantId, status: { not: 'ACTIVE' } } } },
+          ],
+        },
+      },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        role: true,
+        status: true,
+        tenantId: true,
+        lastLoginAt: true,
+        userRoleAssignments: {
+          where: { tenantId },
+          select: {
+            role: { select: { name: true, key: true } },
+            team: { select: { name: true } },
+          },
+        },
+        teamMemberships: {
+          where: { status: 'ACTIVE', team: { tenantId } },
+          select: {
+            team: { select: { name: true } },
+          },
+        },
+      },
+      orderBy: [{ firstName: 'asc' }, { email: 'asc' }],
+    });
+
+    return {
+      tenant,
+      users: users.map(({ userRoleAssignments, teamMemberships, tenantId: homeTenantId, ...user }) => {
+        const roles = Array.from(
+          new Set(userRoleAssignments.map((a) => a.role?.name || a.role?.key).filter(Boolean)),
+        );
+        const teams = Array.from(
+          new Set([
+            ...userRoleAssignments.map((a) => a.team?.name).filter(Boolean),
+            ...teamMemberships.map((m) => m.team?.name).filter(Boolean),
+          ]),
+        );
+        return {
+          ...user,
+          membership: homeTenantId === tenantId ? 'HOME' : 'GRANTED',
+          roles,
+          teams,
+        };
+      }),
+    };
+  }
+
+  /**
+   * Launch a cross-tenant read-only View As preview in a specific client
+   * workspace. Strictly restricted to the verified designated owner account.
+   */
+  async impersonateClientUser(
+    actor: { userId: string; tenantId: string | null; sessionId: string | null; impersonatedBy?: string },
+    targetTenantId: string,
+    targetUserId: string,
+    request?: any,
+  ) {
+    const operator = await this.assertClientPortalPreviewOperator(actor);
+    if (operator.id === targetUserId) {
+      throw new BadRequestException('You are already signed in as this user');
+    }
+
+    const expiresAt = Math.floor(Date.now() / 1000) + IMPERSONATION_MAX_SECONDS;
+    const preview = await this.validateImpersonationSession({
+      userId: targetUserId,
+      tenantId: targetTenantId,
+      impersonatedBy: operator.id,
+      impersonationExpiresAt: expiresAt,
+    });
+    const target = preview.target!;
+    const activeTenant = preview.tenant;
+    const originTenantId = actor.tenantId ?? operator.tenantId ?? null;
+
+    const sessionId = crypto.randomUUID();
+    const tokens = await this.generateTokens(
+      target.id,
+      activeTenant.id,
+      target.role,
+      sessionId,
+      {
+        impersonatedBy: operator.id,
+        originalSessionId: actor.sessionId,
+        originalTenantId: originTenantId,
+        impersonationExpiresAt: expiresAt,
+      },
+    );
+
+    await this.prisma.auditLog.create({
+      data: {
+        tenantId: activeTenant.id,
+        userId: operator.id,
+        action: 'IMPERSONATION_STARTED',
+        resource: 'user',
+        resourceId: target.id,
+        changes: {
+          targetUserId: target.id,
+          targetTenantId: activeTenant.id,
+          originalTenantId: originTenantId,
+          crossTenantPreview: true,
+          sessionId,
+        },
+        ipAddress: request?.ip ?? null,
+        userAgent: request?.headers?.['user-agent'] ?? null,
+      },
+    });
+
+    return {
+      user: this.sanitizeUser({
+        ...target,
+        tenantId: activeTenant.id,
+        defaultTeamId: preview.targetDefaultTeamId,
+      }),
+      tenant: this.sanitizeTenant(activeTenant),
+      memberships: this.previewMemberships(activeTenant),
+      impersonatedBy: operator.id,
+      impersonationReadOnly: true,
+      impersonationExpiresAt: expiresAt,
+      ...tokens,
+    };
+  }
+
   /** Hand the session back to the admin who started it. */
   async stopImpersonation(actor: ImpersonationClaims, request?: any) {
     if (!actor.impersonatedBy) {
@@ -506,14 +738,34 @@ export class AuthService {
     const admin = preview.actor;
 
     const sessionId = crypto.randomUUID();
-    // The impersonated session was minted inside the admin's active tenant, so
-    // that is where they return — not wherever the row's last-active pointer is.
-    const returnTenantId = preview.tenant.id;
+    // Return to the tenant the actor originally came from (when cross-client
+    // preview carried originalTenantId), otherwise the preview workspace.
+    const returnTenantId =
+      actor.originalTenantId !== undefined ? actor.originalTenantId : preview.tenant.id;
+    const returnTenant =
+      returnTenantId === preview.tenant.id
+        ? preview.tenant
+        : returnTenantId
+          ? await this.prisma.tenant.findUnique({ where: { id: returnTenantId } })
+          : null;
+
+    if (returnTenantId && (!returnTenant || !['ACTIVE', 'TRIAL'].includes(returnTenant.status))) {
+      throw new UnauthorizedException('Your original workspace is no longer active');
+    }
+
+    const returnDefaultTeamId =
+      returnTenantId === preview.tenant.id
+        ? preview.actorDefaultTeamId
+        : returnTenantId
+          ? admin.role === 'SUPER_ADMIN'
+            ? (admin.tenantId === returnTenantId ? admin.defaultTeamId : null)
+            : await this.assertPreviewTenantMembership(admin, returnTenantId)
+          : admin.defaultTeamId;
+
     const tokens = await this.generateTokens(admin.id, returnTenantId, admin.role, sessionId);
-    const returnTenant = preview.tenant;
 
     await this.recordImpersonationAudit(request, {
-      tenantId: returnTenantId,
+      tenantId: preview.tenant.id,
       actorId: admin.id,
       action: 'IMPERSONATION_ENDED',
       targetUserId: actor.userId,
@@ -521,8 +773,12 @@ export class AuthService {
     });
 
     return {
-      user: this.sanitizeUser({ ...admin, tenantId: returnTenantId, defaultTeamId: preview.actorDefaultTeamId }),
-      tenant: this.sanitizeTenant(returnTenant),
+      user: this.sanitizeUser({
+        ...admin,
+        tenantId: returnTenantId,
+        defaultTeamId: returnDefaultTeamId,
+      }),
+      tenant: returnTenant ? this.sanitizeTenant(returnTenant) : null,
       ...tokens,
       memberships: await this.listMemberships(admin.id),
     };

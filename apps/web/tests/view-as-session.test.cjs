@@ -258,3 +258,77 @@ test('preview sockets never connect or receive an auth token; ordinary socket se
     }
   }
 });
+
+test('cross-client View As helper enables only active SUPER_ADMIN lewinsky.wetrade@gmail.com with server flag', () => {
+  assert.equal(
+    capabilities.canPreviewAllClients(
+      { userId: 'u1', email: 'lewinsky.wetrade@gmail.com', role: 'SUPER_ADMIN' },
+      true,
+    ),
+    true,
+  );
+  assert.equal(
+    capabilities.canPreviewAllClients(
+      { userId: 'u1', email: 'LEWINSKY.WETRADE@gmail.com', role: 'SUPER_ADMIN' },
+      true,
+    ),
+    true,
+  );
+  assert.equal(
+    capabilities.canPreviewAllClients(
+      { userId: 'u1', email: 'lewinsky.wetrade@gmail.com', role: 'SUPER_ADMIN' },
+      false,
+    ),
+    false,
+  );
+  assert.equal(
+    capabilities.canPreviewAllClients(
+      { userId: 'u1', email: 'other@wetrade.com', role: 'SUPER_ADMIN' },
+      true,
+    ),
+    false,
+  );
+  assert.equal(
+    capabilities.canPreviewAllClients(
+      { userId: 'u1', email: 'lewinsky.wetrade@gmail.com', role: 'USER' },
+      true,
+    ),
+    false,
+  );
+  assert.equal(
+    capabilities.canPreviewAllClients(
+      { userId: 'u1', email: 'lewinsky.wetrade@gmail.com', role: 'SUPER_ADMIN', impersonatedBy: 'admin' },
+      true,
+    ),
+    false,
+  );
+});
+
+test('startClientPortalPreview posts /auth/impersonate/client, sets read-only preview session, and lands on /daily-inventory', async () => {
+  const calls = [];
+  const c = impersonationFixture({ access_token: 'admin' }, async (url, body) => {
+    calls.push([url, body]);
+    return {
+      data: {
+        accessToken: 'client-preview-token',
+        impersonatedBy: 'lewinsky',
+        impersonationReadOnly: true,
+        user: { id: 'client-user', firstName: 'Client', email: 'owner@famco.test' },
+        tenant: { id: 'famco-tenant', name: 'FAMCO' },
+        memberships: [{ tenantId: 'famco-tenant', name: 'FAMCO', slug: 'famco', status: 'ACTIVE' }],
+      },
+    };
+  });
+  await c.api.startClientPortalPreview({
+    tenantId: 'famco-tenant',
+    userId: 'client-user',
+    destination: '/daily-inventory',
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], '/auth/impersonate/client');
+  assert.equal(calls[0][1].tenantId, 'famco-tenant');
+  assert.equal(calls[0][1].userId, 'client-user');
+  assert.equal(c.window.location.href, '/daily-inventory');
+  assert.equal(c.localStorage.getItem('access_token'), 'client-preview-token');
+  assert.equal(c.api.getImpersonation().email, 'owner@famco.test');
+});
