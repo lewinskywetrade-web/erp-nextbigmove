@@ -104,6 +104,29 @@ export async function startClientPortalPreview(params: {
   window.location.href = params.destination || '/daily-inventory';
 }
 
+/**
+ * Exchange a single-use preview handoff code launched from admin console for a
+ * read-only Client Portal View As session.
+ */
+export async function exchangeClientPreviewHandoff(code: string): Promise<string> {
+  const { data } = await apiClient.post('/auth/impersonate/client/exchange', { code });
+  if (data?.impersonationReadOnly !== true || !data?.impersonatedBy) {
+    throw new Error('Read-only client preview is not available. Please retry from Admin.');
+  }
+  applySession(data);
+  window.localStorage.setItem(IMPERSONATION_KEY, JSON.stringify({
+    name: [data.user?.firstName, data.user?.lastName].filter(Boolean).join(' ') || data.user?.email,
+    email: data.user?.email ?? '',
+  }));
+  const dest =
+    data?.destination === '/daily-inventory'
+    || data?.destination === '/reports'
+    || data?.destination === '/dashboard'
+      ? data.destination
+      : '/dashboard';
+  return dest;
+}
+
 /** Hand the session back to the admin who started it. */
 export async function stopImpersonation(): Promise<void> {
   let returnedTenantId: string | null = null;

@@ -12,6 +12,8 @@ import { WmsStaffActivityService } from '../../common/services/wms-staff-activit
 import { EffectiveAccessService } from '../../common/services/effective-access.service';
 
 const IMPERSONATION_MAX_SECONDS = 15 * 60;
+const CLIENT_PREVIEW_HANDOFF_TTL_MS = 60 * 1000;
+const CLIENT_PREVIEW_HANDOFF_PREFIX = 'client_preview_handoff:';
 export const CLIENT_PORTAL_PREVIEW_ALLOWED_EMAIL = 'lewinsky.wetrade@gmail.com';
 type ImpersonationClaims = {
   userId: string;
@@ -601,7 +603,16 @@ export class AuthService {
         ],
         NOT: {
           OR: [
-            { userRoleAssignments: { some: { workspace: toStoredPermissionWorkspace('wms') } } },
+            {
+              AND: [
+                { userRoleAssignments: { some: { workspace: toStoredPermissionWorkspace('wms') } } },
+                {
+                  userRoleAssignments: {
+                    none: { tenantId, workspace: toStoredPermissionWorkspace('erp') },
+                  },
+                },
+              ],
+            },
             { tenantMemberships: { some: { tenantId, status: { not: 'ACTIVE' } } } },
           ],
         },
@@ -725,6 +736,132 @@ export class AuthService {
       impersonationReadOnly: true,
       impersonationExpiresAt: expiresAt,
       ...tokens,
+    };
+  }
+
+  /**
+   * Issue a short-lived (60s), single-use opaque handoff code so the designated
+   * owner can launch a Client Portal View As session from admin.nextbigmove.com
+   * into erp.nextbigmove.com without placing JWTs in any URL.
+   */
+  async createClientPreviewHandoff(
+    actor: { userId: string; tenantId: string | null; sessionId: string | null; impersonatedBy?: string },
+    targetTenantId: string,
+    targetUserId: string,
+    destination: '/daily-inventory' | '/dashboard' | '/reports' = '/dashboard',
+  ) {
+    const operator = await this.assertClientPortalPreviewOperator(actor);
+    if (operator.id === targetUserId) {
+      throw new BadRequestException('You are already signed in as this user');
+    }
+
+    const previewExpiresAt = Math.floor(Date.now() / 1000) + IMPERSONATION_MAX_SECONDS;
+    await this.validateImpersonationSession({
+      userId: targetUserId,
+      tenantId: targetTenantId,
+      impersonatedBy: operator.id,
+      impersonationExpiresAt: previewExpiresAt,
+    });
+
+    const rawCode = crypto.randomBytes(32).toString('base64url');
+    const codeHash = crypto.createHash('sha256').update(rawCode).digest('hex');
+    const key = `${CLIENT_PREVIEW_HANDOFF_PREFIX}${codeHash}`;
+    const now = Date.now();
+    const expiresAtMs = now + CLIENT_PREVIEW_HANDOFF_TTL_MS;
+
+    // Prune stale handoff tokens best-effort so table size stays tiny.
+    await this.prisma.wmsSystemSetting.deleteMany({
+      where: {
+        key: { startsWith: CLIENT_PREVIEW_HANDOFF_PREFIX },
+        createdAt: { lt: new Date(now - 5 * 60 * 1000) },
+      },
+    });
+
+    await this.prisma.wmsSystemSetting.create({
+      data: {
+        key,
+        value: {
+          actorId: operator.id,
+          actorTenantId: actor.tenantId ?? operator.tenantId ?? null,
+          targetUserId,
+          targetTenantId,
+          destination,
+          expiresAtMs,
+        },
+      },
+    });
+
+    return {
+      code: rawCode,
+      expiresInSeconds: Math.floor(CLIENT_PREVIEW_HANDOFF_TTL_MS / 1000),
+      destination,
+    };
+  }
+
+  /**
+   * Redeem a single-use handoff code into a 15-minute read-only View As
+   * session for the target client account.
+   */
+  async exchangeClientPreviewHandoff(rawCode: string, request?: any) {
+    const trimmed = typeof rawCode === 'string' ? rawCode.trim() : '';
+    if (!trimmed || trimmed.length < 32) {
+      throw new UnauthorizedException('Invalid preview handoff code');
+    }
+
+    const codeHash = crypto.createHash('sha256').update(trimmed).digest('hex');
+    const key = `${CLIENT_PREVIEW_HANDOFF_PREFIX}${codeHash}`;
+
+    const record = await this.prisma.$transaction(async (tx) => {
+      const existing = await tx.wmsSystemSetting.findUnique({ where: { key } });
+      if (!existing) {
+        return null;
+      }
+      const deleted = await tx.wmsSystemSetting.deleteMany({ where: { key } });
+      if (deleted.count !== 1) {
+        return null;
+      }
+      return existing.value as {
+        actorId?: string;
+        actorTenantId?: string | null;
+        targetUserId?: string;
+        targetTenantId?: string;
+        destination?: string;
+        expiresAtMs?: number;
+      };
+    });
+
+    if (
+      !record
+      || !record.actorId
+      || !record.targetUserId
+      || !record.targetTenantId
+      || typeof record.expiresAtMs !== 'number'
+      || record.expiresAtMs <= Date.now()
+    ) {
+      throw new UnauthorizedException('This client preview link has expired or was already used.');
+    }
+
+    const session = await this.impersonateClientUser(
+      {
+        userId: record.actorId,
+        tenantId: record.actorTenantId ?? null,
+        sessionId: null,
+      },
+      record.targetTenantId,
+      record.targetUserId,
+      request,
+    );
+
+    const safeDestination =
+      record.destination === '/daily-inventory'
+      || record.destination === '/reports'
+      || record.destination === '/dashboard'
+        ? record.destination
+        : '/dashboard';
+
+    return {
+      ...session,
+      destination: safeDestination,
     };
   }
 

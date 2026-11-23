@@ -255,6 +255,7 @@ describe('Cross-client live portal View As (lewinsky.wetrade@gmail.com only)', (
       [originTenantId, { id: originTenantId, name: 'Next Big Move', slug: 'nbm', status: 'ACTIVE', encryptionKey: 'sec' }],
       [clientTenantId, { id: clientTenantId, name: 'FAMCO', slug: 'famco', status: 'ACTIVE', encryptionKey: 'sec' }],
     ]);
+    const settingsStore = new Map<string, { key: string; value: any; createdAt: Date }>();
     const prisma: any = {
       user: {
         findUnique: jest.fn(async ({ where }: any) => users.get(where.id) ?? null),
@@ -268,15 +269,31 @@ describe('Cross-client live portal View As (lewinsky.wetrade@gmail.com only)', (
         findUnique: jest.fn(async () => null),
         findMany: jest.fn(async () => []),
       },
+      wmsSystemSetting: {
+        create: jest.fn(async ({ data }: any) => {
+          const row = { key: data.key, value: data.value, createdAt: new Date() };
+          settingsStore.set(data.key, row);
+          return row;
+        }),
+        findUnique: jest.fn(async ({ where }: any) => settingsStore.get(where.key) ?? null),
+        deleteMany: jest.fn(async ({ where }: any) => {
+          if (where?.key && typeof where.key === 'string') {
+            const existed = settingsStore.delete(where.key);
+            return { count: existed ? 1 : 0 };
+          }
+          return { count: 0 };
+        }),
+      },
       auditLog: { create: jest.fn(async () => ({})) },
     };
+    prisma.$transaction = jest.fn(async (fn: any) => fn(prisma));
     const access: any = {
       resolveUserAccess: jest.fn(async ({ basePermissions }: any) => ({ permissions: basePermissions ?? [], roles: [] })),
     };
     const jwt = new JwtService();
     const service = new AuthService(prisma, jwt, config as never, { recordFromRequest: jest.fn() } as never, access);
     const strategy = new JwtStrategy(config as never, service);
-    return { service, strategy, jwt, prisma, users };
+    return { service, strategy, jwt, prisma, users, settingsStore };
   }
 
   it('allows only active SUPER_ADMIN lewinsky.wetrade@gmail.com to enable and list cross-client previews', async () => {
@@ -356,5 +373,45 @@ describe('Cross-client live portal View As (lewinsky.wetrade@gmail.com only)', (
     await expect(
       service.impersonateClientUser({ userId: 'tenant-admin', tenantId: originTenantId, sessionId: 's2' }, clientTenantId, 'famco-lead'),
     ).rejects.toThrow('designated owner');
+  });
+
+  it('issues a single-use 60s handoff code for lewinsky.wetrade@gmail.com only and blocks replay or expiry', async () => {
+    const { service, jwt, settingsStore } = buildCrossClientFixture();
+    const actor = { userId: 'lewinsky', tenantId: originTenantId, sessionId: 'orig-session' };
+
+    await expect(
+      service.createClientPreviewHandoff(
+        { userId: 'other-super', tenantId: originTenantId, sessionId: 's1' },
+        clientTenantId,
+        'famco-lead',
+        '/daily-inventory',
+      ),
+    ).rejects.toThrow('designated owner');
+
+    const handoff = await service.createClientPreviewHandoff(
+      actor,
+      clientTenantId,
+      'famco-lead',
+      '/daily-inventory',
+    );
+    expect(handoff.expiresInSeconds).toBe(60);
+    expect(settingsStore.size).toBe(1);
+    // Stored key is hashed; plaintext code is never saved verbatim.
+    expect(Array.from(settingsStore.keys())[0]).not.toContain(handoff.code);
+
+    const redeemed = await service.exchangeClientPreviewHandoff(handoff.code);
+    expect(redeemed.impersonationReadOnly).toBe(true);
+    expect(redeemed.destination).toBe('/daily-inventory');
+    expect((jwt.decode(redeemed.accessToken) as Record<string, any>).tenantId).toBe(clientTenantId);
+
+    // Replaying the same code fails closed.
+    await expect(service.exchangeClientPreviewHandoff(handoff.code)).rejects.toThrow('expired or was already used');
+
+    // Expired code fails closed even if not yet redeemed.
+    const expired = await service.createClientPreviewHandoff(actor, clientTenantId, 'famco-lead', '/dashboard');
+    for (const row of settingsStore.values()) {
+      row.value.expiresAtMs = Date.now() - 1000;
+    }
+    await expect(service.exchangeClientPreviewHandoff(expired.code)).rejects.toThrow('expired or was already used');
   });
 });

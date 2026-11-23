@@ -16,6 +16,7 @@ import {
   ClipboardList,
   Clock,
   Copy,
+  Eye,
   GaugeCircle,
   Link2,
   PauseCircle,
@@ -24,6 +25,7 @@ import {
 } from 'lucide-react';
 import apiClient from '@/lib/api-client';
 import { readStoredAdminUser, readStoredPermissions } from '@/lib/admin-session';
+import { canPreviewAllClients } from '@/lib/client-preview';
 import {
   hasAnyAdminPermission,
   WMS_PARTNERS_EDIT_PERMISSIONS,
@@ -105,6 +107,7 @@ export default function TenantDetailsPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [slugCopied, setSlugCopied] = useState(false);
+  const [canPreviewClients, setCanPreviewClients] = useState(false);
 
   const {
     register,
@@ -172,6 +175,17 @@ export default function TenantDetailsPage() {
     };
 
     fetchTenant();
+    const token = localStorage.getItem('access_token');
+    if (token) {
+      apiClient
+        .get('/auth/me', { headers: { Authorization: `Bearer ${token}` } })
+        .then((res) => {
+          setCanPreviewClients(
+            canPreviewAllClients(res.data?.user ?? null, Boolean(res.data?.canPreviewClients)),
+          );
+        })
+        .catch(() => setCanPreviewClients(false));
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canRead, tenantId, router]);
 
@@ -703,6 +717,14 @@ export default function TenantDetailsPage() {
                 label="View users"
                 href={`/tenants/${tenant.id}/users`}
               />
+              {canPreviewClients ? (
+                <QuickActionButton
+                  icon={<Eye className="h-3.5 w-3.5" />}
+                  label="Preview client portal (View as)"
+                  href={`/tenants/${tenant.id}/users`}
+                  tone="primary"
+                />
+              ) : null}
               <QuickActionButton
                 icon={<Link2 className="h-3.5 w-3.5" />}
                 label="View integrations"

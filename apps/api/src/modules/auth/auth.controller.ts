@@ -1,6 +1,7 @@
 import { Controller, Post, Body, HttpCode, HttpStatus, Get, UseGuards, Request, Patch, BadRequestException, UnauthorizedException, Query, Param, ParseUUIDPipe } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import {
+  ExchangeClientPreviewHandoffDto,
   ImpersonateClientDto,
   LoginDto,
   RefreshTokenDto,
@@ -272,6 +273,33 @@ export class AuthController {
   @UseGuards(JwtAuthGuard)
   async impersonateClient(@Body() dto: ImpersonateClientDto, @Request() req) {
     return this.authService.impersonateClientUser(req.user, dto.tenantId, dto.userId, req);
+  }
+
+  /**
+   * Issue a 60s single-use opaque handoff code for launching client preview
+   * from admin.nextbigmove.com into erp.nextbigmove.com.
+   */
+  @Post('impersonate/client/handoff')
+  @UseGuards(JwtAuthGuard)
+  async createClientPreviewHandoff(@Body() dto: ImpersonateClientDto, @Request() req) {
+    return this.authService.createClientPreviewHandoff(
+      req.user,
+      dto.tenantId,
+      dto.userId,
+      dto.destination ?? '/dashboard',
+    );
+  }
+
+  /**
+   * Exchange a single-use handoff code for a read-only Client Portal View As session.
+   */
+  @Post('impersonate/client/exchange')
+  @HttpCode(HttpStatus.OK)
+  async exchangeClientPreviewHandoff(
+    @Body() dto: ExchangeClientPreviewHandoffDto,
+    @Request() req,
+  ) {
+    return this.authService.exchangeClientPreviewHandoff(dto.code, req);
   }
 
   /**

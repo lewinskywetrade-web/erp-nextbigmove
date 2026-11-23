@@ -4,7 +4,8 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import apiClient from '@/lib/api-client';
 import { startImpersonation } from '@/lib/impersonation';
-import { viewAsCapabilities, viewAsDisabledReason } from '@/lib/view-as';
+import { canPreviewAllClients, viewAsCapabilities, viewAsDisabledReason } from '@/lib/view-as';
+import { ClientPortalPreviewDialog } from '../../_components/client-portal-preview-dialog';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { AlertBanner, LoadingCard } from '@/components/ui/feedback';
@@ -77,6 +78,8 @@ export default function UsersPage() {
   const [isReady, setIsReady] = useState(false);
   const [canManage, setCanManage] = useState(false);
   const [canImpersonate, setCanImpersonate] = useState(false);
+  const [canPreviewClients, setCanPreviewClients] = useState(false);
+  const [isClientPreviewOpen, setIsClientPreviewOpen] = useState(false);
   // Impersonating yourself is rejected server-side; hiding it keeps the menu honest.
   const [currentUserId, setCurrentUserId] = useState<string | null>(null);
   const [actorIsSuperAdmin, setActorIsSuperAdmin] = useState(false);
@@ -110,6 +113,10 @@ export default function UsersPage() {
           apiClient.get('/auth/permissions', { params: { workspace: 'erp' } }),
         ]);
         const identity = identityResult.status === 'fulfilled' ? identityResult.value.data?.user : null;
+        const serverCanPreviewClients =
+          identityResult.status === 'fulfilled'
+            ? Boolean(identityResult.value.data?.canPreviewClients)
+            : false;
         const permissions = permissionsResult.status === 'fulfilled' ? permissionsResult.value.data?.permissions : [];
         const capability = viewAsCapabilities(identity, permissions);
         if (!cancelled) {
@@ -117,6 +124,7 @@ export default function UsersPage() {
           setActorIsSuperAdmin(capability.isSuperAdmin);
           setCanManage(capability.canManage);
           setCanImpersonate(capability.canImpersonate);
+          setCanPreviewClients(canPreviewAllClients(identity, serverCanPreviewClients));
           setPermissionCheckResolved(true);
         }
       } catch {
@@ -479,6 +487,16 @@ export default function UsersPage() {
           >
             Add existing user
           </Button>
+          {canPreviewClients ? (
+            <Button
+              variant="outline"
+              iconLeft={<Eye className="h-4 w-4" />}
+              onClick={() => setIsClientPreviewOpen(true)}
+              className="btn-icon"
+            >
+              View another Client
+            </Button>
+          ) : null}
         </div>
 
         <div className="p-4">
@@ -870,6 +888,13 @@ export default function UsersPage() {
           deleteMutation.mutate(userToDelete.id);
         }}
       />
+
+      {canPreviewClients ? (
+        <ClientPortalPreviewDialog
+          open={isClientPreviewOpen}
+          onOpenChange={setIsClientPreviewOpen}
+        />
+      ) : null}
     </div>
   );
 }

@@ -11,7 +11,9 @@ const apiClient = axios.create({
 // Request interceptor - Add auth token and tenant ID
 apiClient.interceptors.request.use(
   (config) => {
-    if (typeof window !== 'undefined') {
+    const isHandoffExchange =
+      typeof config.url === 'string' && config.url.includes('/auth/impersonate/client/exchange');
+    if (typeof window !== 'undefined' && !isHandoffExchange) {
       const token = getPageSessionToken();
       const tenantId = localStorage.getItem('current_tenant_id');
       const teamIdsRaw = localStorage.getItem('current_team_ids');

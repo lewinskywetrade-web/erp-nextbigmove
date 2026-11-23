@@ -3,9 +3,14 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
-import { ArrowLeft, Search, User as UserIcon, Users } from 'lucide-react';
+import { ArrowLeft, Eye, Search, User as UserIcon, Users } from 'lucide-react';
 import apiClient from '@/lib/api-client';
 import { readStoredAdminUser, readStoredPermissions } from '@/lib/admin-session';
+import {
+  canPreviewAllClients,
+  launchClientPortalPreviewFromAdmin,
+  type ClientPreviewDestination,
+} from '@/lib/client-preview';
 import { hasAnyAdminPermission, WMS_PARTNERS_READ_PERMISSIONS } from '@/lib/wms-permissions';
 import { WmsCompactPanel } from '../../../_components/wms-compact-panel';
 import { WmsInlineNotice } from '../../../_components/wms-inline-notice';
@@ -65,6 +70,10 @@ export default function PartnerUsersPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState('');
   const [search, setSearch] = useState('');
+  const [canPreviewClients, setCanPreviewClients] = useState(false);
+  const [verifiedActorId, setVerifiedActorId] = useState<string | null>(null);
+  const [previewDestination, setPreviewDestination] = useState<ClientPreviewDestination>('/dashboard');
+  const [previewingUserId, setPreviewingUserId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!canRead) {
@@ -79,12 +88,26 @@ export default function PartnerUsersPage() {
           router.push('/login');
           return;
         }
-        const response = await apiClient.get(`/tenants/${tenantId}/users`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        if (isMounted) {
-          setData(response.data as PartnerUsersResponse);
+        const [usersResult, meResult] = await Promise.allSettled([
+          apiClient.get(`/tenants/${tenantId}/users`, {
+            headers: { Authorization: `Bearer ${token}` },
+          }),
+          apiClient.get('/auth/me', {
+            headers: { Authorization: `Bearer ${token}` },
+          }),
+        ]);
+        if (!isMounted) return;
+        if (usersResult.status === 'fulfilled') {
+          setData(usersResult.value.data as PartnerUsersResponse);
           setError('');
+        } else {
+          setError(getErrorMessage(usersResult.reason, 'Failed to load partner users'));
+        }
+        if (meResult.status === 'fulfilled') {
+          const meUser = meResult.value.data?.user ?? null;
+          const serverCanPreview = Boolean(meResult.value.data?.canPreviewClients);
+          setVerifiedActorId(meUser?.userId || meUser?.id || null);
+          setCanPreviewClients(canPreviewAllClients(meUser, serverCanPreview));
         }
       } catch (loadError: unknown) {
         if (isMounted) setError(getErrorMessage(loadError, 'Failed to load partner users'));
@@ -130,8 +153,8 @@ export default function PartnerUsersPage() {
 
       {canRead ? (
         <WmsCompactPanel title={`Users${data ? ` (${data.users.length})` : ''}`} icon={<Users className="panel-icon" />}>
-          <div className="border-b border-[#edf2f6] p-4">
-            <label className="relative block max-w-sm">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#edf2f6] p-4">
+            <label className="relative block w-full max-w-sm">
               <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#7c8f9b]" />
               <input
                 type="search"
@@ -141,6 +164,20 @@ export default function PartnerUsersPage() {
                 className="input pl-8"
               />
             </label>
+            {canPreviewClients ? (
+              <label className="flex items-center gap-2 text-xs font-semibold text-[#4d6677]">
+                <span>Open Client Portal on:</span>
+                <select
+                  value={previewDestination}
+                  onChange={(e) => setPreviewDestination(e.target.value as ClientPreviewDestination)}
+                  className="input h-9 w-auto min-w-[210px] text-xs font-semibold"
+                >
+                  <option value="/dashboard">Client Dashboard (/dashboard)</option>
+                  <option value="/daily-inventory">Daily Stock Ins &amp; Outs (/daily-inventory)</option>
+                  <option value="/reports">Client Reports (/reports)</option>
+                </select>
+              </label>
+            ) : null}
           </div>
           <div className="overflow-x-auto">
             <table className="min-w-full border-separate border-spacing-0">
@@ -153,13 +190,14 @@ export default function PartnerUsersPage() {
                   <HeaderCell>Access</HeaderCell>
                   <HeaderCell>Last login</HeaderCell>
                   <HeaderCell>Created</HeaderCell>
+                  {canPreviewClients ? <HeaderCell>Preview</HeaderCell> : null}
                 </tr>
               </thead>
               <tbody className="bg-white">
                 {isLoading ? (
                   Array.from({ length: 4 }).map((_, index) => (
                     <tr key={`loading-${index}`}>
-                      {Array.from({ length: 7 }).map((__, cellIndex) => (
+                      {Array.from({ length: canPreviewClients ? 8 : 7 }).map((__, cellIndex) => (
                         <td key={`loading-${index}-${cellIndex}`} className="px-5 py-4">
                           <div className="h-3.5 animate-pulse rounded-full bg-[#eef2f5]" />
                         </td>
@@ -168,7 +206,7 @@ export default function PartnerUsersPage() {
                   ))
                 ) : filteredUsers.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="px-5 py-14 text-center text-[13px] text-[#6f8290]">
+                    <td colSpan={canPreviewClients ? 8 : 7} className="px-5 py-14 text-center text-[13px] text-[#6f8290]">
                       {data?.users.length ? 'No users match your search.' : 'This partner has no users yet.'}
                     </td>
                   </tr>
@@ -178,6 +216,8 @@ export default function PartnerUsersPage() {
                     const roleLabel = partnerUser.role === 'SUPER_ADMIN'
                       ? 'Super Admin'
                       : partnerUser.roles.length ? partnerUser.roles.join(', ') : '—';
+                    const isSelf = verifiedActorId === partnerUser.id;
+                    const canPreviewRow = canPreviewClients && partnerUser.status === 'ACTIVE' && !isSelf;
                     return (
                       <tr key={partnerUser.id} className="border-b border-[#edf2f6] text-[13px] text-[#29404f]">
                         <BodyCell>
@@ -203,6 +243,46 @@ export default function PartnerUsersPage() {
                         </BodyCell>
                         <BodyCell className="tabular-nums text-[#4d6677]">{formatTenantDateTime(partnerUser.lastLoginAt)}</BodyCell>
                         <BodyCell className="tabular-nums text-[#4d6677]">{formatTenantDateTime(partnerUser.createdAt)}</BodyCell>
+                        {canPreviewClients ? (
+                          <BodyCell>
+                            <button
+                              type="button"
+                              disabled={!canPreviewRow || previewingUserId !== null}
+                              title={
+                                isSelf
+                                  ? 'You are already signed in as this account'
+                                  : partnerUser.status !== 'ACTIVE'
+                                    ? 'Only active users can be previewed'
+                                    : `Open ${partnerUser.email} in read-only Client Portal preview`
+                              }
+                              onClick={() => {
+                                if (!canPreviewRow || previewingUserId !== null) return;
+                                setPreviewingUserId(partnerUser.id);
+                                setError('');
+                                void launchClientPortalPreviewFromAdmin({
+                                  tenantId,
+                                  userId: partnerUser.id,
+                                  destination: previewDestination,
+                                })
+                                  .catch((previewError: unknown) => {
+                                    setError(
+                                      getErrorMessage(
+                                        previewError,
+                                        'Unable to launch read-only Client Portal preview.',
+                                      ),
+                                    );
+                                  })
+                                  .finally(() => {
+                                    setPreviewingUserId(null);
+                                  });
+                              }}
+                              className="btn btn-sm btn-outline btn-icon whitespace-nowrap disabled:opacity-50"
+                            >
+                              <Eye className="h-3.5 w-3.5" />
+                              {previewingUserId === partnerUser.id ? 'Opening...' : 'View as in ERP'}
+                            </button>
+                          </BodyCell>
+                        ) : null}
                       </tr>
                     );
                   })

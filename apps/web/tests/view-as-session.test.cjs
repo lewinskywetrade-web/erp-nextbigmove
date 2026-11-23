@@ -332,3 +332,36 @@ test('startClientPortalPreview posts /auth/impersonate/client, sets read-only pr
   assert.equal(c.localStorage.getItem('access_token'), 'client-preview-token');
   assert.equal(c.api.getImpersonation().email, 'owner@famco.test');
 });
+
+test('exchangeClientPreviewHandoff redeems single-use code cleanly and rejects missing preview flags', async () => {
+  const calls = [];
+  const c = impersonationFixture({}, async (url, body) => {
+    calls.push([url, body]);
+    return {
+      data: {
+        accessToken: 'handoff-preview-token',
+        impersonatedBy: 'lewinsky',
+        impersonationReadOnly: true,
+        destination: '/dashboard',
+        user: { id: 'client-user', firstName: 'Client', email: 'client@famco.test' },
+        tenant: { id: 'famco-tenant', name: 'FAMCO' },
+        memberships: [{ tenantId: 'famco-tenant', name: 'FAMCO', slug: 'famco', status: 'ACTIVE' }],
+      },
+    };
+  });
+  const destination = await c.api.exchangeClientPreviewHandoff('opaque-handoff-code-value-1234567890');
+  assert.equal(destination, '/dashboard');
+  assert.equal(calls[0][0], '/auth/impersonate/client/exchange');
+  assert.equal(calls[0][1].code, 'opaque-handoff-code-value-1234567890');
+  assert.equal(c.localStorage.getItem('access_token'), 'handoff-preview-token');
+  assert.equal(c.api.getImpersonation().email, 'client@famco.test');
+
+  const invalid = impersonationFixture({}, async () => ({
+    data: { accessToken: 'no-flag', user: { id: 'client-user' } },
+  }));
+  await assert.rejects(
+    invalid.api.exchangeClientPreviewHandoff('opaque-handoff-code-value-1234567890'),
+    /Read-only client preview is not available/,
+  );
+  assert.equal(invalid.localStorage.getItem('access_token'), null);
+});
